@@ -24,7 +24,10 @@ from qwen35_aptmoe_proxy_components import (
     component_parameter_counts,
     load_text_config,
 )
-from qwen35_route_capture import RouteTraceCapture
+from merge_qwen35_route_traces import (
+    group_route_patterns_by_optimizer_step,
+)
+from qwen35_route_capture import RouteTraceCapture, _install_kt_route_hooks
 
 
 MODEL_PATH = Path("/mnt/data3/models/Qwen3.5-35B-A3B")
@@ -230,6 +233,89 @@ class RouteContractTest(unittest.TestCase):
                 metadata = json.loads(str(data["metadata_json"].item()))
             self.assertEqual(routes.shape, (2, 2, 3, 2))
             self.assertEqual(metadata["patterns"], 2)
+
+    def test_route_merge_groups_microbatches_by_optimizer_step(self) -> None:
+        routes = np.arange(8 * 2 * 3 * 2, dtype=np.int16).reshape(
+            8,
+            2,
+            3,
+            2,
+        )
+        grouped = group_route_patterns_by_optimizer_step(routes, 4)
+        self.assertEqual(grouped.shape, (2, 2, 12, 2))
+        np.testing.assert_array_equal(
+            grouped[0, 0],
+            np.concatenate([routes[index, 0] for index in range(4)]),
+        )
+        np.testing.assert_array_equal(
+            grouped[1, 1],
+            np.concatenate([routes[index, 1] for index in range(4, 8)]),
+        )
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            group_route_patterns_by_optimizer_step(routes[:7], 4)
+
+    def test_kt_capture_observes_actual_wrapper_routing(self) -> None:
+        class FakeKTMoEWrapper(torch.nn.Module):
+            def __init__(self, offset: int) -> None:
+                super().__init__()
+                self._is_kt_moe_wrapper = True
+                self.offset = offset
+
+            def _compute_routing(
+                self,
+                hidden_states: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                tokens = hidden_states.shape[0]
+                ids = torch.tensor(
+                    [[self.offset, self.offset + 1]],
+                    dtype=torch.long,
+                ).expand(tokens, -1)
+                weights = torch.full((tokens, 2), 0.5)
+                return ids, weights
+
+        class FakeLayer(torch.nn.Module):
+            def __init__(self, offset: int) -> None:
+                super().__init__()
+                self.mlp = FakeKTMoEWrapper(offset)
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.layers = torch.nn.ModuleList(
+                    [FakeLayer(0), FakeLayer(2)]
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.dict(
+                "os.environ",
+                {"FFT_APTMOE_SIMULATION_ROOT": str(root)},
+            ):
+                capture = RouteTraceCapture(
+                    output_dir=root / "routes",
+                    sequence_length=3,
+                    max_patterns=1,
+                    expected_layers=2,
+                    top_k=2,
+                )
+            model = FakeModel()
+            handles = _install_kt_route_hooks(model, capture)
+            capture.set_hook_handles(handles)
+            capture.begin_model_forward(model, ())
+            hidden = torch.zeros(3, 4)
+            for layer in model.layers:
+                layer.mlp._compute_routing(hidden)
+            capture.end_model_forward(model, (), None)
+            self.assertEqual(
+                capture.patterns[0][0].tolist(),
+                [[0, 1], [0, 1], [0, 1]],
+            )
+            self.assertEqual(
+                capture.patterns[0][1].tolist(),
+                [[2, 3], [2, 3], [2, 3]],
+            )
+            for layer in model.layers:
+                self.assertNotIn("_compute_routing", layer.mlp.__dict__)
 
 
 class PlacementAndStorageTest(unittest.TestCase):

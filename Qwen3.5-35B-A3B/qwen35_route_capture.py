@@ -11,6 +11,7 @@ import atexit
 import json
 import os
 import re
+import types
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,26 @@ from aptmoe_proxy.storage import (
 
 
 LAYER_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+
+class _MethodPatchHandle:
+    """Restore one instance method patched for route observation."""
+
+    def __init__(self, module: torch.nn.Module, method_name: str) -> None:
+        self.module = module
+        self.method_name = method_name
+        self.had_instance_attribute = method_name in module.__dict__
+        self.instance_attribute = module.__dict__.get(method_name)
+        self.removed = False
+
+    def remove(self) -> None:
+        if self.removed:
+            return
+        self.removed = True
+        if self.had_instance_attribute:
+            setattr(self.module, self.method_name, self.instance_attribute)
+        elif self.method_name in self.module.__dict__:
+            delattr(self.module, self.method_name)
 
 
 class RouteTraceCapture:
@@ -111,29 +132,31 @@ class RouteTraceCapture:
             output: Any,
         ) -> None:
             del module, inputs
-            current = self.current_pattern
-            if current is None or layer_idx in current:
-                return
             if not isinstance(output, tuple) or len(output) < 3:
                 raise RuntimeError(
                     "Qwen3.5 router output does not contain selected experts"
                 )
-            selected = output[2]
-            if not isinstance(selected, torch.Tensor):
-                raise RuntimeError("Qwen3.5 selected experts are not a tensor")
-            if selected.ndim != 2 or selected.shape[1] != self.top_k:
-                raise RuntimeError(
-                    f"layer {layer_idx} route shape={tuple(selected.shape)}, "
-                    f"expected [tokens, {self.top_k}]"
-                )
-            current[layer_idx] = (
-                selected.detach()
-                .to(device="cpu", dtype=torch.int16)
-                .numpy()
-                .copy()
-            )
+            self.record_selected(layer_idx, output[2])
 
         return capture
+
+    def record_selected(self, layer_idx: int, selected: Any) -> None:
+        current = self.current_pattern
+        if current is None or layer_idx in current:
+            return
+        if not isinstance(selected, torch.Tensor):
+            raise RuntimeError("Qwen3.5 selected experts are not a tensor")
+        if selected.ndim != 2 or selected.shape[1] != self.top_k:
+            raise RuntimeError(
+                f"layer {layer_idx} route shape={tuple(selected.shape)}, "
+                f"expected [tokens, {self.top_k}]"
+            )
+        current[layer_idx] = (
+            selected.detach()
+            .to(device="cpu", dtype=torch.int16)
+            .numpy()
+            .copy()
+        )
 
     def write(self) -> None:
         if self._written:
@@ -190,6 +213,66 @@ class RouteTraceCapture:
         )
 
 
+def _install_kt_route_hooks(
+    model: torch.nn.Module,
+    capture: RouteTraceCapture,
+) -> list[Any]:
+    """Observe the actual IDs returned by KT's routing implementation.
+
+    KTMoELayerWrapper replaces the original sparse-MoE module and computes
+    routing in ``_compute_routing``. The retained Transformers TopKRouter is
+    used only as a weight/metadata source, so its forward hooks never fire.
+    Patch the wrapper method per instance and record its returned IDs without
+    recomputing or changing routing.
+    """
+
+    handles: list[Any] = []
+    registered: set[int] = set()
+    for name, module in model.named_modules():
+        if not getattr(module, "_is_kt_moe_wrapper", False):
+            continue
+        match = LAYER_PATTERN.search(name)
+        if match is None:
+            raise RuntimeError(
+                f"cannot extract layer id from KT MoE wrapper name {name!r}"
+            )
+        layer_idx = int(match.group(1))
+        if layer_idx in registered:
+            raise RuntimeError(f"duplicate KT MoE wrapper for layer {layer_idx}")
+        original_compute_routing = getattr(module, "_compute_routing", None)
+        if not callable(original_compute_routing):
+            raise RuntimeError(
+                f"KT MoE wrapper for layer {layer_idx} has no routing method"
+            )
+        handle = _MethodPatchHandle(module, "_compute_routing")
+
+        def observed_compute_routing(
+            self: torch.nn.Module,
+            *args: Any,
+            _original: Any = original_compute_routing,
+            _layer_idx: int = layer_idx,
+            **kwargs: Any,
+        ) -> Any:
+            topk_ids, topk_weights = _original(*args, **kwargs)
+            capture.record_selected(_layer_idx, topk_ids)
+            return topk_ids, topk_weights
+
+        module._compute_routing = types.MethodType(  # type: ignore[method-assign]
+            observed_compute_routing,
+            module,
+        )
+        handles.append(handle)
+        registered.add(layer_idx)
+    if registered != set(range(capture.expected_layers)):
+        for handle in handles:
+            handle.remove()
+        raise RuntimeError(
+            "Qwen3.5 KT route capture expected layers 0.."
+            f"{capture.expected_layers - 1}, found {sorted(registered)}"
+        )
+    return handles
+
+
 def install_route_capture(
     model: torch.nn.Module,
     output_dir: str | Path,
@@ -206,22 +289,31 @@ def install_route_capture(
     )
     registered: set[int] = set()
     handles: list[Any] = []
-    for name, module in model.named_modules():
-        if not isinstance(module, Qwen3_5MoeTopKRouter):
-            continue
-        match = LAYER_PATTERN.search(name)
-        if match is None:
-            raise RuntimeError(f"cannot extract layer id from router name {name!r}")
-        layer_idx = int(match.group(1))
-        if layer_idx in registered:
-            raise RuntimeError(f"duplicate Qwen3.5 router for layer {layer_idx}")
-        registered.add(layer_idx)
-        handles.append(module.register_forward_hook(capture.hook(layer_idx)))
-    if registered != set(range(capture.expected_layers)):
-        raise RuntimeError(
-            "Qwen3.5 route capture expected layers 0..39, "
-            f"found {sorted(registered)}"
-        )
+    if capture.backend == "kt":
+        handles.extend(_install_kt_route_hooks(model, capture))
+        source = "kt_wrapper._compute_routing"
+    else:
+        for name, module in model.named_modules():
+            if not isinstance(module, Qwen3_5MoeTopKRouter):
+                continue
+            match = LAYER_PATTERN.search(name)
+            if match is None:
+                raise RuntimeError(
+                    f"cannot extract layer id from router name {name!r}"
+                )
+            layer_idx = int(match.group(1))
+            if layer_idx in registered:
+                raise RuntimeError(
+                    f"duplicate Qwen3.5 router for layer {layer_idx}"
+                )
+            registered.add(layer_idx)
+            handles.append(module.register_forward_hook(capture.hook(layer_idx)))
+        if registered != set(range(capture.expected_layers)):
+            raise RuntimeError(
+                "Qwen3.5 route capture expected layers 0..39, "
+                f"found {sorted(registered)}"
+            )
+        source = "transformers.TopKRouter"
     handles.append(model.register_forward_pre_hook(capture.begin_model_forward))
     handles.append(model.register_forward_hook(capture.end_model_forward))
     capture.set_hook_handles(handles)
@@ -229,7 +321,7 @@ def install_route_capture(
     print(
         f"[qwen35_route_capture] installed rank={capture.rank} "
         f"patterns={capture.max_patterns} output={capture.output_dir}; "
-        "copies are warmup-only",
+        f"source={source}; copies are warmup-only",
         flush=True,
     )
     return capture
