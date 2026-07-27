@@ -11,6 +11,7 @@ from typing import Any
 
 
 TIMING_MODE = "coarse_host_wall_no_cuda_sync"
+MEGATRAIN_TIMING_MODE = "megatrain_host_wall_with_backend_cuda_sync"
 INSTRUMENTATION_FLAGS = (
     "forced_cuda_synchronize",
     "backend_internal_probes",
@@ -37,16 +38,25 @@ def main() -> None:
     parser.add_argument("--path", type=Path, required=True)
     parser.add_argument("--expected-steps", type=int, required=True)
     parser.add_argument("--warmup-steps", type=int, required=True)
+    parser.add_argument(
+        "--backend",
+        choices=("ktransformers", "deepspeed", "aptmoe", "megatrain"),
+        required=True,
+    )
     args = parser.parse_args()
 
     data = json.loads(args.path.read_text(encoding="utf-8"))
     errors: list[str] = []
-    if data.get("timing_mode") != TIMING_MODE:
-        errors.append(f"timing_mode must be {TIMING_MODE!r}")
+    expected_mode = (
+        MEGATRAIN_TIMING_MODE if args.backend == "megatrain" else TIMING_MODE
+    )
+    if data.get("timing_mode") != expected_mode:
+        errors.append(f"timing_mode must be {expected_mode!r}")
     instrumentation = data.get("instrumentation") or {}
     for key in INSTRUMENTATION_FLAGS:
-        if instrumentation.get(key) is not False:
-            errors.append(f"instrumentation.{key} must be false")
+        expected = args.backend == "megatrain" if key == "forced_cuda_synchronize" else False
+        if instrumentation.get(key) is not expected:
+            errors.append(f"instrumentation.{key} must be {expected!r}")
 
     steps = data.get("steps")
     if not isinstance(steps, list):
@@ -83,7 +93,7 @@ def main() -> None:
         raise SystemExit(1)
     print(
         f"[validate_step_timing] OK: {len(steps)} steps, "
-        f"{expected_stable} stable, mode={TIMING_MODE}"
+        f"{expected_stable} stable, mode={expected_mode}"
     )
 
 

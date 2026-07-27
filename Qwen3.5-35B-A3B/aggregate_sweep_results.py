@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Any
 
 
 TIMING_MODE = "coarse_host_wall_no_cuda_sync"
+MEGATRAIN_TIMING_MODE = "megatrain_host_wall_with_backend_cuda_sync"
 RESULT_COLUMNS = [
     "backend",
     "profile",
@@ -46,6 +48,10 @@ RESULT_COLUMNS = [
     "forward_sec",
     "backward_sec",
     "optimizer_sec",
+    "cpu_memory_peak_gb",
+    "cpu_memory_exceeds_1tib",
+    "oom_classification",
+    "gpu_memory_peak_gib",
     "memory_limit",
     "numa_policy",
     "timing_mode",
@@ -56,6 +62,11 @@ RESULT_COLUMNS = [
     "exit_code",
     "run_dir",
 ]
+PLOT_DESCRIPTIONS = {
+    "01_tps_vs_sequence.png": "稳定吞吐",
+    "02_step_phase_times.png": "稳定 step 阶段耗时",
+    "03_peak_memory_vs_sequence.png": "CPU/GPU 峰值内存",
+}
 
 
 def as_float(value: Any) -> float | None:
@@ -77,6 +88,7 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
     exit_path = run_dir / "exit_code.txt"
     exit_code = exit_path.read_text(encoding="utf-8").strip() if exit_path.is_file() else "MISSING"
     timing_path = run_dir / "step_timing" / "step_timing.json"
+    memory_path = run_dir / "memory_summary.json"
     row: dict[str, Any] = {
         **{key: config.get(key) for key in RESULT_COLUMNS},
         "benchmark_class": config.get(
@@ -89,11 +101,34 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
         "forward_sec": None,
         "backward_sec": None,
         "optimizer_sec": None,
+        "cpu_memory_peak_gb": None,
+        "cpu_memory_exceeds_1tib": None,
+        "oom_classification": None,
+        "gpu_memory_peak_gib": None,
         "timing_mode": None,
         "full_update_verified": None,
         "exit_code": exit_code,
         "run_dir": str(run_dir),
     }
+    if memory_path.is_file():
+        memory = json.loads(memory_path.read_text(encoding="utf-8"))
+        row["cpu_memory_peak_gb"] = (
+            memory.get("process_tree_peak_gb_decimal")
+            if memory.get("process_tree_peak_gb_decimal") is not None
+            else memory.get("host_used_peak_gb_decimal")
+        )
+        row["cpu_memory_exceeds_1tib"] = memory.get(
+            "observed_peak_exceeds_one_tib"
+        )
+        row["oom_classification"] = memory.get("oom_classification")
+        task_gpu_peaks = [
+            as_float(values.get("task_peak_gib"))
+            for values in (memory.get("gpu_peaks") or {}).values()
+        ]
+        row["gpu_memory_peak_gib"] = max(
+            (value for value in task_gpu_peaks if value is not None),
+            default=None,
+        )
     if exit_code == "DRY_RUN":
         row["status"] = "DRY_RUN"
         return row
@@ -135,7 +170,14 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
             != "Qwen3_5MoeForCausalLM"
             or config.get("weight_source") != "pretrained_checkpoint"
             or config.get("checkpoint_compatible") is not True
-            or config.get("llamafactory_backend") is not True
+            or (
+                config.get("backend") == "megatrain"
+                and config.get("llamafactory_backend") is not False
+            )
+            or (
+                config.get("backend") != "megatrain"
+                and config.get("llamafactory_backend") is not True
+            )
         ):
             contract_status = "MODEL_CONTRACT_MISMATCH"
         elif (
@@ -217,10 +259,19 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
         row["status"] = "PRECISION_MISMATCH"
     elif contract_status is not None:
         row["status"] = contract_status
-    elif row["timing_mode"] != TIMING_MODE:
+    elif row["timing_mode"] != (
+        MEGATRAIN_TIMING_MODE
+        if config.get("backend") == "megatrain"
+        else TIMING_MODE
+    ):
         row["status"] = "TIMING_MODE_MISMATCH"
     elif any(
-        instrumentation.get(key) is not False
+        instrumentation.get(key)
+        is not (
+            config.get("backend") == "megatrain"
+            if key == "forced_cuda_synchronize"
+            else False
+        )
         for key in (
             "forced_cuda_synchronize",
             "backend_internal_probes",
@@ -240,6 +291,8 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
             and config.get("result_validity") == "smoke_only"
             else "OK_PROXY"
             if benchmark_class == "deployment_proxy"
+            else "OK_BACKEND_SYNC"
+            if config.get("backend") == "megatrain"
             else "OK"
         )
     return row
@@ -252,13 +305,246 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def write_markdown(path: Path, root: Path, rows: list[dict[str, Any]]) -> None:
+def _plot_groups(
+    rows: list[dict[str, Any]],
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[
+            (
+                str(row.get("benchmark_class")),
+                str(row.get("backend")),
+                str(row.get("profile")),
+            )
+        ].append(row)
+
+    groups: list[tuple[str, list[dict[str, Any]]]] = []
+    for (benchmark_class, backend, profile), group in sorted(grouped.items()):
+        label = f"{backend}/{profile}"
+        if len(grouped) > 1 and len({key[0] for key in grouped}) > 1:
+            label = f"{benchmark_class}/{label}"
+        groups.append(
+            (
+                label,
+                sorted(group, key=lambda item: int(item["sequence_length"])),
+            )
+        )
+    return groups
+
+
+def _set_sequence_ticks(axis: Any, sequences: set[int]) -> None:
+    if not sequences:
+        return
+    ticks = sorted(sequences)
+    axis.set_xscale("log", base=2)
+    axis.set_xticks(ticks)
+    axis.set_xticklabels([str(value) for value in ticks])
+
+
+def _show_no_data(axis: Any) -> None:
+    axis.text(
+        0.5,
+        0.5,
+        "No valid data",
+        ha="center",
+        va="center",
+        transform=axis.transAxes,
+    )
+
+
+def generate_plots(output: Path, rows: list[dict[str, Any]]) -> list[Path]:
+    plots_dir = output / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    mpl_config = output / ".mplconfig"
+    mpl_config.mkdir(parents=True, exist_ok=True)
+    os.environ["MPLCONFIGDIR"] = str(mpl_config)
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    groups = _plot_groups(rows)
+    sequences = {
+        int(row["sequence_length"])
+        for row in rows
+        if row.get("sequence_length") is not None
+    }
+    colors = plt.get_cmap("tab10")
+    generated: list[Path] = []
+
+    fig, axis = plt.subplots(figsize=(9, 5.5))
+    plotted = False
+    for index, (label, group) in enumerate(groups):
+        points = [
+            (int(row["sequence_length"]), as_float(row.get("stable_tps")))
+            for row in group
+        ]
+        valid = [(sequence, value) for sequence, value in points if value is not None]
+        if not valid:
+            continue
+        axis.plot(
+            [item[0] for item in valid],
+            [item[1] for item in valid],
+            marker="o",
+            linewidth=2,
+            color=colors(index % 10),
+            label=label,
+        )
+        plotted = True
+    _set_sequence_ticks(axis, sequences)
+    axis.set_xlabel("Sequence length")
+    axis.set_ylabel("Stable throughput (tokens/s)")
+    axis.set_title("Stable throughput vs. sequence length")
+    axis.grid(True, which="both", alpha=0.25)
+    if plotted:
+        axis.legend()
+    else:
+        _show_no_data(axis)
+    fig.tight_layout()
+    path = plots_dir / "01_tps_vs_sequence.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    generated.append(path)
+
+    fig, axis = plt.subplots(figsize=(10, 6))
+    plotted = False
+    phase_styles = {
+        "forward_sec": ("Forward", "o", "-"),
+        "backward_sec": ("Backward", "s", "--"),
+        "optimizer_sec": ("Optimizer", "^", ":"),
+    }
+    for index, (label, group) in enumerate(groups):
+        color = colors(index % 10)
+        for key, (phase_label, marker, line_style) in phase_styles.items():
+            points = [
+                (int(row["sequence_length"]), as_float(row.get(key)))
+                for row in group
+            ]
+            valid = [(sequence, value) for sequence, value in points if value is not None]
+            if not valid:
+                continue
+            axis.plot(
+                [item[0] for item in valid],
+                [item[1] for item in valid],
+                marker=marker,
+                linestyle=line_style,
+                linewidth=2,
+                color=color,
+                label=f"{label} {phase_label}",
+            )
+            plotted = True
+    _set_sequence_ticks(axis, sequences)
+    axis.set_xlabel("Sequence length")
+    axis.set_ylabel("Mean stable phase time (s)")
+    axis.set_title("Stable step phase times vs. sequence length")
+    axis.grid(True, which="both", alpha=0.25)
+    if plotted:
+        axis.legend(ncol=2)
+    else:
+        _show_no_data(axis)
+    fig.tight_layout()
+    path = plots_dir / "02_step_phase_times.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    generated.append(path)
+
+    fig, cpu_axis = plt.subplots(figsize=(10, 6))
+    gpu_axis = cpu_axis.twinx()
+    cpu_plotted = False
+    gpu_plotted = False
+    handles: list[Any] = []
+    labels: list[str] = []
+    for index, (label, group) in enumerate(groups):
+        color = colors(index % 10)
+        cpu_points = [
+            (
+                int(row["sequence_length"]),
+                as_float(row.get("cpu_memory_peak_gb")),
+            )
+            for row in group
+        ]
+        valid_cpu = [
+            (sequence, value)
+            for sequence, value in cpu_points
+            if value is not None
+        ]
+        if valid_cpu:
+            line = cpu_axis.plot(
+                [item[0] for item in valid_cpu],
+                [item[1] for item in valid_cpu],
+                marker="o",
+                linewidth=2,
+                color=color,
+                label=f"{label} CPU",
+            )[0]
+            handles.append(line)
+            labels.append(line.get_label())
+            cpu_plotted = True
+
+        gpu_points = [
+            (
+                int(row["sequence_length"]),
+                as_float(row.get("gpu_memory_peak_gib")),
+            )
+            for row in group
+        ]
+        valid_gpu = [
+            (sequence, value)
+            for sequence, value in gpu_points
+            if value is not None
+        ]
+        if valid_gpu:
+            line = gpu_axis.plot(
+                [item[0] for item in valid_gpu],
+                [item[1] for item in valid_gpu],
+                marker="^",
+                linestyle="--",
+                linewidth=2,
+                color=color,
+                label=f"{label} GPU",
+            )[0]
+            handles.append(line)
+            labels.append(line.get_label())
+            gpu_plotted = True
+    _set_sequence_ticks(cpu_axis, sequences)
+    cpu_axis.set_xlabel("Sequence length")
+    cpu_axis.set_ylabel("CPU peak memory (decimal GB)")
+    gpu_axis.set_ylabel("GPU peak memory (GiB)")
+    cpu_axis.ticklabel_format(axis="y", style="plain", useOffset=False)
+    gpu_axis.ticklabel_format(axis="y", style="plain", useOffset=False)
+    cpu_axis.set_title("Peak CPU/GPU memory vs. sequence length")
+    cpu_axis.grid(True, which="both", alpha=0.25)
+    if handles:
+        cpu_axis.legend(handles, labels, ncol=2)
+    else:
+        _show_no_data(cpu_axis)
+    if not cpu_plotted:
+        cpu_axis.set_yticks([])
+    if not gpu_plotted:
+        gpu_axis.set_yticks([])
+    fig.tight_layout()
+    path = plots_dir / "03_peak_memory_vs_sequence.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    generated.append(path)
+    return generated
+
+
+def write_markdown(
+    path: Path,
+    root: Path,
+    rows: list[dict[str, Any]],
+    plot_paths: list[Path] | None = None,
+) -> None:
     lines = [
         "# Qwen3.5-35B-A3B BF16 TPS Sweep",
         "",
         f"- 结果根目录：`{root}`",
         "- 仅记录每个 optimizer step 的 forward、backward、optimizer 和 total host wall time。",
-        "- 不强制 CUDA 同步，不启用后端内部性能探针，不运行系统资源采样器，也不在 step 内写文件。",
+        "- CPU/GPU 内存由 step 计时路径之外的进程采样器记录，不计入 phase timer；consumer 不再设置 1 TiB cgroup hard limit，也不会因越线自动终止。",
+        "- KTransformers、DeepSpeed、APTMoE 不强制 CUDA 同步；MegaTrain 后端自身包含必要的 CUDA 同步，并在 timing_mode/status 中单独标注。",
+        "- CPU 峰值超过 1 TiB 与否仅作为观测结果，是否按 OOM 记录始终保留人工判断。",
         "- TPS 仅使用 `global_step > warmup_steps` 的稳定窗口。",
         "- exact-model run 从多模态源 checkpoint 仅加载 `Qwen3_5MoeForCausalLM`；proxy 只读取目标 config/tokenizer。",
         "- Full、LoRA exact-model 与 `deployment_proxy` 按 benchmark class 分组；proxy 使用随机权重，不能声明模型效果或真实 Qwen3.5 端到端训练 TPS。",
@@ -306,13 +592,16 @@ def write_markdown(path: Path, root: Path, rows: list[dict[str, Any]]) -> None:
                 cpu_line,
                 f"- 内存策略：{first.get('memory_limit')}；NUMA：{first.get('numa_policy')}",
                 "",
-                "| Seq | Stable steps | Mean step (s) | TPS | Forward (s) | Backward (s) | Optimizer (s) | Status |",
-                "|---:|---:|---:|---:|---:|---:|---:|---|",
+                "| Seq | Stable steps | Mean step (s) | TPS | Forward (s) | Backward (s) | Optimizer (s) | CPU peak (GB) | >1 TiB | GPU peak (GiB) | OOM review | Status |",
+                "|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|---|",
             ]
         )
-        for row in sorted(group, key=lambda item: int(item["sequence_length"])):
+        for row in sorted(
+            group,
+            key=lambda item: int(item["sequence_length"]),
+        ):
             lines.append(
-                "| {seq} | {steps} | {step} | {tps} | {forward} | {backward} | {optimizer} | {status} |".format(
+                "| {seq} | {steps} | {step} | {tps} | {forward} | {backward} | {optimizer} | {cpu_peak} | {exceeds} | {gpu_peak} | {oom} | {status} |".format(
                     seq=row["sequence_length"],
                     steps=row.get("stable_steps") or "-",
                     step=fmt(row.get("mean_step_sec")),
@@ -320,12 +609,29 @@ def write_markdown(path: Path, root: Path, rows: list[dict[str, Any]]) -> None:
                     forward=fmt(row.get("forward_sec")),
                     backward=fmt(row.get("backward_sec")),
                     optimizer=fmt(row.get("optimizer_sec")),
+                    cpu_peak=fmt(row.get("cpu_memory_peak_gb"), 2),
+                    exceeds=(
+                        "yes"
+                        if row.get("cpu_memory_exceeds_1tib") is True
+                        else "no"
+                        if row.get("cpu_memory_exceeds_1tib") is False
+                        else "-"
+                    ),
+                    gpu_peak=fmt(row.get("gpu_memory_peak_gib"), 2),
+                    oom=row.get("oom_classification") or "-",
                     status=row.get("status"),
                 )
             )
         lines.append("")
     if not rows:
         lines.append("尚无 run_config.json。")
+    if plot_paths:
+        lines.extend(["## 聚合图", ""])
+        for plot_path in plot_paths:
+            description = PLOT_DESCRIPTIONS.get(plot_path.name, plot_path.stem)
+            relative_path = plot_path.relative_to(path.parent)
+            lines.append(f"- {description}：`{relative_path}`")
+        lines.append("")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -341,13 +647,16 @@ def main() -> None:
         root.glob("**/seq_*/run_config.json"),
         key=lambda path: (
             str(path.parent.parent),
-            int(re.search(r"seq_(\d+)", path.parent.name).group(1)),
+            -int(re.search(r"seq_(\d+)", path.parent.name).group(1)),
         ),
     )
     rows = [aggregate_run(path) for path in configs]
     write_csv(output / "sweep_results.csv", rows)
-    write_markdown(output / "summary.md", root, rows)
+    plot_paths = generate_plots(output, rows)
+    write_markdown(output / "summary.md", root, rows, plot_paths)
     print(f"[aggregate] runs={len(rows)} -> {output / 'sweep_results.csv'}")
+    for plot_path in plot_paths:
+        print(f"[aggregate] plot -> {plot_path}")
     print(f"[aggregate] summary -> {output / 'summary.md'}")
 
 

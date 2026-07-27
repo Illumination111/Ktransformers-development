@@ -1,6 +1,9 @@
 # Conda environment dependency versions
 
-Captured from `sapphire4` at `2026-07-21T06:44:26Z`. This is an installed-state inventory generated from `conda list --json`; it includes Conda packages and packages recorded from PyPI, including transitive dependencies.
+Captured from `sapphire4` at `2026-07-21T06:44:26Z`; the MegaTrain environment
+was added and verified on `2026-07-27`. This is an installed-state inventory
+generated from `conda list --json`; it includes Conda packages and packages
+recorded from PyPI, including transitive dependencies.
 
 ## Environment summary
 
@@ -8,29 +11,37 @@ Captured from `sapphire4` at `2026-07-21T06:44:26Z`. This is an installed-state 
 | --- | --- | ---: | --- | --- |
 | Kllama | `/mnt/data2/wbw/conda/envs/Kllama` | 204 | 3.12.13 | 26.1.2 |
 | Deepspeed | `/mnt/data2/wbw/conda/envs/Deepspeed` | 198 | 3.12.13 | 26.1.2 |
+| Megatrain | `/mnt/data2/wbw/conda/envs/Megatrain` | 202 | 3.12.13 | 26.1.2 |
 
 ## Key ML stack
 
-| Package | Kllama | Deepspeed |
-| --- | --- | --- |
-| python | 3.12.13 | 3.12.13 |
-| pip | 26.1.2 | 26.1.2 |
-| torch | 2.9.1 | 2.9.1 |
-| torchvision | 0.24.1+cu128 | 0.24.1+cu128 |
-| torchaudio | 2.9.1+cu128 | 2.9.1+cu128 |
-| triton | 3.5.1 | 3.5.1 |
-| deepspeed | 0.19.2 | 0.19.2 |
-| transformers | 5.6.0 | 5.6.0 |
-| accelerate | 1.11.0 | 1.11.0 |
-| accelerate-kt | 1.14.0.post1 | — |
-| ktransformers | 0.6.3 | — |
-| kt-kernel | 0.6.3.post1 | — |
-| flash-attn | 2.8.3 | 2.8.3 |
-| numpy | 2.5.1 | 2.5.1 |
-| scipy | 1.18.0 | 1.18.0 |
-| datasets | 4.0.0 | 4.0.0 |
-| peft | 0.18.1 | 0.18.1 |
-| trl | 0.24.0 | 0.24.0 |
+| Package | Kllama | Deepspeed | Megatrain |
+| --- | --- | --- | --- |
+| python | 3.12.13 | 3.12.13 | 3.12.13 |
+| pip | 26.1.2 | 26.1.2 | 26.1.2 |
+| megatrain | — | — | 0.2.0 (editable) |
+| torch | 2.9.1 | 2.9.1 | 2.9.1+cu128 |
+| torchvision | 0.24.1+cu128 | 0.24.1+cu128 | 0.24.1+cu128 |
+| torchaudio | 2.9.1+cu128 | 2.9.1+cu128 | 2.9.1+cu128 |
+| triton | 3.5.1 | 3.5.1 | 3.5.1 |
+| deepspeed | 0.19.2 | 0.19.2 | 0.19.2 |
+| transformers | 5.6.0 | 5.6.0 | 5.6.0 |
+| accelerate | 1.11.0 | 1.11.0 | 1.11.0 |
+| accelerate-kt | 1.14.0.post1 | — | — |
+| ktransformers | 0.6.3 | — | — |
+| kt-kernel | 0.6.3.post1 | — | — |
+| flash-attn | 2.8.3 | 2.8.3 | 2.8.3 |
+| flash-linear-attention | — | 0.5.1 | 0.5.1 |
+| causal-conv1d | — | 1.6.2.post1 | 1.6.2.post1 |
+| numpy | 2.5.1 | 2.5.1 | 2.5.1 |
+| scipy | 1.18.0 | 1.18.0 | 1.18.0 |
+| datasets | 4.0.0 | 4.0.0 | 4.0.0 |
+| peft | 0.18.1 | 0.18.1 | 0.18.1 |
+| trl | 0.24.0 | 0.24.0 | 0.24.0 |
+
+MegaTrain was installed from `/mnt/data2/wbw/MegaTrain` with
+`pip install --no-deps --no-build-isolation -e .`. `pip check` reports no
+broken requirements, and the prebuilt DeepSpeed CPUAdam op is available.
 
 ## Kllama
 

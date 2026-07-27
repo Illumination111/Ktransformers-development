@@ -26,10 +26,10 @@ KTransformers 与 DeepSpeed 仍使用当前 LLaMA-Factory 入口运行真实
 - 序列长度：server 为 32、64、128、256、512、1024、2048、4096；
   consumer 为 16、32、64、128、256、512、1024、2048；
 - 每档 15 个 optimizer steps，前 5 步只作性能 warmup；
-- server：8 GPU、global batch 8；consumer：2 GPU、global batch 2、1 TiB
-  cgroup、无 swap、NUMA 0/1 interleave；
+- server：8 GPU、global batch 8；consumer：2 GPU、global batch 2、不创建
+  benchmark cgroup 内存上限、NUMA 0/1 interleave；
 - 只记录无 `cuda.synchronize()` 的 host-wall forward/backward/optimizer/step
-  边界时间，不启用资源采样器或内部 profiler。
+  边界时间，不启用内部 profiler；CPU/GPU 采样器位于 phase timer 之外。
 
 当前 APTMoE 不能满足这个正式口径：
 
@@ -100,7 +100,7 @@ YAML/SFT 数据入口运行 full update，仍须完成下文的入口、保存�
 - pipeline、offload、通信和保存是否工作；
 - 标注为 `qwen3_30b_operational_baseline` 的独立数据。
 
-不得把它放进 Qwen3.5 三后端 TPS 表，也不要按总参数比 34.66/30.53 对 TPS 做线性
+不得把它放进 Qwen3.5 等价后端 TPS 表，也不要按总参数比 34.66/30.53 对 TPS 做线性
 换算。
 
 ### B. 最小 Qwen3-shaped proxy：只对齐 CPU expert
@@ -355,9 +355,9 @@ workspace：
 64.56 GiB model weights 是持久参数下界；稀疏 routed experts 的 gradient/moment
 只在被路由后逐步建立，因此短 run 可能低于 258.24 GiB。258.24 GiB 是当前 BF16
 state 策略的全 materialization 规划值，但实际 RSS 仍可能因 activation、allocator
-和临时 buffer 超过它，必须通过 smoke run 测量。当前主机 2 TiB RAM、consumer
-1 TiB cgroup 从参数状态看有余量，但不能由此推断 GPU 一定可装下 token mixer、
-activation 和 expert staging。
+和临时 buffer 超过它，必须通过 smoke run 测量。当前主机约 2 TiB RAM；consumer
+不再用 1 TiB cgroup 自动终止，而是在结束后人工审阅峰值。参数状态有余量不能用于
+推断 GPU 一定可装下 token mixer、activation 和 expert staging。
 
 ## 分阶段执行方案
 
@@ -430,10 +430,10 @@ CPU expert forward/backward、256-way router、两类 attention forward/backward
 
 server 依次跑 32、64、128、256、512、1024、2048、4096，consumer 依次跑
 16、32、64、128、256、512、1024、2048；每档执行 15 个真实 optimizer updates，
-前 5 个 warmup、后 10 个计时。consumer 使用 1 TiB cgroup、关闭 swap并 NUMA 0/1
-interleave；server 使用 8 GPU。每档单独进程启动，输出 canonical step records、
-route/placement/fast-path manifest 和 `full_update_verification.json`，但不输出
-checkpoint。
+前 5 个 warmup、后 10 个计时。consumer 不创建内存 cgroup，仅使用 NUMA 0/1
+interleave，并在结束后人工审阅 CPU/GPU 内存曲线；server 使用 8 GPU。每档单独进程
+启动，输出 canonical step records、route/placement/fast-path manifest 和
+`full_update_verification.json`，但不输出 checkpoint。
 
 ## 与理想 Qwen3.5 APTMoE 的 TPS 关系
 

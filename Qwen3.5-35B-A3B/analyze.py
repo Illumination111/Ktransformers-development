@@ -33,18 +33,11 @@ try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import matplotlib.ticker as mticker
     from matplotlib.patches import Patch
     _HAS_MPL = True
 except ImportError:
     _HAS_MPL = False
     print("[analyze] matplotlib not installed, skipping plots. pip install matplotlib", file=sys.stderr)
-
-try:
-    import pandas as pd
-    _HAS_PD = True
-except ImportError:
-    _HAS_PD = False
 
 # --------------------------------------------------------------------------- #
 # 颜色定义（各 Phase 使用不同颜色）
@@ -86,7 +79,10 @@ def load_monitor_csv(csv_path: Path) -> dict:
         "event": [],
         "cpu_util": [],
         "ram_used_gb": [],
+        "proc_ram_gb": [],
+        "ram_plot_gb": [],
         "ram_total_gb": 0.0,
+        "has_proc_metrics": False,
         "disk_read_mbps": [],
         "disk_write_mbps": [],
         "gpus": {},
@@ -99,6 +95,9 @@ def load_monitor_csv(csv_path: Path) -> dict:
     if not rows:
         return data
 
+    has_proc_ram = "proc_ram_gb" in (rows[0] or {})
+    data["has_proc_metrics"] = has_proc_ram
+
     for r in rows:
         def _f(k, default=0.0):
             try:
@@ -110,7 +109,14 @@ def load_monitor_csv(csv_path: Path) -> dict:
         data["phase"].append(r.get("phase", ""))
         data["event"].append(r.get("event", ""))
         data["cpu_util"].append(_f("cpu_util_pct"))
-        data["ram_used_gb"].append(_f("ram_used_gb"))
+        host_ram = _f("ram_used_gb")
+        data["ram_used_gb"].append(host_ram)
+        if has_proc_ram:
+            process_ram = _f("proc_ram_gb")
+            data["proc_ram_gb"].append(process_ram)
+            data["ram_plot_gb"].append(process_ram)
+        else:
+            data["ram_plot_gb"].append(host_ram)
         data["disk_read_mbps"].append(_f("disk_read_mbps"))
         data["disk_write_mbps"].append(_f("disk_write_mbps"))
 
@@ -127,11 +133,21 @@ def load_monitor_csv(csv_path: Path) -> dict:
                     total_key = f"gpu{gi}_mem_total_mb"
                     data["gpus"][gi] = {
                         "mem_used": [],
+                        "proc_mem": [],
+                        "plot_mem": [],
                         "mem_total": _f(total_key) / 1024,
                         "sm_util": [],
                         "mem_util": [],
                     }
-                data["gpus"][gi]["mem_used"].append(_f(key) / 1024)
+                host_memory = _f(key) / 1024
+                data["gpus"][gi]["mem_used"].append(host_memory)
+                process_key = f"proc_gpu{gi}_mem_mb"
+                if process_key in r:
+                    process_memory = _f(process_key) / 1024
+                    data["gpus"][gi]["proc_mem"].append(process_memory)
+                    data["gpus"][gi]["plot_mem"].append(process_memory)
+                else:
+                    data["gpus"][gi]["plot_mem"].append(host_memory)
                 data["gpus"][gi]["sm_util"].append(_f(f"gpu{gi}_sm_util_pct"))
                 data["gpus"][gi]["mem_util"].append(_f(f"gpu{gi}_mem_util_pct"))
 
@@ -295,8 +311,21 @@ def plot_gpu_memory(monitor: dict, plots_dir: Path):
 
     # Sub-plot 1: VRAM usage (GB)
     ax = axes[0]
+    use_process = bool(monitor.get("has_proc_metrics"))
     for gi, gdata in sorted(gpus.items()):
-        ax.plot(elapsed, gdata["mem_used"], label=f"GPU{gi}", color=GPU_COLORS[gi % len(GPU_COLORS)], linewidth=1.2)
+        series = gdata.get("plot_mem") or gdata["mem_used"]
+        label = f"GPU{gi} task" if use_process else f"GPU{gi}"
+        ax.plot(elapsed, series, label=label, color=GPU_COLORS[gi % len(GPU_COLORS)], linewidth=1.2)
+        if use_process:
+            ax.plot(
+                elapsed,
+                gdata["mem_used"],
+                label=f"GPU{gi} device",
+                color=GPU_COLORS[gi % len(GPU_COLORS)],
+                linewidth=0.7,
+                alpha=0.3,
+                linestyle="--",
+            )
     if gpus:
         total = list(gpus.values())[0]["mem_total"]
         if total > 0:
@@ -333,7 +362,49 @@ def plot_cpu_ram(monitor: dict, plots_dir: Path):
     fig, axes = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
 
     ax = axes[0]
-    ax.plot(elapsed, monitor["ram_used_gb"], color="#e74c3c", linewidth=1.2, label="Used RAM")
+    use_process = bool(monitor.get("has_proc_metrics"))
+    ram_series = monitor.get("ram_plot_gb") or monitor["ram_used_gb"]
+    ax.plot(
+        elapsed,
+        ram_series,
+        color="#e74c3c",
+        linewidth=1.2,
+        label="Training process-tree RSS" if use_process else "Host used RAM",
+    )
+    if use_process:
+        ax.plot(
+            elapsed,
+            monitor["ram_used_gb"],
+            color="#7f8c8d",
+            linewidth=0.8,
+            alpha=0.45,
+            linestyle="--",
+            label="Host used RAM",
+        )
+    one_tib_gb = (1 << 40) / 1e9
+    ax.axhline(
+        y=one_tib_gb,
+        color="#8e44ad",
+        linestyle="-.",
+        linewidth=1.0,
+        label=f"Manual review threshold: 1 TiB ({one_tib_gb:.1f} GB)",
+    )
+    if ram_series:
+        peak_index = max(range(len(ram_series)), key=ram_series.__getitem__)
+        ax.scatter(
+            [elapsed[peak_index]],
+            [ram_series[peak_index]],
+            color="#c0392b",
+            s=20,
+            zorder=5,
+        )
+        ax.annotate(
+            f"peak {ram_series[peak_index]:.1f} GB",
+            (elapsed[peak_index], ram_series[peak_index]),
+            xytext=(6, 8),
+            textcoords="offset points",
+            fontsize=8,
+        )
     total = monitor.get("ram_total_gb", 0)
     if total > 0:
         ax.axhline(y=total, color="gray", linestyle=":", linewidth=0.8, label=f"Total RAM {total:.0f} GB")
@@ -515,7 +586,6 @@ def plot_phase_summary(monitor: dict, trainer_logs: dict, exit_codes: dict, plot
     peak_gpu_mem = {}
     peak_disk_write = {}
 
-    elapsed = monitor.get("elapsed", [])
     phase_list = monitor.get("phase", [])
     gpus = monitor.get("gpus", {})
     disk_write = monitor.get("disk_write_mbps", [])
@@ -539,11 +609,14 @@ def plot_phase_summary(monitor: dict, trainer_logs: dict, exit_codes: dict, plot
     step_counts = {ph: len(trainer_logs.get(ph, {}).get("steps", [])) for ph in phases}
     avg_loss = {}
     for ph in phases:
-        losses = [l for l in trainer_logs.get(ph, {}).get("loss", []) if l == l and l > 0]
+        losses = [
+            loss
+            for loss in trainer_logs.get(ph, {}).get("loss", [])
+            if loss == loss and loss > 0
+        ]
         avg_loss[ph] = sum(losses) / len(losses) if losses else 0
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
-    x = range(len(phases))
     bar_colors = [PHASE_COLORS.get(p, "#888888") for p in phases]
 
     def _bar(ax, vals, title, ylabel, note=""):
@@ -582,7 +655,6 @@ def plot_phase_summary(monitor: dict, trainer_logs: dict, exit_codes: dict, plot
         if ec is not None and ec != 0:
             for ax_row in axes:
                 for ax in ax_row:
-                    bars = ax.containers
                     ax.text(i, 0, f"ec={ec}", ha="center", va="bottom",
                             fontsize=6, color="red", fontweight="bold")
 
@@ -627,7 +699,7 @@ def generate_summary_md(
         ec = exit_codes.get(ph, None)
         tl = trainer_logs.get(ph, {})
         steps_done = len(tl.get("steps", []))
-        losses = [l for l in tl.get("loss", []) if l == l and l > 0]
+        losses = [loss for loss in tl.get("loss", []) if loss == loss and loss > 0]
         last_loss = f"{losses[-1]:.4f}" if losses else "N/A"
         ec_str = str(ec) if ec is not None else "跳过"
         status = "✓" if ec == 0 else ("⚠ 跳过" if ec is None else f"✗ 失败({ec})")
@@ -851,7 +923,7 @@ def main():
     print("[analyze] generating summary.md ...")
     summary_path = generate_summary_md(log_dir, monitor, trainer_logs, exit_codes)
 
-    print(f"\n[analyze] done.")
+    print("\n[analyze] done.")
     print(f"  plots  : {plots_dir}")
     print(f"  summary: {summary_path}")
 
