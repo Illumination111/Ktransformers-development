@@ -31,6 +31,7 @@ STEP_KEYS = (
     "step_total_sec",
     "step_tps",
 )
+_CURRENT_RECORDER: StepPhaseRecorder | None = None
 
 
 def _env_int(name: str, default: int) -> int:
@@ -236,13 +237,16 @@ def _wrap_deepspeed_step(trainer: Any, recorder: StepPhaseRecorder) -> None:
     engine._fft_coarse_step_timed = True
 
 
-def _patch_get_batch_samples(recorder: StepPhaseRecorder) -> None:
+def _patch_get_batch_samples() -> None:
     if getattr(Trainer, "_fft_coarse_get_batch_patched", False):
         return
     original = Trainer.get_batch_samples
 
     @functools.wraps(original)
     def timed_get_batch_samples(self: Trainer, *args: Any, **kwargs: Any) -> Any:
+        recorder = getattr(self, "_fft_step_phase_recorder", None)
+        if recorder is None:
+            return original(self, *args, **kwargs)
         recorder.begin_step()
         try:
             return original(self, *args, **kwargs)
@@ -254,13 +258,16 @@ def _patch_get_batch_samples(recorder: StepPhaseRecorder) -> None:
     Trainer._fft_coarse_get_batch_patched = True
 
 
-def _patch_training_step(recorder: StepPhaseRecorder) -> None:
+def _patch_training_step() -> None:
     if getattr(Trainer, "_fft_coarse_training_step_patched", False):
         return
     original = Trainer.training_step
 
     @functools.wraps(original)
     def timed_training_step(self: Trainer, *args: Any, **kwargs: Any) -> Any:
+        recorder = getattr(self, "_fft_step_phase_recorder", None)
+        if recorder is None:
+            return original(self, *args, **kwargs)
         recorder.add_microbatch()
         if recorder.backend == "deepspeed":
             _wrap_deepspeed_step(self, recorder)
@@ -330,12 +337,18 @@ class StepPhaseTimingCallback(TrainerCallback):
 
     def on_train_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
         self.recorder.write()
+        marker = os.environ.get("FFT_CUDA_CACHE_HOLD_MARKER")
+        if marker:
+            marker_path = Path(marker)
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_path.touch()
         return control
 
 
 def install_step_phase_timing() -> StepPhaseRecorder:
     """Install the minimal timer before LLaMA-Factory constructs its Trainer."""
 
+    global _CURRENT_RECORDER
     out_dir = Path(os.environ.get("FFT_STEP_TIMING_OUT_DIR", "step_timing"))
     recorder = StepPhaseRecorder(
         out_dir=out_dir,
@@ -343,20 +356,23 @@ def install_step_phase_timing() -> StepPhaseRecorder:
         tokens_per_step=_env_int("FFT_STEP_TIMING_TOKENS_PER_STEP", 0),
         backend=os.environ.get("FFT_TRAINING_BACKEND", "unknown").strip().lower(),
     )
-    _patch_get_batch_samples(recorder)
-    _patch_training_step(recorder)
+    _CURRENT_RECORDER = recorder
+    _patch_get_batch_samples()
+    _patch_training_step()
 
-    if getattr(Trainer, "_fft_coarse_callback_installed", False):
-        return recorder
-    original_init = Trainer.__init__
+    if not getattr(Trainer, "_fft_coarse_callback_installed", False):
+        original_init = Trainer.__init__
 
-    @functools.wraps(original_init)
-    def patched_init(self: Trainer, *args: Any, **kwargs: Any) -> None:
-        original_init(self, *args, **kwargs)
-        self.add_callback(StepPhaseTimingCallback(recorder))
+        @functools.wraps(original_init)
+        def patched_init(self: Trainer, *args: Any, **kwargs: Any) -> None:
+            original_init(self, *args, **kwargs)
+            active_recorder = _CURRENT_RECORDER
+            if active_recorder is not None:
+                self._fft_step_phase_recorder = active_recorder
+                self.add_callback(StepPhaseTimingCallback(active_recorder))
 
-    Trainer.__init__ = patched_init
-    Trainer._fft_coarse_callback_installed = True
+        Trainer.__init__ = patched_init
+        Trainer._fft_coarse_callback_installed = True
     atexit.register(recorder.write)
     print(
         f"[step_phase_timer] mode={TIMING_MODE} backend={recorder.backend} out={out_dir}",

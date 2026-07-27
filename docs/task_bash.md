@@ -1,6 +1,7 @@
-# Qwen3.5-35B-A3B 三后端文本-only BF16 全量微调脚本调用与参数配置
+# Qwen3.5-35B-A3B 四后端文本-only BF16 全量微调脚本调用与参数配置
 
-三个后端共用同一套参数解析、序列长度 sweep、TPS 计时和资源限制逻辑。BF16 是硬编码配置，不能切换为 FP16/FP32。
+四个后端共用同一套参数解析、按 profile 独立定义的序列长度 sweep、TPS 计时和
+资源观测逻辑。BF16 是硬编码配置，不能切换为 FP16/FP32。
 
 本地 Qwen3.5 checkpoint 是多模态的，但本测试强制只加载
 `Qwen3_5MoeForCausalLM` 文本子模型：视觉塔、`Conv3d`、多模态 processor 和视觉
@@ -12,8 +13,9 @@
 
 ```text
 server：8 GPU、全局 batch 8、使用主机约 2T 内存
-consumer：2 GPU、全局 batch 2、限制 1 TiB 内存
-sequence length：32、64、128、256、512、1024、2048、4096
+consumer：2 GPU、全局 batch 2、不设 benchmark 内存上限、完成后人工审阅 1 TiB 峰值
+server sequence：4096、2048、1024、512、256、128、64、32
+consumer sequence：2048、1024、512、256、128、64、32、16
 每个长度：15 steps，排除前 5 个 warmup steps
 精度：BF16
 模型：text-only Qwen3_5MoeForCausalLM
@@ -23,6 +25,11 @@ sequence length：32、64、128、256、512、1024、2048、4096
 线程按可见物理核心数除以训练 rank 数自动计算；在当前 96 物理核心主机上，server
 为 12 线程/rank，consumer 为 48 线程/rank。
 
+下面四条完整启动命令均故意不传 `--seq-lengths`。脚本会让 server 从 4096 递减到
+32，让 consumer 从 2048 递减到 16；尤其在
+`--profile both` 下，不能在启动命令中设置一份公共 sequence length 列表来替代这两套
+profile 默认值。
+
 ### KTransformers：一条命令跑完整测试
 
 该命令自动使用 `Kllama` Conda 环境和 AMXBF16 后端：
@@ -31,7 +38,6 @@ sequence length：32、64、128、256、512、1024、2048、4096
 bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransformers.sh \
   --profile both \
   --devices 0,1,2,3,4,5,6,7 \
-  --seq-lengths 32,64,128,256,512,1024,2048,4096 \
   --steps 15 \
   --warmup-steps 5 \
   --gas 1 \
@@ -41,7 +47,6 @@ bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransfo
   --dataset-name fft_real_100 \
   --log-base /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/test_log \
   --kt-distributed-checkpoint-reuse on \
-  --consumer-cgroup-mode auto \
   --continue-on-error
 ```
 
@@ -53,7 +58,7 @@ checkpoint 语义正常重算。该开关仅作用于 KTransformers，且默认�
 KTransformers 和 DeepSpeed 生成的 LLaMA-Factory 配置都固定使用非重入式 checkpoint：
 `gradient_checkpointing_kwargs: {use_reentrant: false}`。这也避免 Transformers `Trainer`
 的二次初始化把 KTransformers 所需的非重入式 checkpoint 静默改回 LLaMA-Factory 的
-reentrant 默认值。APTMoE 使用外部 adapter；做三后端严格对比时，该 adapter 也应采用
+reentrant 默认值。APTMoE 使用外部 adapter；做跨后端严格对比时，该 adapter 也应采用
 等价的非重入式 checkpoint 设置。
 
 ### DeepSpeed：一条命令跑完整测试
@@ -64,7 +69,6 @@ reentrant 默认值。APTMoE 使用外部 adapter；做三后端严格对比时�
 bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_deepspeed.sh \
   --profile both \
   --devices 0,1,2,3,4,5,6,7 \
-  --seq-lengths 32,64,128,256,512,1024,2048,4096 \
   --steps 15 \
   --warmup-steps 5 \
   --gas 1 \
@@ -73,7 +77,6 @@ bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_deepspee
   --dataset-dir /mnt/data2/wbw/FFTtest/dataset \
   --dataset-name fft_real_100 \
   --log-base /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/test_log \
-  --consumer-cgroup-mode auto \
   --continue-on-error
 ```
 
@@ -82,14 +85,13 @@ DeepSpeed 的 CPUAdam/ZeRO 内部探针不可启用。脚本会强制使用
 
 ### APTMoE：一条命令跑完整测试
 
-APTMoE 目前必须先准备已经完成 Qwen3.5 全量训练适配的 Python 入口。将下面命令中
-两个 `/path/to/...` 替换为真实路径后即可启动：
+APTMoE 使用项目内置的 Qwen3.5 component-isomorphic deployment proxy。下面显式写出
+当前主机上已经验证可用的 Aptmoe Python 和 proxy 入口路径：
 
 ```bash
 bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_aptmoe.sh \
   --profile both \
   --devices 0,1,2,3,4,5,6,7 \
-  --seq-lengths 32,64,128,256,512,1024,2048,4096 \
   --steps 15 \
   --warmup-steps 5 \
   --gas 1 \
@@ -98,17 +100,47 @@ bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_aptmoe.s
   --dataset-dir /mnt/data2/wbw/FFTtest/dataset \
   --dataset-name fft_real_100 \
   --log-base /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/test_log \
-  --consumer-cgroup-mode auto \
-  --aptmoe-python /path/to/aptmoe-env/bin/python \
-  --aptmoe-entrypoint /path/to/qwen35_aptmoe_bf16_adapter.py \
+  --aptmoe-python /mnt/data2/wbw/conda/envs/Aptmoe/bin/python3 \
+  --aptmoe-entrypoint /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/aptmoe_qwen35_proxy_train.py \
   --continue-on-error
 ```
 
-APTMoE adapter 必须接受脚本传入的 `--text-only`，并保证只构造
-`Qwen3_5MoeForCausalLM`，不得加载视觉塔或 processor。它还必须生成
-`<step-timing-output-dir>/step_timing.json`。具体参数契约见
-[README_PERF_SWEEP.md](../Qwen3.5-35B-A3B/README_PERF_SWEEP.md)。未提供 adapter
-时只能执行 `--dry-run`，真实训练会明确终止。
+这两个参数也可以完全省略，脚本会自动找到同一 Python 环境和内置入口。不要传入
+`/path/to/...` 示例占位符：显式 `--aptmoe-python` 会覆盖自动检测，即使当前 shell
+已经激活 `(Aptmoe)`，不存在的覆盖路径仍会导致
+`Python for backend aptmoe was not found`。
+
+正式测试还要求预先准备精确 route trace、对应 profile 的 lookup table 和
+linear-attention fast path；缺少时脚本会在大规模参数分配前终止。仅验证流程时可按
+[README_PERF_SWEEP.md](../Qwen3.5-35B-A3B/README_PERF_SWEEP.md) 添加三个显式
+fallback 参数，这类结果会固定标记为 `SMOKE_ONLY`。
+
+### MegaTrain：一条命令跑完整测试
+
+该命令使用新建的 `Megatrain` Conda 环境和本地 MegaTrain checkout：
+
+```bash
+bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_megatrain.sh \
+  --profile both \
+  --devices 0,1,2,3,4,5,6,7 \
+  --steps 15 \
+  --warmup-steps 5 \
+  --gas 1 \
+  --learning-rate 1.0e-5 \
+  --model-path /mnt/data3/models/Qwen3.5-35B-A3B \
+  --dataset-dir /mnt/data2/wbw/FFTtest/dataset \
+  --dataset-name fft_real_100 \
+  --log-base /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/test_log \
+  --megatrain-root /mnt/data2/wbw/MegaTrain \
+  --continue-on-error
+```
+
+脚本默认使用 `/mnt/data2/wbw/conda/envs/Megatrain` 和
+`/mnt/data2/wbw/MegaTrain`，因此 `--megatrain-root` 也可以省略。MegaTrain 入口仍然
+强制提取 text-only `Qwen3_5MoeForCausalLM`，使用 `CPUMasterModel` 和预编译的
+DeepSpeedCPUAdam；不会把视觉塔或 MTP 参数加入训练。由于 MegaTrain 后端流水线自身
+包含必要的 CUDA 同步，其结果使用独立 timing mode，并在汇总中标记
+`OK_BACKEND_SYNC`。
 
 ### 只运行单个 profile
 
@@ -121,7 +153,7 @@ bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransfo
   --devices 0,1,2,3,4,5,6,7 \
   --kt-distributed-checkpoint-reuse on
 
-# KTransformers consumer：2 卡、1 TiB 内存
+# KTransformers consumer：2 卡、无硬限制，完成后人工审阅 1 TiB
 bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransformers.sh \
   --profile consumer \
   --devices 0,1 \
@@ -136,19 +168,31 @@ bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_deepspee
 bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_deepspeed.sh \
   --profile consumer \
   --devices 0,1
+
+# MegaTrain server
+bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_megatrain.sh \
+  --profile server \
+  --devices 0,1,2,3,4,5,6,7
+
+# MegaTrain consumer
+bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_megatrain.sh \
+  --profile consumer \
+  --devices 0,1
 ```
 
-### 三后端统一计时规则
+### 四后端统一输出与计时差异
 
-三套脚本只记录每个 optimizer step 的：
+四套脚本只记录每个 optimizer step 的：
 
 - forward host wall time；
 - backward host wall time；
 - optimizer host wall time；
 - 完整 optimizer-step wall time 和据此计算的 TPS。
 
-计时器只读取 `time.perf_counter()`，不调用 `torch.cuda.synchronize()`；逐 step
-记录先缓存在内存中，训练结束后统一写出。所有后端都强制设置：
+KTransformers、DeepSpeed、APTMoE 计时器只读取 `time.perf_counter()`，不主动
+调用 `torch.cuda.synchronize()`；MegaTrain 保留后端流水线内部必要的 CUDA 同步，
+并以独立 timing mode/`OK_BACKEND_SYNC` 状态标注。逐 step 记录先缓存在内存中，
+训练结束后统一写出。所有后端都强制设置：
 
 ```text
 DS_PROBE_MODE=off
@@ -157,48 +201,49 @@ KT_SFT_PROFILE=0
 FFT_DISABLE_PERF_PROBES=1
 ```
 
-脚本不会在训练期间启动 CPU、磁盘、GPU 或内存采样进程。这里的阶段耗时是训练
-API 的 host wall time，不应解释为纯 GPU kernel 时间。
+脚本会在 phase timer 外启动进程树 CPU/GPU 内存采样器。采样器不因越过 1 TiB
+终止训练；这里的阶段耗时是训练 API 的 host wall time，不应解释为纯 GPU kernel
+时间。
 
 ## 2. Profile 固定配置
 
 | Profile | GPU | 每卡 batch | 全局 micro-batch | 每个 optimizer step 的有效 batch | 内存 |
 |---|---:|---:|---:|---:|---|
 | server | 8 | 1 | 8 | `8 × GAS` | 不设置 cgroup 上限 |
-| consumer | 2 | 1 | 2 | `2 × GAS` | 恰好 1 TiB，禁止 swap |
+| consumer | 2 | 1 | 2 | `2 × GAS` | 不设置 benchmark cgroup 上限；人工审阅 1 TiB |
 
 GPU 数量和 batch 不提供单独的 `--gpus`、`--batch-size` 参数，避免测试时破坏 server/consumer 定义。
 
 consumer 使用：
 
 ```text
-MemoryMax=1T
-MemorySwapMax=0
 numactl --interleave=0,1
+monitor.csv -> plots/01_gpu_memory.png + plots/02_cpu_ram.png
+memory_summary.md/json -> MANUAL_REVIEW_REQUIRED
 ```
 
-训练启动前会验证实际 cgroup 上限和 NUMA policy，然后校验程序通过 `exec`
-替换为训练进程，不会在性能测试期间保留采样进程。默认自动选择 cgroup 模式；
-如果用户级 systemd 不可用，可以使用：
+训练启动前只记录外部已有的 cgroup/swap 状态并验证 NUMA policy；不创建
+`MemoryMax`、不关闭 swap，也不会在内存峰值超过 1 TiB 时自动按 OOM 归类。
 
-```bash
-# 通过系统级 systemd 创建限制，可能需要管理员权限
-bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransformers.sh \
-  --profile consumer \
-  --consumer-cgroup-mode system
+每个 profile 只启动一次 rank/worker 集合。consumer 会在同一批持久进程中依次运行
+`2048 → 1024 → … → 16`；2048 完成后不调用 `torch.cuda.empty_cache()`，其 CUDA
+caching allocator/最长 buffer 达到的峰值一直保留到 16 完成，之后进程退出才统一
+释放。KTransformers、DeepSpeed 和 APTMoE 的 NCCL process group，以及 MegaTrain
+的 GPU worker，也都只在 profile 结束后清理。server 同理保留 4096 的峰值直到 32
+完成。
 
-# 当前 shell 已经位于恰好 1 TiB 的 cgroup 中
-bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransformers.sh \
-  --profile consumer \
-  --consumer-cgroup-mode prelimited
-```
+profile 级 `gpu_peak_hold.json` 会用 `monitor.csv` 的 phase 分段逐卡验证后续长度的
+最小任务显存没有跌破最长项峰值（默认容差 512 MiB）。验证失败标记
+`GPU_PEAK_HOLD_BROKEN_NOT_OOM`；测试前 GPU 已忙标记 `GPU_BUSY_NOT_OOM`；最后统一
+释放未确认标记 `GPU_RELEASE_UNCONFIRMED_NOT_OOM`。这些资源隔离状态都不会误报为
+训练 OOM，也不会结束同机其他任务。
 
 ## 3. 公共参数
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `--profile` | `server` | `server`、`consumer` 或 `both` |
-| `--seq-lengths` | 八档全部 | 逗号分隔的 sequence length |
+| `--seq-lengths` | 按 profile 选择 | 高级单-profile 覆盖项；输入后仍自动按从长到短执行 |
 | `--steps` | `15` | 每个 sequence 的 optimizer steps |
 | `--warmup-steps` | `5` | 前 N 步不计入稳定 TPS |
 | `--gas` | `1` | Gradient accumulation steps |
@@ -210,7 +255,7 @@ bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransfo
 | `--dataset-name` | `fft_real_100` | `dataset_info.json` 中的数据集名称 |
 | `--log-base` | 当前目录下 `test_log` | 测试结果根目录 |
 | `--kt-distributed-checkpoint-reuse` | `on` | KTransformers 多卡 checkpoint 重算复用第一次 CPU MoE forward；可设为 `off` 做 A/B 对照 |
-| `--continue-on-error` | 关闭 | 某个长度失败后继续后续测试 |
+| `--continue-on-error` | 关闭 | 兼容参数；持久 CUDA profile 一旦执行失败会停止，避免在损坏的 CUDA 状态中继续 |
 | `--keep-model-output` | 关闭 | 保留最终模型；默认跳过完整权重保存 |
 | `--skip-dataset-check` | 关闭 | 跳过 tokenizer 长度校验 |
 | `--dry-run` | 关闭 | 只生成配置并打印命令 |
@@ -218,16 +263,13 @@ bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransfo
 默认 sequence length 为：
 
 ```text
-32,64,128,256,512,1024,2048,4096
+server: 4096,2048,1024,512,256,128,64,32
+consumer: 2048,1024,512,256,128,64,32,16
 ```
 
-例如只测试 512、2048 和 4096：
-
-```bash
-bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransformers.sh \
-  --profile server \
-  --seq-lengths 512,2048,4096
-```
+完整对比测试应保留这些 profile 默认值。`--seq-lengths` 只保留给临时的单-profile
+诊断；不要在 `--profile both` 的启动命令中传入，否则一份覆盖值会同时作用于 server
+和 consumer，破坏两类机器规格各自的长度范围。
 
 修改步数与 warmup：
 
@@ -296,9 +338,12 @@ bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransfo
 
 FFT_CONDA_ENV=Deepspeed \
 bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_deepspeed.sh --profile server
+
+FFT_CONDA_ENV=Megatrain \
+bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_megatrain.sh --profile server
 ```
 
-DeepSpeed 和 APTMoE 默认使用
+DeepSpeed、APTMoE 和 MegaTrain 默认使用
 `floor(当前进程可见物理核心数 / profile 的 GPU/rank 数)`。KTransformers
 只有 global rank0 创建 CPU MoE backend，因此改为 rank-aware 分配：非 owner
 rank 各 2 线程，预留 2 个物理核，其余核心交给 rank0。在当前 96 核主机上，
@@ -336,14 +381,17 @@ bash /mnt/data2/wbw/FFTtest/Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_deepspee
 - KTransformers 8 卡：[accelerate_ktransformers_bf16_8gpu.yaml](../Qwen3.5-35B-A3B/configs/accelerate_ktransformers_bf16_8gpu.yaml)
 - KTransformers 2 卡：[accelerate_ktransformers_bf16_2gpu.yaml](../Qwen3.5-35B-A3B/configs/accelerate_ktransformers_bf16_2gpu.yaml)
 - DeepSpeed ZeRO-3：[deepspeed_zero3_offload_bf16.json](../Qwen3.5-35B-A3B/configs/deepspeed_zero3_offload_bf16.json)
+- MegaTrain 基础配置：[megatrain_qwen35_bf16.yaml](../Qwen3.5-35B-A3B/configs/megatrain_qwen35_bf16.yaml)
+- MegaTrain text-only 训练入口：[megatrain_qwen35_train.py](../Qwen3.5-35B-A3B/megatrain_qwen35_train.py)
 - 公共启动逻辑：[run_finetune_perf_sweep_bf16_common.sh](../Qwen3.5-35B-A3B/run_finetune_perf_sweep_bf16_common.sh)
 - 文本-only 加载契约：[qwen35_text_only.py](../Qwen3.5-35B-A3B/qwen35_text_only.py)
 - 统一粗粒度计时器：[step_phase_timer.py](../Qwen3.5-35B-A3B/step_phase_timer.py)
 - 一次性资源校验/启动器：[resource_scope_exec.py](../Qwen3.5-35B-A3B/resource_scope_exec.py)
 - 计时契约校验器：[validate_step_timing.py](../Qwen3.5-35B-A3B/validate_step_timing.py)
 
-每个 sequence 都会在日志目录生成独立的 `train_config.yaml`；KTransformers 还会
-生成写入实际 `kt_num_threads` 的 `accelerate_config.yaml`。这些才是当次测试的最终配置。
+KTransformers、DeepSpeed 每个 sequence 会生成 `train_config.yaml`，MegaTrain 会生成
+`megatrain_config.yaml`；KTransformers 还会生成写入实际 `kt_num_threads` 的
+`accelerate_config.yaml`。这些才是当次测试的最终配置。
 
 建议正式测试前先执行：
 
@@ -360,11 +408,24 @@ test_log/<timestamp>_<backend>_BF16_FULL_SWEEP/
 ├── summary.md
 ├── sweep_results.csv
 ├── dataset_validation.json
-├── server_8gpu_batch8/seq_*/
+├── server_8gpu_batch8/
+│   ├── profile_sweep_manifest.json
 │   ├── resource_contract.json
-│   └── step_timing/step_timing.{json,csv,md}
-└── consumer_2gpu_batch2/seq_*/
+│   ├── gpu_lifecycle.json
+│   ├── gpu_peak_hold.json
+│   ├── monitor.csv
+│   ├── train.log
+│   └── seq_*/
+│       ├── memory_summary.{md,json}
+│       ├── plots/{01_gpu_memory.png,02_cpu_ram.png}
+│       └── step_timing/step_timing.{json,csv,md}
+└── consumer_2gpu_batch2/（同样结构）
 ```
+
+`summary.md` 与 `sweep_results.csv` 不要求同时运行两个 profile。启动训练前会注册
+`EXIT` finalizer；只运行 consumer/server、训练失败或脚本主体提前结束时，只要已经
+生成至少一个 `run_config.json`，都会对现有结果执行汇总。若汇总器自身失败且训练
+原退出码为 0，脚本以 98 退出。
 
 稳定 TPS 公式为：
 

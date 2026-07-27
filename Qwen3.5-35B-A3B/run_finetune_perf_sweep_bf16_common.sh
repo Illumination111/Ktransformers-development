@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Shared Qwen3.5-35B-A3B text-only native-BF16 fine-tuning sequence sweep.
-# Invoke through one of the three backend-specific wrapper scripts.
+# Invoke through one of the four backend-specific wrapper scripts.
 
 set -Eeuo pipefail
 
@@ -21,6 +21,25 @@ VALIDATOR="${SCRIPT_DIR}/validate_benchmark_dataset.py"
 AGGREGATOR="${SCRIPT_DIR}/aggregate_sweep_results.py"
 TIMING_VALIDATOR="${SCRIPT_DIR}/validate_step_timing.py"
 RESOURCE_EXEC="${SCRIPT_DIR}/resource_scope_exec.py"
+MONITOR_SCRIPT="${SCRIPT_DIR}/monitor.py"
+MEMORY_ANALYZER="${SCRIPT_DIR}/analyze_memory_usage.py"
+GPU_LIFECYCLE_GUARD="${SCRIPT_DIR}/gpu_lifecycle_guard.py"
+GPU_PEAK_HOLD_VERIFIER="${SCRIPT_DIR}/verify_gpu_peak_hold.py"
+MEGATRAIN_ROOT="${FFT_MEGATRAIN_ROOT:-/mnt/data2/wbw/MegaTrain}"
+MEGATRAIN_ENTRYPOINT="${SCRIPT_DIR}/megatrain_qwen35_train.py"
+MEGATRAIN_SWEEP_ENTRYPOINT="${SCRIPT_DIR}/megatrain_qwen35_sweep.py"
+MEGATRAIN_CONFIG_BASE="${CONFIGS_DIR}/megatrain_qwen35_bf16.yaml"
+APTMOE_SWEEP_ENTRYPOINT="${SCRIPT_DIR}/aptmoe_qwen35_sweep.py"
+ACTIVE_MONITOR_PID=""
+ACTIVE_MONITOR_FIFO=""
+ACTIVE_TRAIN_GUARD_PID=""
+ACTIVE_TEE_PID=""
+ACTIVE_LOG_FIFO=""
+GPU_RELEASE_TIMEOUT="${FFT_GPU_RELEASE_TIMEOUT:-60}"
+GPU_RELEASE_TOLERANCE_MIB="${FFT_GPU_RELEASE_TOLERANCE_MIB:-512}"
+GPU_PEAK_HOLD_TOLERANCE_MIB="${FFT_GPU_PEAK_HOLD_TOLERANCE_MIB:-512}"
+PREPARE_ONLY=0
+SUMMARY_FINALIZED=0
 
 if [[ $# -lt 1 ]]; then
     echo "Internal error: backend argument is required" >&2
@@ -29,14 +48,14 @@ fi
 BACKEND="$1"
 shift
 case "${BACKEND}" in
-    ktransformers|deepspeed|aptmoe) ;;
+    ktransformers|deepspeed|aptmoe|megatrain) ;;
     *) echo "Unsupported backend: ${BACKEND}" >&2; exit 2 ;;
 esac
 
 PROFILE="server"
 FINETUNING_TYPE="full"
-readonly -a SERVER_SEQUENCE_LENGTHS=(32 64 128 256 512 1024 2048 4096)
-readonly -a CONSUMER_SEQUENCE_LENGTHS=(16 32 64 128 256 512 1024 2048)
+readonly -a SERVER_SEQUENCE_LENGTHS=(4096 2048 1024 512 256 128 64 32)
+readonly -a CONSUMER_SEQUENCE_LENGTHS=(2048 1024 512 256 128 64 32 16)
 SEQUENCE_LENGTHS_CSV=""
 SEQUENCE_LENGTHS_OVERRIDE_SET=0
 STEPS=15
@@ -54,13 +73,9 @@ CPU_THREADS_OVERRIDE="${FFT_CPU_THREADS:-}"
 KT_OWNER_THREADS_OVERRIDE="${FFT_KT_OWNER_THREADS:-}"
 KT_DISTRIBUTED_CHECKPOINT_REUSE="${FFT_KT_DISTRIBUTED_CHECKPOINT_REUSE:-on}"
 
-# Consumer resource contract: an aggregate 1 TiB cgroup hard limit, no swap,
-# and equal interleaving across the two 1-TiB NUMA nodes. The interleave policy
-# targets 512 GiB per node when the cgroup reaches its limit.
-CONSUMER_MEMORY_LIMIT="1T"
-CONSUMER_MEMORY_LIMIT_BYTES=1099511627776
+# Consumer runs retain equal NUMA interleaving but have no benchmark-created
+# cgroup memory cap. CPU/GPU memory is sampled for post-run manual review.
 CONSUMER_NUMA_NODES="${FFT_CONSUMER_NUMA_NODES:-0,1}"
-CONSUMER_CGROUP_MODE="${FFT_CONSUMER_CGROUP_MODE:-auto}"
 
 APTMOE_ROOT="${FFT_APTMOE_ROOT:-/mnt/data2/wbw/APTMoE-baseline}"
 APTMOE_SIMULATION_ROOT="${FFT_APTMOE_SIMULATION_ROOT:-${FFT_ROOT}/APTMoE-simulate}"
@@ -83,7 +98,7 @@ Usage: bash $(basename "$0") [options]
 Profiles:
   --profile server|consumer|both
       server   : 8 GPUs, global batch 8, no memory cgroup cap (host ~2T)
-      consumer : 2 GPUs, global batch 2, hard 1T cgroup cap, NUMA 0/1 interleave
+      consumer : 2 GPUs, global batch 2, no benchmark memory cap, NUMA 0/1 interleave
 
 Sweep and training (BF16 only):
   --finetuning-type TYPE      full or lora (default: full)
@@ -91,9 +106,10 @@ Sweep and training (BF16 only):
   --lora-alpha N              LoRA alpha when TYPE=lora (default: 16)
                                 LoRA target is fixed to all
   --seq-lengths LIST           Override the selected profile default(s)
-                                server:   32,64,128,256,512,1024,2048,4096
-                                consumer: 16,32,64,128,256,512,1024,2048
+                                server:   4096,2048,1024,512,256,128,64,32
+                                consumer: 2048,1024,512,256,128,64,32,16
                                 With profile=both, every override must be valid for both
+                                All selected lengths run from largest to smallest
   --steps N                    Optimizer steps per sequence (default: 15)
   --warmup-steps N             Initial steps excluded from stable TPS (default: 5)
   --gas N                      Gradient accumulation steps (default: 1)
@@ -114,8 +130,12 @@ KTransformers checkpoint reuse:
                                 checkpoint recompute (default: on)
 
 Consumer memory policy:
-  --consumer-cgroup-mode MODE  auto, user, system, or prelimited (default: auto)
   --consumer-numa-nodes LIST   Equal-interleave nodes (default: 0,1)
+  CPU/GPU memory is sampled throughout training. No process is killed at 1 TiB;
+  plots and memory_summary.md are produced for manual OOM classification.
+
+MegaTrain (megatrain wrapper only):
+  --megatrain-root PATH        MegaTrain checkout (default: /mnt/data2/wbw/MegaTrain)
 
 APTMoE deployment proxy (aptmoe wrapper only):
   --aptmoe-root PATH           APTMoE-baseline checkout
@@ -143,7 +163,12 @@ Other:
   -h, --help                   Show this help
 
 Timing records only per-step forward, backward, optimizer, and total wall time.
-Backend-internal profilers, forced CUDA synchronization, and resource samplers are disabled.
+CPU/GPU resource sampling runs outside the phase timing path. MegaTrain's
+backend-required CUDA synchronization is explicitly labelled in its results.
+Each profile uses one persistent rank/worker set. The longest sequence runs
+first; its CUDA allocator peak stays held through every shorter sequence and is
+released only after the profile ends. Busy GPUs, a broken peak hold, and an
+unconfirmed final release use dedicated statuses and are not called OOM.
 Exact backends load Qwen3_5MoeForCausalLM without a visual tower; the APTMoE proxy reads only target config/tokenizer.
 TPS = GPUs * per-device batch * sequence length * GAS / post-warmup mean step time.
 EOF
@@ -176,8 +201,8 @@ while [[ $# -gt 0 ]]; do
         --dataset-name) need_value "$1" "$#"; DATASET_NAME="$2"; shift ;;
         --log-base) need_value "$1" "$#"; LOG_BASE="$2"; shift ;;
         --kt-distributed-checkpoint-reuse) need_value "$1" "$#"; KT_DISTRIBUTED_CHECKPOINT_REUSE="$2"; shift ;;
-        --consumer-cgroup-mode) need_value "$1" "$#"; CONSUMER_CGROUP_MODE="$2"; shift ;;
         --consumer-numa-nodes) need_value "$1" "$#"; CONSUMER_NUMA_NODES="$2"; shift ;;
+        --megatrain-root) need_value "$1" "$#"; MEGATRAIN_ROOT="$2"; shift ;;
         --aptmoe-root) need_value "$1" "$#"; APTMOE_ROOT="$2"; shift ;;
         --aptmoe-simulation-root) need_value "$1" "$#"; APTMOE_SIMULATION_ROOT="$2"; shift ;;
         --aptmoe-route-root) need_value "$1" "$#"; APTMOE_ROUTE_ROOT="$2"; shift ;;
@@ -227,6 +252,11 @@ require_positive_int "--gas" "${GRAD_ACCUM_STEPS}"
 require_positive_number "--learning-rate" "${LEARNING_RATE}"
 require_positive_int "--lora-rank" "${LORA_RANK}"
 require_positive_int "--lora-alpha" "${LORA_ALPHA}"
+require_positive_int "FFT_GPU_RELEASE_TIMEOUT" "${GPU_RELEASE_TIMEOUT}"
+require_nonnegative_int \
+    "FFT_GPU_RELEASE_TOLERANCE_MIB" "${GPU_RELEASE_TOLERANCE_MIB}"
+require_nonnegative_int \
+    "FFT_GPU_PEAK_HOLD_TOLERANCE_MIB" "${GPU_PEAK_HOLD_TOLERANCE_MIB}"
 if [[ -n "${CPU_THREADS_OVERRIDE}" ]]; then
     require_positive_int "--cpu-threads/FFT_CPU_THREADS" "${CPU_THREADS_OVERRIDE}"
 fi
@@ -240,8 +270,8 @@ fi
 [[ "${PROFILE}" =~ ^(server|consumer|both)$ ]] || die "invalid --profile: ${PROFILE}"
 [[ "${FINETUNING_TYPE}" =~ ^(full|lora)$ ]] || \
     die "invalid --finetuning-type: ${FINETUNING_TYPE}"
-if [[ "${BACKEND}" == "aptmoe" && "${FINETUNING_TYPE}" != "full" ]]; then
-    die "APTMoE deployment proxy supports only --finetuning-type full"
+if [[ "${BACKEND}" =~ ^(aptmoe|megatrain)$ && "${FINETUNING_TYPE}" != "full" ]]; then
+    die "${BACKEND} supports only --finetuning-type full in this benchmark"
 fi
 if [[ "${FINETUNING_TYPE}" == "lora" ]]; then
     EFFECTIVE_LORA_RANK="${LORA_RANK}"
@@ -252,10 +282,8 @@ else
 fi
 [[ "${KT_DISTRIBUTED_CHECKPOINT_REUSE}" =~ ^(on|off)$ ]] || \
     die "invalid --kt-distributed-checkpoint-reuse: ${KT_DISTRIBUTED_CHECKPOINT_REUSE}"
-[[ "${CONSUMER_CGROUP_MODE}" =~ ^(auto|user|system|prelimited)$ ]] || \
-    die "invalid --consumer-cgroup-mode: ${CONSUMER_CGROUP_MODE}"
 if [[ "${CAPTURE_APTMOE_ROUTES}" -eq 1 ]]; then
-    [[ "${BACKEND}" != "aptmoe" ]] || \
+    [[ "${BACKEND}" =~ ^(ktransformers|deepspeed)$ ]] || \
         die "--capture-aptmoe-routes must be used on an exact KTransformers or DeepSpeed run"
     (( WARMUP_STEPS > 0 )) || \
         die "--capture-aptmoe-routes requires at least one excluded warmup step"
@@ -285,13 +313,21 @@ if [[ "${SEQUENCE_LENGTHS_OVERRIDE_SET}" -eq 1 ]]; then
         if [[ "${seq}" == "16" && "${PROFILE}" =~ ^(server|both)$ ]]; then
             die "sequence length 16 is only supported by the consumer profile"
         fi
-        if [[ "${seq}" == "4096" && "${PROFILE}" =~ ^(consumer|both)$ ]]; then
+        # A normal exact-model consumer benchmark stops at 2048. Exact-route
+        # capture may use two ranks with gradient accumulation to construct an
+        # equivalent server global batch, while the APTMoE proxy may explicitly
+        # opt into 4096 when its lookup covers all 8192 tokens.
+        if [[ "${seq}" == "4096" && "${PROFILE}" =~ ^(consumer|both)$ ]] && \
+           [[ "${CAPTURE_APTMOE_ROUTES}" -ne 1 && "${BACKEND}" != "aptmoe" ]]; then
             die "sequence length 4096 is only supported by the server profile"
         fi
         [[ -z "${SEEN_SEQUENCE[${seq}]:-}" ]] || die "duplicate sequence length: ${seq}"
         SEEN_SEQUENCE["${seq}"]=1
         (( seq > MAX_SEQUENCE_LENGTH )) && MAX_SEQUENCE_LENGTH="${seq}"
     done
+    mapfile -t SEQUENCE_LENGTHS_OVERRIDE < <(
+        printf '%s\n' "${SEQUENCE_LENGTHS_OVERRIDE[@]}" | sort -rn
+    )
 else
     case "${PROFILE}" in
         server|both) MAX_SEQUENCE_LENGTH=4096 ;;
@@ -334,10 +370,16 @@ case "${BACKEND}" in
             PYTHON="${VALIDATOR_PYTHON}"
         fi
         ;;
+    megatrain)
+        CONDA_ENV="${FFT_CONDA_ENV:-Megatrain}"
+        PYTHON="$(_find_conda_python "${CONDA_ENV}" || true)"
+        ;;
 esac
 [[ -n "${PYTHON}" && -x "${PYTHON}" ]] || \
     die "Python for backend ${BACKEND} was not found (env=${CONDA_ENV})"
 CONDA_BIN_DIR="$(dirname "${PYTHON}")"
+MONITOR_PYTHON="$(_find_conda_python Deepspeed || true)"
+[[ -n "${MONITOR_PYTHON}" ]] || MONITOR_PYTHON="${PYTHON}"
 
 detect_physical_cores() {
     "${VALIDATOR_PYTHON}" - <<'PY'
@@ -364,12 +406,25 @@ PHYSICAL_CORES="$(detect_physical_cores)"
 check_files_and_environment() {
     [[ -d "${MODEL_PATH}" ]] || die "model directory not found: ${MODEL_PATH}"
     [[ -d "${DATASET_DIR}" ]] || die "dataset directory not found: ${DATASET_DIR}"
-    [[ -d "${LLAMA_FACTORY_DIR}/src/llamafactory" ]] || die "LLaMA-Factory source not found: ${LLAMA_FACTORY_DIR}"
-    [[ -f "${TRAIN_CONFIG_BASE}" ]] || die "training template not found: ${TRAIN_CONFIG_BASE}"
-    [[ -f "${SCRIPT_DIR}/step_phase_timer.py" ]] || die "coarse step phase timer not found"
-    [[ -f "${SCRIPT_DIR}/qwen35_text_only.py" ]] || die "text-only model loader not found"
-    [[ -f "${VALIDATOR}" && -f "${AGGREGATOR}" && -f "${TIMING_VALIDATOR}" && -f "${RESOURCE_EXEC}" ]] || \
+    [[ -f "${VALIDATOR}" && -f "${AGGREGATOR}" && -f "${TIMING_VALIDATOR}" && \
+       -f "${RESOURCE_EXEC}" && -f "${GPU_LIFECYCLE_GUARD}" && \
+       -f "${GPU_PEAK_HOLD_VERIFIER}" ]] || \
         die "benchmark helper scripts are missing"
+    [[ -f "${MONITOR_SCRIPT}" && -f "${MEMORY_ANALYZER}" ]] || \
+        die "CPU/GPU memory monitoring helpers are missing"
+    env MPLCONFIGDIR=/tmp/fft_qwen35_matplotlib \
+        "${MONITOR_PYTHON}" -c 'import matplotlib, psutil, pynvml' || \
+        die "memory monitoring dependencies are unavailable"
+    if [[ "${BACKEND}" =~ ^(ktransformers|deepspeed)$ ]]; then
+        [[ -d "${LLAMA_FACTORY_DIR}/src/llamafactory" ]] || \
+            die "LLaMA-Factory source not found: ${LLAMA_FACTORY_DIR}"
+        [[ -f "${TRAIN_CONFIG_BASE}" ]] || \
+            die "training template not found: ${TRAIN_CONFIG_BASE}"
+        [[ -f "${SCRIPT_DIR}/step_phase_timer.py" ]] || \
+            die "coarse step phase timer not found"
+        [[ -f "${SCRIPT_DIR}/qwen35_text_only.py" ]] || \
+            die "text-only model loader not found"
+    fi
 
     case "${BACKEND}" in
         ktransformers)
@@ -390,6 +445,8 @@ check_files_and_environment() {
                 die "APTMoE pipeline runtime not found under ${APTMOE_ROOT}"
             [[ -f "${APTMOE_ENTRYPOINT}" ]] || \
                 die "APTMoE proxy entrypoint not found: ${APTMOE_ENTRYPOINT}"
+            [[ -f "${APTMOE_SWEEP_ENTRYPOINT}" ]] || \
+                die "APTMoE persistent sweep entrypoint is missing"
             [[ -f "${SCRIPT_DIR}/profile_aptmoe_qwen35_proxy.py" ]] || \
                 die "APTMoE lookup profiler is missing"
             [[ -f "${SCRIPT_DIR}/merge_qwen35_route_traces.py" ]] || \
@@ -398,6 +455,21 @@ check_files_and_environment() {
                 "${PYTHON}" -c \
                 'import numpy, torch, transformers; from Runtime.PipelineRuntime.pipeline_runtime import PipelineRuntime; from aptmoe_proxy import ProxyPlacementSolver, RouteController' || \
                 die "APTMoE proxy dependencies are unavailable in ${CONDA_ENV}"
+            ;;
+        megatrain)
+            [[ -d "${MEGATRAIN_ROOT}/infinity" ]] || \
+                die "MegaTrain root not found: ${MEGATRAIN_ROOT}"
+            [[ -f "${MEGATRAIN_ENTRYPOINT}" && \
+               -f "${MEGATRAIN_SWEEP_ENTRYPOINT}" && \
+               -f "${MEGATRAIN_CONFIG_BASE}" ]] || \
+                die "MegaTrain benchmark entrypoint/config is missing"
+            env PYTHONPATH="${SCRIPT_DIR}:${MEGATRAIN_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+                "${PYTHON}" -c \
+                'import causal_conv1d, deepspeed, flash_attn, fla, infinity, torch, transformers' || \
+                die "MegaTrain dependencies are unavailable in ${CONDA_ENV}"
+            "${PYTHON}" -c \
+                'import importlib.util; from deepspeed.git_version_info import installed_ops; assert installed_ops.get("cpu_adam") and importlib.util.find_spec("deepspeed.ops.adam.cpu_adam_op")' || \
+                die "MegaTrain requires prebuilt DeepSpeedCPUAdam in ${CONDA_ENV}"
             ;;
     esac
     if [[ "${CAPTURE_APTMOE_ROUTES}" -eq 1 ]]; then
@@ -449,13 +521,6 @@ resolve_devices() {
     printf '%s\n' "${joined}"
 }
 
-current_cgroup_memory_max() {
-    local rel path
-    rel="$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup)"
-    path="/sys/fs/cgroup${rel}/memory.max"
-    [[ -r "${path}" ]] && cat "${path}" || printf 'unknown\n'
-}
-
 check_numa_capacity() {
     command -v numactl >/dev/null || die "numactl is required for the consumer NUMA policy"
     local node total_kib
@@ -468,32 +533,6 @@ check_numa_capacity() {
         (( total_kib >= 536870912 )) || \
             die "NUMA node ${node} has less than 512 GiB total memory"
     done
-}
-
-resolve_consumer_cgroup_mode() {
-    local mode="${CONSUMER_CGROUP_MODE}"
-    local current_max
-    current_max="$(current_cgroup_memory_max)"
-    if [[ "${mode}" == "auto" ]]; then
-        if [[ "${current_max}" =~ ^[0-9]+$ ]] && \
-           (( current_max <= CONSUMER_MEMORY_LIMIT_BYTES )); then
-            mode="prelimited"
-        elif [[ "${DRY_RUN}" -eq 1 ]]; then
-            mode="user"
-        elif systemctl --user show-environment >/dev/null 2>&1; then
-            mode="user"
-        elif [[ "$(id -u)" -eq 0 ]]; then
-            mode="system"
-        else
-            die "No delegated user systemd/cgroup is available. Ask the administrator to enable it, or launch inside a prelimited 1T cgroup and use --consumer-cgroup-mode prelimited."
-        fi
-    fi
-    if [[ "${mode}" == "prelimited" ]]; then
-        [[ "${current_max}" =~ ^[0-9]+$ ]] || die "current cgroup memory.max is not numeric: ${current_max}"
-        (( current_max == CONSUMER_MEMORY_LIMIT_BYTES )) || \
-            die "current cgroup memory.max=${current_max}; consumer requires exactly 1 TiB"
-    fi
-    printf '%s\n' "${mode}"
 }
 
 declare -a RESOURCE_PREFIX=()
@@ -512,28 +551,10 @@ build_resource_policy() {
     fi
 
     check_numa_capacity
-    RESOURCE_MODE="$(resolve_consumer_cgroup_mode)"
-    case "${RESOURCE_MODE}" in
-        user)
-            RESOURCE_PREFIX=(
-                systemd-run --user --scope --quiet --collect
-                --property="MemoryMax=${CONSUMER_MEMORY_LIMIT}"
-                --property=MemorySwapMax=0
-            )
-            ;;
-        system)
-            RESOURCE_PREFIX=(
-                systemd-run --scope --quiet --collect
-                --property="MemoryMax=${CONSUMER_MEMORY_LIMIT}"
-                --property=MemorySwapMax=0
-            )
-            ;;
-        prelimited) ;;
-        *) die "internal error: resource mode ${RESOURCE_MODE}" ;;
-    esac
-    RESOURCE_PREFIX+=(numactl "--interleave=${CONSUMER_NUMA_NODES}")
-    MEMORY_LIMIT_LABEL="1TiB hard cgroup (swap disabled)"
-    NUMA_POLICY_LABEL="equal interleave nodes ${CONSUMER_NUMA_NODES} (~512GiB/node at limit)"
+    RESOURCE_MODE="observed_only"
+    RESOURCE_PREFIX=(numactl "--interleave=${CONSUMER_NUMA_NODES}")
+    MEMORY_LIMIT_LABEL="uncapped; sampled for manual 1TiB review"
+    NUMA_POLICY_LABEL="equal interleave nodes ${CONSUMER_NUMA_NODES}"
 }
 
 profile_parameters() {
@@ -631,6 +652,36 @@ make_train_config() {
     printf '%s\n' "${config}"
 }
 
+make_megatrain_config() {
+    local run_dir="$1" seq="$2"
+    local config="${run_dir}/megatrain_config.yaml"
+    "${VALIDATOR_PYTHON}" - \
+        "${MEGATRAIN_CONFIG_BASE}" "${config}" "${MODEL_PATH}" \
+        "${DATASET_NAME}" "${DATASET_DIR}" "${seq}" "${GLOBAL_BATCH_SIZE}" \
+        "${GRAD_ACCUM_STEPS}" "${STEPS}" "${LEARNING_RATE}" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+source, output = map(Path, sys.argv[1:3])
+config = yaml.safe_load(source.read_text(encoding="utf-8"))
+config["model"]["name"] = sys.argv[3]
+config["dataset"]["name"] = sys.argv[4]
+config["dataset"]["dataset_dir"] = sys.argv[5]
+config["dataset"]["max_seq_len"] = int(sys.argv[6])
+config["training"]["batch_size"] = int(sys.argv[7])
+config["training"]["gradient_accumulation_steps"] = int(sys.argv[8])
+config["training"]["num_steps"] = int(sys.argv[9])
+config["training"]["learning_rate"] = float(sys.argv[10])
+output.write_text(
+    yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
+    encoding="utf-8",
+)
+PY
+    printf '%s\n' "${config}"
+}
+
 write_run_config() {
     local path="$1" profile_name="$2" seq="$3" devices="$4" tokens="$5"
     local apt_route_trace="$6" apt_lookup_table="$7"
@@ -655,6 +706,7 @@ from pathlib import Path
 
 out = Path(sys.argv[1])
 is_proxy = sys.argv[2] == "aptmoe"
+is_megatrain = sys.argv[2] == "megatrain"
 fallback_requested = any(bool(int(value)) for value in sys.argv[28:31])
 finetuning_type = sys.argv[34]
 obj = {
@@ -678,7 +730,8 @@ obj = {
         else "pretrained_checkpoint"
     ),
     "checkpoint_compatible": not is_proxy,
-    "llamafactory_backend": not is_proxy,
+    "llamafactory_backend": not is_proxy and not is_megatrain,
+    "megatrain_backend": is_megatrain,
     "real_forward_backward_optimizer_update": True,
     "finetuning_type": finetuning_type,
     "lora_rank": int(sys.argv[35]) if finetuning_type == "lora" else 0,
@@ -710,6 +763,21 @@ obj = {
     "model_path": sys.argv[14],
     "dataset_name": sys.argv[15],
     "memory_limit": sys.argv[16],
+    "memory_enforcement": "none_by_benchmark",
+    "memory_monitoring": True,
+    "manual_oom_review_threshold_bytes": 1 << 40,
+    "automatic_memory_termination": False,
+    "automatic_oom_classification": False,
+    "gpu_allocation_lifetime": "profile_process_lifetime",
+    "artificial_gpu_reservation": False,
+    "empty_cache_after_longest_sequence": False,
+    "persistent_profile_process": True,
+    "longest_sequence_peak_held_until_profile_end": True,
+    "gpu_release_required_before_next_sequence": False,
+    "gpu_release_required_after_profile": True,
+    "gpu_busy_is_oom": False,
+    "gpu_peak_hold_failure_is_oom": False,
+    "gpu_release_failure_is_oom": False,
     "numa_policy": sys.argv[17],
     "resource_mode": sys.argv[18],
     "cpu_threads_per_rank": int(sys.argv[19]),
@@ -738,6 +806,8 @@ obj = {
     "result_scope": (
         "APTMoE component-isomorphic deployment throughput; no model-quality claim"
         if is_proxy
+        else "end-to-end Qwen3.5 text-model full-finetune throughput via MegaTrain; backend CUDA synchronization retained"
+        if is_megatrain
         else f"end-to-end Qwen3.5 text-model {finetuning_type}-finetune throughput"
     ),
 }
@@ -750,6 +820,114 @@ print_command() {
     printf ' %q' "$@"
     printf '\n'
 }
+
+stop_active_monitor() {
+    if [[ -n "${ACTIVE_MONITOR_PID}" ]] && \
+       kill -0 "${ACTIVE_MONITOR_PID}" 2>/dev/null; then
+        kill -TERM "${ACTIVE_MONITOR_PID}" 2>/dev/null || true
+        wait "${ACTIVE_MONITOR_PID}" 2>/dev/null || true
+    fi
+    ACTIVE_MONITOR_PID=""
+    if [[ -n "${ACTIVE_MONITOR_FIFO}" ]]; then
+        rm -f "${ACTIVE_MONITOR_FIFO}"
+    fi
+    ACTIVE_MONITOR_FIFO=""
+}
+
+stop_active_training() {
+    if [[ -n "${ACTIVE_TRAIN_GUARD_PID}" ]] && \
+       kill -0 "${ACTIVE_TRAIN_GUARD_PID}" 2>/dev/null; then
+        kill -TERM "${ACTIVE_TRAIN_GUARD_PID}" 2>/dev/null || true
+        wait "${ACTIVE_TRAIN_GUARD_PID}" 2>/dev/null || true
+    fi
+    ACTIVE_TRAIN_GUARD_PID=""
+    if [[ -n "${ACTIVE_TEE_PID}" ]] && \
+       kill -0 "${ACTIVE_TEE_PID}" 2>/dev/null; then
+        kill -TERM "${ACTIVE_TEE_PID}" 2>/dev/null || true
+        wait "${ACTIVE_TEE_PID}" 2>/dev/null || true
+    fi
+    ACTIVE_TEE_PID=""
+    if [[ -n "${ACTIVE_LOG_FIFO}" ]]; then
+        rm -f "${ACTIVE_LOG_FIFO}"
+    fi
+    ACTIVE_LOG_FIFO=""
+}
+
+cleanup_active_processes() {
+    stop_active_training
+    stop_active_monitor
+}
+
+generate_sweep_summary() {
+    [[ -n "${RUN_ROOT}" && -d "${RUN_ROOT}" ]] || return 0
+    [[ "${SUMMARY_FINALIZED}" -eq 0 ]] || return 0
+    compgen -G "${RUN_ROOT}/*/seq_*/run_config.json" >/dev/null || return 0
+    SUMMARY_FINALIZED=1
+    if "${VALIDATOR_PYTHON}" "${AGGREGATOR}" --root "${RUN_ROOT}"; then
+        log "Sweep summary: ${RUN_ROOT}/summary.md"
+        log "Machine-readable results: ${RUN_ROOT}/sweep_results.csv"
+        return 0
+    fi
+    warn "Sweep aggregation failed for ${RUN_ROOT}"
+    return 98
+}
+
+finalize_sweep_on_exit() {
+    local original_status="${1:-0}"
+    local summary_status=0
+    trap - EXIT
+    set +e
+    cleanup_active_processes
+    generate_sweep_summary
+    summary_status=$?
+    if [[ "${original_status}" -eq 0 && "${summary_status}" -ne 0 ]]; then
+        original_status="${summary_status}"
+    fi
+    exit "${original_status}"
+}
+
+start_memory_monitor() {
+    local run_dir="$1"
+    mkdir -p "${run_dir}/.mplconfig"
+    ACTIVE_MONITOR_FIFO="${run_dir}/monitor_events.fifo"
+    rm -f "${ACTIVE_MONITOR_FIFO}"
+    env MPLCONFIGDIR="${run_dir}/.mplconfig" \
+        "${MONITOR_PYTHON}" "${MONITOR_SCRIPT}" \
+        --out "${run_dir}/monitor.csv" \
+        --fifo "${ACTIVE_MONITOR_FIFO}" \
+        --interval 2 \
+        --disk-mount /mnt/data2 \
+        --pid "$$" \
+        >> "${run_dir}/monitor.log" 2>&1 &
+    ACTIVE_MONITOR_PID=$!
+    local attempt
+    for attempt in {1..30}; do
+        [[ -f "${run_dir}/monitor.csv" ]] && break
+        kill -0 "${ACTIVE_MONITOR_PID}" 2>/dev/null || \
+            die "memory monitor failed to start; see ${run_dir}/monitor.log"
+        sleep 0.1
+    done
+    [[ -f "${run_dir}/monitor.csv" ]] || \
+        die "memory monitor did not create monitor.csv"
+    log "CPU/GPU memory monitor started (PID=${ACTIVE_MONITOR_PID})"
+}
+
+analyze_memory_usage() {
+    local run_dir="$1" monitor_csv="${2:-}" phase="${3:-}"
+    local -a monitor_args=()
+    [[ -z "${monitor_csv}" ]] || \
+        monitor_args+=(--monitor-csv "${monitor_csv}")
+    [[ -z "${phase}" ]] || monitor_args+=(--phase "${phase}")
+    env MPLCONFIGDIR="${run_dir}/.mplconfig" \
+        "${MONITOR_PYTHON}" "${MEMORY_ANALYZER}" --log-dir "${run_dir}" \
+        "${monitor_args[@]}" \
+        >> "${run_dir}/memory_analysis.log" 2>&1 || \
+        warn "Memory analysis failed; see ${run_dir}/memory_analysis.log"
+}
+
+trap 'finalize_sweep_on_exit $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 run_one_sequence() {
     local profile_name="$1" profile_dir="$2" seq="$3" devices="$4"
@@ -898,6 +1076,36 @@ run_one_sequence() {
                 -m "${TRAIN_ENTRY_MODULE}" train "${train_config}"
             )
             ;;
+        megatrain)
+            train_config="$(make_megatrain_config "${run_dir}" "${seq}")"
+            run_cwd="${MEGATRAIN_ROOT}"
+            local local_devices
+            local_devices="$(seq 0 $((NUM_GPUS - 1)) | paste -sd ',')"
+            command=(
+                env
+                FFT_TRAINING_BACKEND=megatrain
+                FFT_PRECISION=bf16
+                FFT_TEXT_ONLY=1
+                FFT_DISABLE_PERF_PROBES=1
+                OMP_NUM_THREADS="${cpu_threads}"
+                MKL_NUM_THREADS="${cpu_threads}"
+                OPENBLAS_NUM_THREADS="${cpu_threads}"
+                NUMEXPR_NUM_THREADS="${cpu_threads}"
+                BLIS_NUM_THREADS="${cpu_threads}"
+                OMP_DYNAMIC=FALSE
+                MKL_DYNAMIC=FALSE
+                TOKENIZERS_PARALLELISM=false
+                HF_DATASETS_OFFLINE=1
+                TRANSFORMERS_OFFLINE=1
+                CUDA_VISIBLE_DEVICES="${devices}"
+                PYTHONPATH="${SCRIPT_DIR}:${MEGATRAIN_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+                "${PYTHON}" "${MEGATRAIN_ENTRYPOINT}"
+                --config "${train_config}"
+                --timing-output-dir "${timing_dir}"
+                --warmup-steps "${WARMUP_STEPS}"
+                --devices "${local_devices}"
+            )
+            ;;
         aptmoe)
             run_cwd="$(dirname "${APTMOE_ENTRYPOINT}")"
             local torchrun_bin="${CONDA_BIN_DIR}/torchrun"
@@ -968,20 +1176,27 @@ run_one_sequence() {
             ;;
     esac
 
+    if [[ "${PREPARE_ONLY}" -eq 1 ]]; then
+        return 0
+    fi
+
     local -a scoped_command=(
         "${VALIDATOR_PYTHON}" "${RESOURCE_EXEC}"
         --profile "${profile_name}"
         --numa-nodes "${CONSUMER_NUMA_NODES}"
         --output-dir "${run_dir}"
     )
-    if [[ "${profile_name}" == "consumer" ]]; then
-        scoped_command+=(
-            --expected-memory-max "${CONSUMER_MEMORY_LIMIT_BYTES}"
-            --require-swap-zero
-        )
-    fi
     scoped_command+=(-- "${command[@]}")
     local -a full_command=("${RESOURCE_PREFIX[@]}" "${scoped_command[@]}")
+    local -a guarded_command=(
+        "${VALIDATOR_PYTHON}" "${GPU_LIFECYCLE_GUARD}"
+        --devices "${devices}"
+        --report "${run_dir}/gpu_lifecycle.json"
+        --cwd "${run_cwd}"
+        --release-timeout "${GPU_RELEASE_TIMEOUT}"
+        --memory-tolerance-mib "${GPU_RELEASE_TOLERANCE_MIB}"
+        -- "${full_command[@]}"
+    )
     if [[ "${BACKEND}" == "ktransformers" ]]; then
         log "${BACKEND}/${profile_name}: seq=${seq}, GPUs=${NUM_GPUS}, global_batch=${GLOBAL_BATCH_SIZE}, tokens/step=${tokens_per_step}, ${FINETUNING_TYPE}, text-only BF16, KT owner(rank0) threads=${kt_owner_threads}, non-owner rank threads=${cpu_threads}"
     elif [[ "${BACKEND}" == "aptmoe" ]]; then
@@ -991,18 +1206,46 @@ run_one_sequence() {
     fi
 
     if [[ "${DRY_RUN}" -eq 1 ]]; then
-        print_command "${full_command[@]}"
+        print_command "${guarded_command[@]}"
         printf 'DRY_RUN\n' > "${run_dir}/exit_code.txt"
         return 0
     fi
 
     local exit_code=0
-    pushd "${run_cwd}" >/dev/null
+    start_memory_monitor "${run_dir}"
+    ACTIVE_LOG_FIFO="${run_dir}/.train-log.fifo"
+    rm -f "${ACTIVE_LOG_FIFO}"
+    mkfifo "${ACTIVE_LOG_FIFO}"
+    tee "${train_log}" < "${ACTIVE_LOG_FIFO}" &
+    ACTIVE_TEE_PID=$!
     set +e
-    "${full_command[@]}" 2>&1 | tee "${train_log}"
-    exit_code=${PIPESTATUS[0]}
+    "${guarded_command[@]}" > "${ACTIVE_LOG_FIFO}" 2>&1 &
+    ACTIVE_TRAIN_GUARD_PID=$!
+    wait "${ACTIVE_TRAIN_GUARD_PID}"
+    exit_code=$?
+    ACTIVE_TRAIN_GUARD_PID=""
+    wait "${ACTIVE_TEE_PID}"
+    ACTIVE_TEE_PID=""
     set -e
-    popd >/dev/null
+    rm -f "${ACTIVE_LOG_FIFO}"
+    ACTIVE_LOG_FIFO=""
+    local monitor_failed=0
+    if [[ -z "${ACTIVE_MONITOR_PID}" ]] || \
+       ! kill -0 "${ACTIVE_MONITOR_PID}" 2>/dev/null; then
+        monitor_failed=1
+    fi
+    stop_active_monitor
+    analyze_memory_usage "${run_dir}"
+    if [[ "${exit_code}" -eq 0 && "${monitor_failed}" -ne 0 ]]; then
+        warn "Training succeeded but the CPU/GPU memory monitor exited early"
+        exit_code=89
+    elif [[ "${exit_code}" -eq 0 ]] && \
+         [[ ! -f "${run_dir}/memory_summary.json" || \
+            ! -f "${run_dir}/plots/01_gpu_memory.png" || \
+            ! -f "${run_dir}/plots/02_cpu_ram.png" ]]; then
+        warn "Training succeeded but required CPU/GPU memory artifacts are missing"
+        exit_code=89
+    fi
 
     if [[ "${exit_code}" -eq 0 && "${CAPTURE_APTMOE_ROUTES}" -eq 1 ]]; then
         if ! "${PYTHON}" "${SCRIPT_DIR}/merge_qwen35_route_traces.py" \
@@ -1033,7 +1276,8 @@ run_one_sequence() {
         elif ! "${VALIDATOR_PYTHON}" "${TIMING_VALIDATOR}" \
             --path "${timing_dir}/step_timing.json" \
             --expected-steps "${STEPS}" \
-            --warmup-steps "${WARMUP_STEPS}"; then
+            --warmup-steps "${WARMUP_STEPS}" \
+            --backend "${BACKEND}"; then
             warn "Timing output violates the probe-free three-phase contract"
             exit_code=92
         fi
@@ -1047,6 +1291,458 @@ run_one_sequence() {
     if [[ "${exit_code}" -ne 0 ]]; then
         warn "${BACKEND}/${profile_name}/seq_${seq} failed with exit code ${exit_code}"
         return "${exit_code}"
+    fi
+    return 0
+}
+
+write_profile_sweep_manifest() {
+    local path="$1" profile_name="$2" profile_dir="$3" devices="$4"
+    local local_devices="$5" sequences_csv="$6"
+    "${VALIDATOR_PYTHON}" - \
+        "${path}" "${BACKEND}" "${profile_name}" "${profile_dir}" \
+        "${devices}" "${local_devices}" "${sequences_csv}" \
+        "${RUN_TIMESTAMP}" "${APTMOE_SIMULATION_ROOT}" \
+        "${KEEP_MODEL_OUTPUT}" "${DATASET_DIR}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+(
+    output_value,
+    backend,
+    profile,
+    profile_dir_value,
+    devices,
+    local_devices,
+    sequences_value,
+    run_timestamp,
+    simulation_root,
+    keep_model_output,
+    dataset_dir,
+) = sys.argv[1:]
+output = Path(output_value)
+profile_dir = Path(profile_dir_value)
+sequences = [int(value) for value in sequences_value.split(",")]
+cases = []
+for sequence in sequences:
+    run_dir = profile_dir / f"seq_{sequence}"
+    config = json.loads(
+        (run_dir / "run_config.json").read_text(encoding="utf-8")
+    )
+    case = {
+        "sequence_length": sequence,
+        "run_dir": str(run_dir),
+        "timing_output_dir": str(run_dir / "step_timing"),
+        "tokens_per_step": int(config["tokens_per_step"]),
+        "steps": int(config["steps"]),
+        "warmup_steps": int(config["warmup_steps"]),
+    }
+    if backend in {"ktransformers", "deepspeed"}:
+        case["training_config"] = str(run_dir / "train_config.yaml")
+        case["environment"] = {
+            "ACCELERATE_KT_MODEL_MAX_LENGTH": sequence,
+            "FFT_ROUTE_TRACE_DIR": (
+                str(
+                    Path(config["route_trace"]).with_suffix("")
+                )
+                + "_ranks"
+                if config.get("route_capture_warmup_only")
+                and config.get("route_trace")
+                else None
+            ),
+            "FFT_ROUTE_TRACE_SEQUENCE_LENGTH": (
+                sequence
+                if config.get("route_capture_warmup_only")
+                else None
+            ),
+            "FFT_ROUTE_TRACE_PATTERNS": (
+                int(config["warmup_steps"])
+                * int(config["gradient_accumulation_steps"])
+                if config.get("route_capture_warmup_only")
+                else None
+            ),
+            "FFT_APTMOE_SIMULATION_ROOT": (
+                config.get("aptmoe_simulation_root")
+                if config.get("route_capture_warmup_only")
+                else None
+            ),
+        }
+    elif backend == "megatrain":
+        case["training_config"] = str(
+            run_dir / "megatrain_config.yaml"
+        )
+    else:
+        case["aptmoe_arguments"] = {
+            "aptmoe_root": config["aptmoe_root"],
+            "simulation_root": simulation_root,
+            "model_path": config["model_path"],
+            "dataset_dir": dataset_dir,
+            "dataset_name": config["dataset_name"],
+            "output_dir": str(
+                Path(simulation_root)
+                / "random_weights"
+                / run_timestamp
+                / profile
+                / f"seq_{sequence}"
+            ),
+            "step_timing_output_dir": str(run_dir / "step_timing"),
+            "route_trace": config.get("route_trace"),
+            "lookup_table": config.get("lookup_table"),
+            "deployment_profile": profile,
+            "sequence_length": sequence,
+            "num_gpus": int(config["num_gpus"]),
+            "global_batch_size": int(config["global_batch_size"]),
+            "per_device_batch_size": int(
+                config["per_device_batch_size"]
+            ),
+            "gradient_accumulation_steps": int(
+                config["gradient_accumulation_steps"]
+            ),
+            "steps": int(config["steps"]),
+            "warmup_steps": int(config["warmup_steps"]),
+            "learning_rate": float(config["learning_rate"]),
+            "max_grad_norm": 1.0,
+            "prefetch_portion": 0.6,
+            "seed": 42,
+            "precision": "bf16",
+            "text_only": True,
+            "allow_synthetic_routing": bool(
+                config.get("allow_synthetic_routing")
+            ),
+            "allow_unprofiled_placement": bool(
+                config.get("allow_unprofiled_placement")
+            ),
+            "allow_linear_attention_fallback": bool(
+                config.get("allow_linear_attention_fallback")
+            ),
+            "save_random_weights": bool(int(keep_model_output)),
+            "audit_only": False,
+        }
+    cases.append(case)
+
+manifest = {
+    "schema_version": 1,
+    "backend": backend,
+    "profile": profile,
+    "persistent_profile_process": True,
+    "longest_sequence_peak_held_until_profile_end": True,
+    "sequence_order": "descending",
+    "devices": devices,
+    "local_devices": local_devices,
+    "profile_dir": str(profile_dir),
+    "monitor_fifo": str(profile_dir / "monitor_events.fifo"),
+    "cuda_cache_hold_marker": str(
+        profile_dir / ".longest_sequence_cuda_cache_held"
+    ),
+    "cases": cases,
+}
+output.write_text(
+    json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+    encoding="utf-8",
+)
+PY
+}
+
+run_persistent_profile() {
+    local profile_name="$1" profile_dir="$2" devices="$3"
+    shift 3
+    local -a profile_sequence_lengths=("$@")
+    local sequences_csv
+    sequences_csv="$(IFS=,; printf '%s' "${profile_sequence_lengths[*]}")"
+    local first_seq="${profile_sequence_lengths[0]}"
+    local first_run_dir="${profile_dir}/seq_${first_seq}"
+    local manifest="${profile_dir}/profile_sweep_manifest.json"
+    local local_devices
+    local_devices="$(seq 0 $((NUM_GPUS - 1)) | paste -sd ',')"
+
+    PREPARE_ONLY=1
+    local seq
+    for seq in "${profile_sequence_lengths[@]}"; do
+        run_one_sequence \
+            "${profile_name}" "${profile_dir}" "${seq}" "${devices}"
+        ln -sfn ../train.log "${profile_dir}/seq_${seq}/train.log"
+    done
+    PREPARE_ONLY=0
+    write_profile_sweep_manifest \
+        "${manifest}" "${profile_name}" "${profile_dir}" "${devices}" \
+        "${local_devices}" "${sequences_csv}"
+
+    local cpu_threads="${CPU_THREADS_PER_RANK}"
+    local kt_owner_threads="${KT_OWNER_THREADS}"
+    local hold_marker="${profile_dir}/.longest_sequence_cuda_cache_held"
+    local run_cwd="${LLAMA_FACTORY_DIR}"
+    local -a command=()
+    case "${BACKEND}" in
+        ktransformers)
+            local accelerate_bin="${CONDA_BIN_DIR}/accelerate"
+            [[ -x "${accelerate_bin}" ]] || accelerate_bin="accelerate"
+            command=(
+                env
+                USE_KT=1
+                ACCELERATE_USE_KT=true
+                ACCELERATE_KT_TRAIN_MODE="${FINETUNING_TYPE}"
+                ACCELERATE_KT_LORA_RANK="${EFFECTIVE_LORA_RANK}"
+                ACCELERATE_KT_LORA_ALPHA="${EFFECTIVE_LORA_ALPHA}"
+                KT_FINETUNE_MODE="${FINETUNING_TYPE}"
+                FFT_TRAINING_BACKEND=kt
+                FFT_PRECISION=bf16
+                FFT_FINETUNING_TYPE="${FINETUNING_TYPE}"
+                FFT_TEXT_ONLY=1
+                FFT_SKIP_FINAL_SAVE="$((1 - KEEP_MODEL_OUTPUT))"
+                FFT_DISABLE_PERF_PROBES=1
+                FFT_CPU_THREADS="${cpu_threads}"
+                FFT_KT_OWNER_THREADS="${kt_owner_threads}"
+                FFT_KT_NON_OWNER_THREADS="${cpu_threads}"
+                FFT_CUDA_CACHE_HOLD_MARKER="${hold_marker}"
+                KT_BACKWARD_TIMING=off
+                KT_SFT_PROFILE=0
+                KT_REUSE_CHECKPOINT_FORWARD="${KT_DISTRIBUTED_CHECKPOINT_REUSE_ENABLED}"
+                KT_REUSE_CHECKPOINT_FORWARD_DISTRIBUTED="${KT_DISTRIBUTED_CHECKPOINT_REUSE_ENABLED}"
+                DS_PROBE_MODE=off
+                ACCELERATE_KT_MODEL_MAX_LENGTH="${first_seq}"
+                OMP_NUM_THREADS="${cpu_threads}"
+                MKL_NUM_THREADS="${cpu_threads}"
+                OPENBLAS_NUM_THREADS="${cpu_threads}"
+                NUMEXPR_NUM_THREADS="${cpu_threads}"
+                BLIS_NUM_THREADS="${cpu_threads}"
+                OMP_DYNAMIC=FALSE
+                MKL_DYNAMIC=FALSE
+                ACCELERATE_KT_OMP_NUM_THREADS="${cpu_threads}"
+                TOKENIZERS_PARALLELISM=false
+                HF_DATASETS_OFFLINE=1
+                TRANSFORMERS_OFFLINE=1
+                CUDA_VISIBLE_DEVICES="${devices}"
+                PYTHONPATH="${SCRIPT_DIR}:${LLAMA_FACTORY_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+                "${accelerate_bin}" launch
+                --config_file "${first_run_dir}/accelerate_config.yaml"
+                -m "${TRAIN_ENTRY_MODULE}"
+                --sweep-manifest "${manifest}"
+            )
+            ;;
+        deepspeed)
+            local torchrun_bin="${CONDA_BIN_DIR}/torchrun"
+            [[ -x "${torchrun_bin}" ]] || torchrun_bin="torchrun"
+            command=(
+                env
+                USE_KT=0
+                ACCELERATE_USE_KT=false
+                FFT_TRAINING_BACKEND=deepspeed
+                FFT_PRECISION=bf16
+                FFT_FINETUNING_TYPE="${FINETUNING_TYPE}"
+                FFT_TEXT_ONLY=1
+                FFT_SKIP_FINAL_SAVE="$((1 - KEEP_MODEL_OUTPUT))"
+                FFT_DISABLE_PERF_PROBES=1
+                FFT_CPU_THREADS="${cpu_threads}"
+                FFT_CUDA_CACHE_HOLD_MARKER="${hold_marker}"
+                KT_BACKWARD_TIMING=off
+                KT_SFT_PROFILE=0
+                DS_PROBE_MODE=off
+                OMP_NUM_THREADS="${cpu_threads}"
+                MKL_NUM_THREADS="${cpu_threads}"
+                OPENBLAS_NUM_THREADS="${cpu_threads}"
+                NUMEXPR_NUM_THREADS="${cpu_threads}"
+                BLIS_NUM_THREADS="${cpu_threads}"
+                OMP_DYNAMIC=FALSE
+                MKL_DYNAMIC=FALSE
+                TOKENIZERS_PARALLELISM=false
+                HF_DATASETS_OFFLINE=1
+                TRANSFORMERS_OFFLINE=1
+                CUDA_VISIBLE_DEVICES="${devices}"
+                PYTHONPATH="${SCRIPT_DIR}:${LLAMA_FACTORY_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+                "${torchrun_bin}" --standalone --nproc_per_node="${NUM_GPUS}"
+                -m "${TRAIN_ENTRY_MODULE}"
+                --sweep-manifest "${manifest}"
+            )
+            ;;
+        megatrain)
+            run_cwd="${MEGATRAIN_ROOT}"
+            command=(
+                env
+                FFT_TRAINING_BACKEND=megatrain
+                FFT_PRECISION=bf16
+                FFT_TEXT_ONLY=1
+                FFT_DISABLE_PERF_PROBES=1
+                FFT_CUDA_CACHE_HOLD_MARKER="${hold_marker}"
+                OMP_NUM_THREADS="${cpu_threads}"
+                MKL_NUM_THREADS="${cpu_threads}"
+                OPENBLAS_NUM_THREADS="${cpu_threads}"
+                NUMEXPR_NUM_THREADS="${cpu_threads}"
+                BLIS_NUM_THREADS="${cpu_threads}"
+                OMP_DYNAMIC=FALSE
+                MKL_DYNAMIC=FALSE
+                TOKENIZERS_PARALLELISM=false
+                HF_DATASETS_OFFLINE=1
+                TRANSFORMERS_OFFLINE=1
+                CUDA_VISIBLE_DEVICES="${devices}"
+                PYTHONPATH="${SCRIPT_DIR}:${MEGATRAIN_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+                "${PYTHON}" "${MEGATRAIN_SWEEP_ENTRYPOINT}"
+                --sweep-manifest "${manifest}"
+            )
+            ;;
+        aptmoe)
+            run_cwd="$(dirname "${APTMOE_ENTRYPOINT}")"
+            local torchrun_bin="${CONDA_BIN_DIR}/torchrun"
+            [[ -x "${torchrun_bin}" ]] || torchrun_bin="torchrun"
+            command=(
+                env
+                FFT_TRAINING_BACKEND=aptmoe
+                FFT_PRECISION=bf16
+                FFT_TEXT_ONLY=1
+                FFT_SKIP_FINAL_SAVE="$((1 - KEEP_MODEL_OUTPUT))"
+                FFT_DISABLE_PERF_PROBES=1
+                FFT_CPU_THREADS="${cpu_threads}"
+                FFT_CUDA_CACHE_HOLD_MARKER="${hold_marker}"
+                KT_BACKWARD_TIMING=off
+                KT_SFT_PROFILE=0
+                DS_PROBE_MODE=off
+                OMP_NUM_THREADS="${cpu_threads}"
+                MKL_NUM_THREADS="${cpu_threads}"
+                OPENBLAS_NUM_THREADS="${cpu_threads}"
+                NUMEXPR_NUM_THREADS="${cpu_threads}"
+                BLIS_NUM_THREADS="${cpu_threads}"
+                OMP_DYNAMIC=FALSE
+                MKL_DYNAMIC=FALSE
+                TOKENIZERS_PARALLELISM=false
+                HF_DATASETS_OFFLINE=1
+                TRANSFORMERS_OFFLINE=1
+                CUDA_VISIBLE_DEVICES="${devices}"
+                FFT_APTMOE_SIMULATION_ROOT="${APTMOE_SIMULATION_ROOT}"
+                CUDA_CACHE_PATH="${APTMOE_SIMULATION_ROOT}/cache/cuda"
+                TORCH_EXTENSIONS_DIR="${APTMOE_SIMULATION_ROOT}/cache/torch_extensions"
+                TRITON_CACHE_DIR="${APTMOE_SIMULATION_ROOT}/cache/triton"
+                PYTHONPATH="${SCRIPT_DIR}:${APTMOE_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+                "${torchrun_bin}" --standalone --nproc_per_node="${NUM_GPUS}"
+                "${APTMOE_SWEEP_ENTRYPOINT}"
+                --sweep-manifest "${manifest}"
+            )
+            ;;
+    esac
+
+    local -a scoped_command=(
+        "${VALIDATOR_PYTHON}" "${RESOURCE_EXEC}"
+        --profile "${profile_name}"
+        --numa-nodes "${CONSUMER_NUMA_NODES}"
+        --output-dir "${profile_dir}"
+        -- "${command[@]}"
+    )
+    local -a full_command=("${RESOURCE_PREFIX[@]}" "${scoped_command[@]}")
+    local -a guarded_command=(
+        "${VALIDATOR_PYTHON}" "${GPU_LIFECYCLE_GUARD}"
+        --devices "${devices}"
+        --report "${profile_dir}/gpu_lifecycle.json"
+        --cwd "${run_cwd}"
+        --release-timeout "${GPU_RELEASE_TIMEOUT}"
+        --memory-tolerance-mib "${GPU_RELEASE_TOLERANCE_MIB}"
+        -- "${full_command[@]}"
+    )
+
+    log "${BACKEND}/${profile_name}: persistent profile process; sequences=${profile_sequence_lengths[*]}"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        print_command "${guarded_command[@]}"
+        for seq in "${profile_sequence_lengths[@]}"; do
+            printf 'DRY_RUN\n' > "${profile_dir}/seq_${seq}/exit_code.txt"
+        done
+        return 0
+    fi
+
+    [[ "${CONTINUE_ON_ERROR}" -eq 0 ]] || \
+        warn "--continue-on-error is disabled inside a persistent CUDA profile after an execution failure"
+    start_memory_monitor "${profile_dir}"
+    ACTIVE_LOG_FIFO="${profile_dir}/.train-log.fifo"
+    rm -f "${ACTIVE_LOG_FIFO}"
+    mkfifo "${ACTIVE_LOG_FIFO}"
+    tee "${profile_dir}/train.log" < "${ACTIVE_LOG_FIFO}" &
+    ACTIVE_TEE_PID=$!
+    set +e
+    "${guarded_command[@]}" > "${ACTIVE_LOG_FIFO}" 2>&1 &
+    ACTIVE_TRAIN_GUARD_PID=$!
+    wait "${ACTIVE_TRAIN_GUARD_PID}"
+    local exit_code=$?
+    ACTIVE_TRAIN_GUARD_PID=""
+    wait "${ACTIVE_TEE_PID}"
+    ACTIVE_TEE_PID=""
+    set -e
+    rm -f "${ACTIVE_LOG_FIFO}"
+    ACTIVE_LOG_FIFO=""
+    local monitor_failed=0
+    if [[ -z "${ACTIVE_MONITOR_PID}" ]] || \
+       ! kill -0 "${ACTIVE_MONITOR_PID}" 2>/dev/null; then
+        monitor_failed=1
+    fi
+    stop_active_monitor
+    if [[ "${exit_code}" -eq 0 && "${monitor_failed}" -ne 0 ]]; then
+        warn "Training succeeded but the profile memory monitor exited early"
+        exit_code=89
+    fi
+    if [[ "${exit_code}" -eq 0 ]]; then
+        if ! "${VALIDATOR_PYTHON}" "${GPU_PEAK_HOLD_VERIFIER}" \
+            --manifest "${manifest}" \
+            --monitor "${profile_dir}/monitor.csv" \
+            --output "${profile_dir}/gpu_peak_hold.json" \
+            --tolerance-mib "${GPU_PEAK_HOLD_TOLERANCE_MIB}"; then
+            warn "Longest-sequence GPU peak was not held across the profile"
+            exit_code=97
+        fi
+    fi
+    if [[ "${exit_code}" =~ ^(87|88|89|97)$ ]]; then
+        for seq in "${profile_sequence_lengths[@]}"; do
+            printf '%s\n' "${exit_code}" > \
+                "${profile_dir}/seq_${seq}/exit_code.txt"
+        done
+    fi
+
+    local profile_post_status=0
+    for seq in "${profile_sequence_lengths[@]}"; do
+        local run_dir="${profile_dir}/seq_${seq}"
+        analyze_memory_usage \
+            "${run_dir}" "${profile_dir}/monitor.csv" "seq_${seq}"
+        if [[ ! -f "${run_dir}/exit_code.txt" ]]; then
+            printf '%s\n' "${exit_code}" > "${run_dir}/exit_code.txt"
+        fi
+        local case_exit
+        case_exit="$(<"${run_dir}/exit_code.txt")"
+        if [[ "${case_exit}" == "0" ]]; then
+            if [[ ! -f "${run_dir}/memory_summary.json" || \
+                  ! -f "${run_dir}/plots/01_gpu_memory.png" || \
+                  ! -f "${run_dir}/plots/02_cpu_ram.png" ]]; then
+                warn "seq=${seq}: required CPU/GPU memory artifacts are missing"
+                printf '89\n' > "${run_dir}/exit_code.txt"
+                profile_post_status=1
+            elif [[ ! -f "${run_dir}/step_timing/step_timing.json" ]]; then
+                warn "seq=${seq}: canonical rank-0 timing is missing"
+                printf '90\n' > "${run_dir}/exit_code.txt"
+                profile_post_status=1
+            elif ! "${VALIDATOR_PYTHON}" "${TIMING_VALIDATOR}" \
+                --path "${run_dir}/step_timing/step_timing.json" \
+                --expected-steps "${STEPS}" \
+                --warmup-steps "${WARMUP_STEPS}" \
+                --backend "${BACKEND}"; then
+                warn "seq=${seq}: timing violates the three-phase contract"
+                printf '92\n' > "${run_dir}/exit_code.txt"
+                profile_post_status=1
+            fi
+        fi
+        if [[ "${case_exit}" == "0" && "${CAPTURE_APTMOE_ROUTES}" -eq 1 ]]; then
+            local route_capture_dir="${APTMOE_ROUTE_ROOT}/${profile_name}/seq_${seq}_ranks"
+            local apt_route_trace="${APTMOE_ROUTE_ROOT}/${profile_name}/seq_${seq}.npz"
+            if ! "${PYTHON}" "${SCRIPT_DIR}/merge_qwen35_route_traces.py" \
+                --input-dir "${route_capture_dir}" \
+                --output "${apt_route_trace}" \
+                --expected-ranks "${NUM_GPUS}" \
+                --expected-patterns "$((WARMUP_STEPS * GRAD_ACCUM_STEPS))" \
+                --sequence-length "${seq}" \
+                --global-batch-size "${GLOBAL_BATCH_SIZE}" \
+                --simulation-root "${APTMOE_SIMULATION_ROOT}"; then
+                printf '94\n' > "${run_dir}/exit_code.txt"
+                profile_post_status=1
+            fi
+        fi
+        if [[ "${KEEP_MODEL_OUTPUT}" -eq 0 && -d "${run_dir}/model_output" ]]; then
+            rm -rf "${run_dir}/model_output"
+        fi
+    done
+    if [[ "${exit_code}" -ne 0 || "${profile_post_status}" -ne 0 ]]; then
+        return 1
     fi
     return 0
 }
@@ -1075,17 +1771,9 @@ run_profile() {
     fi
 
     log "Profile ${profile_name} sequences: ${profile_sequence_lengths[*]}"
-    local profile_status=0 seq
-    for seq in "${profile_sequence_lengths[@]}"; do
-        if ! run_one_sequence "${profile_name}" "${profile_dir}" "${seq}" "${devices}"; then
-            profile_status=1
-            if [[ "${CONTINUE_ON_ERROR}" -eq 0 ]]; then
-                warn "Stopping profile after first failure; use --continue-on-error to keep sweeping"
-                break
-            fi
-        fi
-    done
-    return "${profile_status}"
+    run_persistent_profile \
+        "${profile_name}" "${profile_dir}" "${devices}" \
+        "${profile_sequence_lengths[@]}"
 }
 
 check_files_and_environment
@@ -1140,7 +1828,7 @@ for selected_profile in "${PROFILES[@]}"; do
     fi
 done
 
-"${VALIDATOR_PYTHON}" "${AGGREGATOR}" --root "${RUN_ROOT}"
-log "Sweep summary: ${RUN_ROOT}/summary.md"
-log "Machine-readable results: ${RUN_ROOT}/sweep_results.csv"
+if ! generate_sweep_summary; then
+    [[ "${overall_status}" -ne 0 ]] || overall_status=98
+fi
 exit "${overall_status}"

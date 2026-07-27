@@ -3,8 +3,9 @@
 后台系统指标采集脚本 —— Qwen3.5-35B-A3B FFT 测试监控器
 
 采集指标（每 INTERVAL 秒一次）：
-  - 每张 GPU 的已用显存、总显存、SM 利用率、显存利用率
+  - 每张 GPU 的已用显存、总显存、SM 利用率、显存利用率（整机）
   - 系统 RAM（总量、已用、可用）
+  - 可选：按 --pid 进程树过滤的 proc_ram_gb / proc_gpu*_mem_mb
   - 磁盘 I/O 速率（读写 MB/s），优先采 /mnt/data2 所在设备
   - CPU 利用率（总体 + 每 NUMA 节点估算）
 
@@ -12,16 +13,18 @@
   监听命名管道 FIFO（--fifo 参数），训练脚本向其写入如下格式的事件：
     phase:<name>
     event:<checkpoint_start|checkpoint_end|step_start|step_end|backward_start>
+    pid:<root_pid>
 
 用法：
   python monitor.py --out /path/to/monitor.csv [--fifo /tmp/monitor_events.fifo] \
-                    [--interval 2] [--disk-mount /mnt/data2]
+                    [--interval 2] [--disk-mount /mnt/data2] [--pid $$]
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
 import os
-import select
 import signal
 import stat
 import subprocess
@@ -95,6 +98,7 @@ def _gpu_columns(n: int) -> list[str]:
             f"gpu{i}_mem_total_mb",
             f"gpu{i}_mem_util_pct",
             f"gpu{i}_sm_util_pct",
+            f"proc_gpu{i}_mem_mb",
         ]
     return cols
 
@@ -107,6 +111,10 @@ BASE_COLUMNS = [
     "ram_used_gb",
     "ram_total_gb",
     "ram_avail_gb",
+    "root_pid",
+    "proc_count",
+    "proc_ram_gb",
+    "proc_cpu_pct",
     "disk_read_mbps",
     "disk_write_mbps",
     "disk_read_iops",
@@ -187,6 +195,153 @@ def _sample_gpu() -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
+# Per-process-tree GPU/CPU metrics
+# --------------------------------------------------------------------------- #
+def _safe_used_gpu_memory_bytes(proc_info) -> int:
+    try:
+        value = int(getattr(proc_info, "usedGpuMemory", 0) or 0)
+    except Exception:
+        return 0
+    return value if value > 0 else 0
+
+
+def _sample_gpu_proc_mem_nvml(pid_set: set[int]) -> list[int]:
+    out = [0] * _GPU_COUNT
+    if not pid_set or not _NVML_AVAILABLE:
+        return out
+    getters = [
+        getattr(pynvml, "nvmlDeviceGetComputeRunningProcesses_v3", None),
+        getattr(pynvml, "nvmlDeviceGetComputeRunningProcesses", None),
+        getattr(pynvml, "nvmlDeviceGetGraphicsRunningProcesses_v3", None),
+        getattr(pynvml, "nvmlDeviceGetGraphicsRunningProcesses", None),
+    ]
+    for index in range(_GPU_COUNT):
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+        except Exception:
+            continue
+        seen: set[int] = set()
+        total = 0
+        for getter in getters:
+            if getter is None:
+                continue
+            try:
+                processes = getter(handle) or []
+            except Exception:
+                continue
+            for process in processes:
+                try:
+                    pid = int(process.pid)
+                except Exception:
+                    continue
+                if pid not in pid_set or pid in seen:
+                    continue
+                seen.add(pid)
+                total += _safe_used_gpu_memory_bytes(process)
+        out[index] = total // (1024 * 1024)
+    return out
+
+
+def _sample_gpu_proc_mem_smi(pid_set: set[int]) -> list[int]:
+    out = [0] * _GPU_COUNT
+    if not pid_set or _GPU_COUNT <= 0:
+        return out
+    try:
+        uuid_map: dict[str, int] = {}
+        metadata = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,uuid",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if metadata.returncode == 0:
+            for line in metadata.stdout.strip().splitlines():
+                parts = [part.strip() for part in line.split(",")]
+                if len(parts) >= 2:
+                    uuid_map[parts[1]] = int(parts[0])
+
+        applications = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=gpu_uuid,pid,used_gpu_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if applications.returncode != 0:
+            return out
+        for line in applications.stdout.strip().splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) < 3:
+                continue
+            try:
+                pid = int(parts[1])
+                memory_mb = int(float(parts[2]))
+            except ValueError:
+                continue
+            gpu_index = uuid_map.get(parts[0])
+            if (
+                pid in pid_set
+                and memory_mb > 0
+                and gpu_index is not None
+                and 0 <= gpu_index < _GPU_COUNT
+            ):
+                out[gpu_index] += memory_mb
+    except Exception:
+        pass
+    return out
+
+
+def _sample_gpu_proc_mem(pid_set: set[int]) -> list[int]:
+    if _NVML_AVAILABLE:
+        return _sample_gpu_proc_mem_nvml(pid_set)
+    return _sample_gpu_proc_mem_smi(pid_set)
+
+
+def _collect_process_tree(root_pid: int | None) -> tuple[set[int], float, float]:
+    """Return process-tree PIDs, summed RSS in decimal GB, and summed CPU%."""
+    if root_pid is None or root_pid <= 0:
+        return set(), 0.0, 0.0
+    try:
+        root = psutil.Process(root_pid)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return set(), 0.0, 0.0
+    try:
+        processes = [root] + root.children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        processes = [root]
+
+    exclude: set[int] = {os.getpid()}
+    try:
+        exclude.update(
+            child.pid
+            for child in psutil.Process(os.getpid()).children(recursive=True)
+        )
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+
+    pid_set: set[int] = set()
+    rss = 0
+    cpu = 0.0
+    for process in processes:
+        try:
+            if process.pid in exclude:
+                continue
+            pid_set.add(process.pid)
+            rss += int(process.memory_info().rss)
+            cpu += float(process.cpu_percent(interval=None))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return pid_set, rss / 1e9, cpu
+
+
+# --------------------------------------------------------------------------- #
 # 主监控循环
 # --------------------------------------------------------------------------- #
 class Monitor:
@@ -196,12 +351,14 @@ class Monitor:
         fifo_path: str | None,
         interval: float,
         disk_mount: str,
+        root_pid: int | None = None,
     ):
         self.out_path = out_path
         self.fifo_path = fifo_path
         self.interval = interval
         self.disk_mount = disk_mount
         self.disk_device = _resolve_disk_device(disk_mount)
+        self.root_pid = root_pid
         self._running = True
         self._phase = "init"
         self._event = ""
@@ -214,6 +371,7 @@ class Monitor:
         print(f"[monitor] 磁盘设备: {self.disk_device or '(all devices)'}", flush=True)
         print(f"[monitor] GPU 数量: {_GPU_COUNT}", flush=True)
         print(f"[monitor] FIFO 路径: {fifo_path}", flush=True)
+        print(f"[monitor] 进程树根 PID: {root_pid}", flush=True)
 
         # 打开 CSV 写入
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -270,7 +428,10 @@ class Monitor:
         """持续从 FIFO 读取事件行（阻塞式）。"""
         while self._running:
             try:
-                with open(self.fifo_path, "r") as f:
+                # Keeping a writer endpoint open avoids an EOF/reopen race when
+                # short-lived event writers close the FIFO.
+                fd = os.open(self.fifo_path, os.O_RDWR)
+                with os.fdopen(fd, "r") as f:
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -281,7 +442,19 @@ class Monitor:
                         elif line.startswith("event:"):
                             self._event = line[6:]
                             print(f"[monitor] 事件: {self._event}", flush=True)
-            except Exception as e:
+                        elif line.startswith("pid:"):
+                            try:
+                                self.root_pid = int(line[4:].strip())
+                                print(
+                                    f"[monitor] 进程树根 PID 更新 → {self.root_pid}",
+                                    flush=True,
+                                )
+                            except ValueError:
+                                print(
+                                    f"[monitor] 忽略非法 pid 事件: {line}",
+                                    flush=True,
+                                )
+            except Exception:
                 if self._running:
                     time.sleep(0.5)
 
@@ -297,6 +470,10 @@ class Monitor:
         ram_used_gb = vm.used / 1e9
         ram_total_gb = vm.total / 1e9
         ram_avail_gb = vm.available / 1e9
+        pid_set, proc_ram_gb, proc_cpu_pct = _collect_process_tree(
+            self.root_pid
+        )
+        proc_gpu = _sample_gpu_proc_mem(pid_set)
 
         # Disk
         curr_disk = _get_disk_io(self.disk_device)
@@ -314,6 +491,10 @@ class Monitor:
             "ram_used_gb": f"{ram_used_gb:.2f}",
             "ram_total_gb": f"{ram_total_gb:.2f}",
             "ram_avail_gb": f"{ram_avail_gb:.2f}",
+            "root_pid": self.root_pid if self.root_pid else "",
+            "proc_count": len(pid_set),
+            "proc_ram_gb": f"{proc_ram_gb:.2f}",
+            "proc_cpu_pct": f"{proc_cpu_pct:.1f}",
             "disk_read_mbps": f"{read_mbps:.1f}",
             "disk_write_mbps": f"{write_mbps:.1f}",
             "disk_read_iops": f"{read_iops:.0f}",
@@ -326,6 +507,9 @@ class Monitor:
             row[f"gpu{i}_mem_total_mb"] = g["mem_total_mb"]
             row[f"gpu{i}_mem_util_pct"] = g["mem_util_pct"]
             row[f"gpu{i}_sm_util_pct"] = g["sm_util_pct"]
+            row[f"proc_gpu{i}_mem_mb"] = (
+                proc_gpu[i] if i < len(proc_gpu) else 0
+            )
 
         # 重置事件（单次触发）
         self._event = ""
@@ -334,6 +518,7 @@ class Monitor:
     def run(self) -> None:
         # 初始化 CPU percent（第一次调用返回 0）
         psutil.cpu_percent(interval=None)
+        _collect_process_tree(self.root_pid)
         prev_disk = _get_disk_io(self.disk_device)
         prev_t = time.time()
 
@@ -348,7 +533,10 @@ class Monitor:
 
         self._f.close()
         if _NVML_AVAILABLE:
-            pynvml.nvmlShutdown()
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
         print("[monitor] 已停止。", flush=True)
 
     def stop(self) -> None:
@@ -365,7 +553,6 @@ def _sig_handler(signum, frame):
     print(f"\n[monitor] 收到信号 {signum}，正在停止...", flush=True)
     if _monitor_instance:
         _monitor_instance.stop()
-    sys.exit(0)
 
 
 # --------------------------------------------------------------------------- #
@@ -387,6 +574,12 @@ def main():
         default="/mnt/data2",
         help="重点监控的磁盘挂载点",
     )
+    parser.add_argument(
+        "--pid",
+        type=int,
+        default=None,
+        help="训练启动脚本 PID；监控该进程树的 CPU/GPU 内存",
+    )
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, _sig_handler)
@@ -397,6 +590,7 @@ def main():
         fifo_path=args.fifo,
         interval=args.interval,
         disk_mount=args.disk_mount,
+        root_pid=args.pid,
     )
     _monitor_instance.run()
 

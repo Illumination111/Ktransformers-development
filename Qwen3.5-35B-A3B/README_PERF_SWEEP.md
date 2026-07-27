@@ -1,10 +1,11 @@
-# Qwen3.5-35B-A3B BF16 全量微调与 APTMoE Proxy TPS Sweep
+# Qwen3.5-35B-A3B BF16 四后端全量微调与 APTMoE Proxy TPS Sweep
 
-这组脚本不包含 LoRA。KTransformers/DeepSpeed 测真实文本模型全量微调；
-APTMoE 测随机权重的组件同构 full-update proxy。目标配置固定为本地
+KTransformers、DeepSpeed 和 MegaTrain 测真实文本模型全量微调；APTMoE 测随机
+权重的组件同构 full-update proxy。KTransformers/DeepSpeed 还可显式选择 LoRA，
+MegaTrain/APTMoE 在本比较中仅支持 full。目标配置固定为本地
 `/mnt/data3/models/Qwen3.5-35B-A3B`，训练与后端混合精度均显式设为
-BF16。server 默认测试 `32,64,128,256,512,1024,2048,4096`，consumer
-默认测试 `16,32,64,128,256,512,1024,2048`。每种 sequence length 分别运行
+BF16。server 默认按 `4096,2048,1024,512,256,128,64,32`，consumer
+默认按 `2048,1024,512,256,128,64,32,16` 从最长到最短测试。每种 sequence length 分别运行
 15 个 optimizer steps，去除前 5 个 warmup steps 后计算稳定 TPS。这里的 5 步
 是性能统计排除窗口；训练配置的学习率 warmup 为 0。
 
@@ -15,7 +16,7 @@ BF16。server 默认测试 `32,64,128,256,512,1024,2048,4096`，consumer
 `Conv3d`；`20260722_181421_KTRANSFORMERS_BF16_FULL_SWEEP` 正是因此在训练开始前
 终止。
 
-现在 KTransformers 和 DeepSpeed 入口会强制执行以下流程：
+现在 KTransformers、DeepSpeed 和 MegaTrain 入口会强制执行以下流程：
 
 - 从源配置提取 `text_config`，构造 `Qwen3_5MoeForCausalLM`；
 - 由 Transformers 将 checkpoint 的 `model.language_model.*` 映射到文本模型，
@@ -30,17 +31,40 @@ BF16。server 默认测试 `32,64,128,256,512,1024,2048,4096`，consumer
 
 ## 计时与性能干扰约束
 
-三个后端只记录每个 optimizer step 的以下数据：
+四个后端只记录每个 optimizer step 的以下数据：
 
 - forward host wall time；
 - backward host wall time；
 - optimizer host wall time；
 - 完整 optimizer-step wall time 和由其计算的 TPS。
 
-计时器只在三个阶段的 API 边界读取 `time.perf_counter()`，不会调用
-`torch.cuda.synchronize()`。逐 step 数据缓存在内存中，训练结束后才统一写入文件。
-脚本强制设置 `DS_PROBE_MODE=off`、`KT_BACKWARD_TIMING=off`、
-`KT_SFT_PROFILE=0`，并且不启动 CPU、磁盘、GPU 或内存采样进程。
+KTransformers、DeepSpeed 和 APTMoE 的计时器只在三个阶段的 API 边界读取
+`time.perf_counter()`，不会主动调用 `torch.cuda.synchronize()`。MegaTrain
+内部训练实现包含保证其流水线完成和读取 CUDA event 的同步，不能安全伪装成无同步
+口径，因此使用独立的 `megatrain_host_wall_with_backend_cuda_sync` timing mode，
+汇总状态标为 `OK_BACKEND_SYNC`。逐 step 数据缓存在内存中，训练结束后才统一写入。
+脚本强制设置 `DS_PROBE_MODE=off`、`KT_BACKWARD_TIMING=off` 和
+`KT_SFT_PROFILE=0`。
+
+每个 profile 的持久训练进程之外会启动一个 2 秒间隔的系统采样器，记录训练进程树 CPU
+RSS、整机 RAM、训练进程 GPU 显存、整卡显存和 GPU 利用率。采样器不在 phase timer
+内部，不写逐 step 文件，也不会因内存越线向训练进程发送信号。
+
+每个 profile 只启动一次 rank/worker 集合，在同一批持久进程中从最长 sequence
+切换到最短 sequence。最长项完成时激活 CUDA cache hold：释放 Python 模型对象时不
+调用 `torch.cuda.empty_cache()`，同一进程的 caching allocator/最长 buffer 会继续
+占据已经达到的峰值，直至该 profile 的最后一个长度完成，随后进程退出才统一释放。
+KTransformers、DeepSpeed 和 APTMoE 的 NCCL process group，以及 MegaTrain 的 GPU
+worker，也都跨 sequence 保留到 profile 结束。这不是另起一个显存占坑进程，因此
+不会与下一长度的训练 allocator 竞争。
+
+profile 级 `monitor.csv` 按 `seq_<长度>` phase 记录全程曲线；
+`gpu_peak_hold.json` 会逐卡检查后续每个长度的最小任务显存没有跌破最长项峰值
+（默认允许 512 MiB 采样误差）。不满足时标记
+`GPU_PEAK_HOLD_BROKEN_NOT_OOM` 并使该 profile 失败。所选 GPU 启动前已有 compute
+process 时标记 `GPU_BUSY_NOT_OOM`；全部长度结束后的统一释放无法确认时标记
+`GPU_RELEASE_UNCONFIRMED_NOT_OOM`。这些资源隔离错误都不会当成训练 OOM，也不会
+清理同机其他任务。
 
 因此三个阶段是训练 API 的 host wall time，不应解释为纯 GPU kernel 时间。DeepSpeed
 的 optimizer 时间对应 `DeepSpeedEngine.step()` 整段，包含 ZeRO/offload 的更新工作，
@@ -51,19 +75,17 @@ BF16。server 默认测试 `32,64,128,256,512,1024,2048,4096`，consumer
 | Profile | GPU | 全局 batch | 每卡 batch | 内存与 NUMA |
 |---|---:|---:|---:|---|
 | server | 8 | 8 | 1 | 不加 cgroup 上限，使用主机现有约 2T 内存 |
-| consumer | 2 | 2 | 1 | cgroup v2 `MemoryMax=1T`、`MemorySwapMax=0`，NUMA 0/1 等比例 interleave，满载目标各 512G |
+| consumer | 2 | 2 | 1 | 不创建 benchmark cgroup 内存上限；NUMA 0/1 等比例 interleave；运行后人工审阅 1 TiB |
 
-consumer 默认优先使用用户级 transient systemd scope。若管理员已经把当前
-shell 放入有效上限恰好为 1 TiB 的 cgroup，可使用
-`--consumer-cgroup-mode prelimited`；若需要由系统级 systemd 创建 scope，使用
-`--consumer-cgroup-mode system`。脚本不会用 `ulimit` 冒充整棵进程的内存硬限制。
-
-资源校验程序在模型加载前检查 cgroup、swap 和 NUMA policy，写出
-`resource_contract.json` 后用 `exec` 替换自身；训练期间不会留下采样或包装进程。
+consumer 不再设置 `MemoryMax=1T`、禁 swap 或在超过阈值时杀进程。资源记录程序在
+模型加载前记录外部环境已有的 cgroup/swap 状态，并检查 NUMA policy，写出
+`resource_contract.json` 后用 `exec` 替换自身。训练完成或失败后，
+`memory_summary.md/json` 给出观测峰值是否越过 1 TiB，但 `oom_classification`
+固定为 `MANUAL_REVIEW_REQUIRED`；是否按 OOM 记账由人工结合曲线和日志决定。
 
 ## CPU 线程
 
-DeepSpeed 和 APTMoE 默认每个训练 rank 使用：
+DeepSpeed、APTMoE 和 MegaTrain 默认按 GPU 数均分可见物理核心：
 
 ```text
 floor(当前进程可见物理核心数 / profile 的 GPU/rank 数)
@@ -106,14 +128,19 @@ bash run_finetune_perf_test_bf16_ktransformers.sh --profile consumer
 bash run_finetune_perf_test_bf16_deepspeed.sh --profile server
 bash run_finetune_perf_test_bf16_deepspeed.sh --profile consumer
 
+# MegaTrain CPU-master full FT（默认环境 /mnt/data2/wbw/conda/envs/Megatrain）
+bash run_finetune_perf_test_bf16_megatrain.sh --profile server
+bash run_finetune_perf_test_bf16_megatrain.sh --profile consumer
+
 # 仅检查所有生成配置与资源包装命令
-bash run_finetune_perf_test_bf16_ktransformers.sh --profile both --dry-run
+bash run_finetune_perf_test_bf16_megatrain.sh \
+  --profile both --seq-lengths 32 --dry-run
 ```
 
 `--profile both` 按 server、consumer 顺序运行。可以通过
 `--seq-lengths 32,64` 缩小调试范围；该参数会覆盖所选 profile 的默认值，
-与 `--profile both` 一起使用时只能包含两个 profile 共有的长度。正式对比应保留
-各 profile 的默认八档。
+与 `--profile both` 一起使用时只能包含两个 profile 共有的长度。无论输入顺序如何，
+脚本都会自动从最长到最短执行。正式对比应保留各 profile 的默认八档。
 
 ## APTMoE deployment proxy（已实现，非等价后端）
 
@@ -177,12 +204,43 @@ microbatch 依次循环重放，覆盖多个 batch 的路由局部性和 optimiz
 cache 和稀疏 state 首次触达都被排除。正式 proxy 会校验 trace 的来源、
 层数、token 数、top-k、expert 范围和重复 ID；synthetic trace 不能冒充正式结果。
 
+如果 server 的 8 张 GPU 暂时不能同时使用，可在 2 张卡上保持单卡
+microbatch=1，并用 GAS=4 得到相同的有效 global batch=8。Qwen3.5 没有
+batch-coupled normalization，attention dropout 也为 0；同一 optimizer step
+内的 4 个 accumulation microbatch 使用相同权重，因此可按 token 轴精确聚合：
+
+```bash
+bash run_finetune_perf_test_bf16_ktransformers.sh \
+  --profile consumer --devices 0,1 \
+  --seq-lengths 4096,2048,1024,512,256,128,64,32 \
+  --steps 6 --warmup-steps 5 --gas 4 \
+  --capture-aptmoe-routes \
+  --aptmoe-route-root \
+    /mnt/data2/wbw/FFTtest/APTMoE-simulate/routes/qwen35/server_source_gas4
+
+for seq in 4096 2048 1024 512 256 128 64 32; do
+  /mnt/data2/wbw/conda/envs/Aptmoe/bin/python \
+    merge_qwen35_route_traces.py \
+    --input-dir \
+      "/mnt/data2/wbw/FFTtest/APTMoE-simulate/routes/qwen35/server_source_gas4/consumer/seq_${seq}_ranks" \
+    --output \
+      "/mnt/data2/wbw/FFTtest/APTMoE-simulate/routes/qwen35/server/seq_${seq}.npz" \
+    --expected-ranks 2 --expected-patterns 20 \
+    --sequence-length "${seq}" --global-batch-size 8 \
+    --source-accumulation-steps 4
+done
+```
+
+输出仍是 5 个 server pattern。metadata 会保留 source world size、source
+microbatch、GAS 和 20 个原始 pattern，不会把等价采集伪装成 8-rank trace。
+
 ### 3. 在目标拓扑生成 lookup
 
-当前 `Aptmoe` 环境尚缺兼容的 `flash-linear-attention` 和 `causal-conv1d`，
-`is_fast_path_available == false`。正式 GPU attention TPS 前必须先安装兼容
-PyTorch 2.9.1/CUDA 12.8 的版本。然后分别在 server/consumer 实际 CPU
-线程、NUMA、cgroup 和 PCIe 拓扑下运行：
+当前 `Aptmoe` 环境已验证 PyTorch 2.9.1/CUDA 12.8、
+`flash-linear-attention==0.5.1` 和 `causal-conv1d==1.6.2.post1`，
+`require_linear_attention_fastpath()` 可用。环境升级后必须重新执行 fast-path
+preflight。然后分别在 server/consumer 实际 CPU 线程、NUMA、cgroup 和 PCIe
+拓扑下运行：
 
 ```bash
 export CUDA_CACHE_PATH=/mnt/data2/wbw/FFTtest/APTMoE-simulate/cache/cuda
@@ -203,7 +261,7 @@ export TRITON_CACHE_DIR=/mnt/data2/wbw/FFTtest/APTMoE-simulate/cache/triton
   --model-path /mnt/data3/models/Qwen3.5-35B-A3B \
   --output /mnt/data2/wbw/FFTtest/APTMoE-simulate/lookups/qwen35/consumer.json \
   --simulation-root /mnt/data2/wbw/FFTtest/APTMoE-simulate \
-  --sequence-length 128 --max-tokens 4096 --cpu-threads 48
+  --sequence-length 128 --max-tokens 8192 --cpu-threads 48
 ```
 
 lookup 覆盖 6 MiB expert H2D/D2H、CPU expert forward/backward 曲线、
@@ -255,11 +313,26 @@ bash run_finetune_perf_test_bf16_aptmoe.sh --profile consumer
 - `summary.md`：按 profile 汇总的对比表；
 - `dataset_validation.json`：Qwen3.5 tokenizer 下的数据长度与 BF16 模型校验；
 - `run_config.json`：源架构、文本加载架构以及 `text_only` 模态契约；
-- 每个 sequence 的 `resource_contract.json`：训练开始前实际生效的 cgroup、swap
-  和 NUMA policy。它不是运行期资源采样结果。
+- 每个 profile 的 `monitor.csv`、`monitor.log`：全量训练过程的 CPU/GPU 内存和
+  利用率原始采样，使用 `seq_<长度>` phase 区分各 sequence；
+- 每个 sequence 的 `plots/01_gpu_memory.png`、`plots/02_cpu_ram.png`：
+  GPU 显存与 CPU 内存曲线；
+- 每个 sequence 的 `memory_summary.md/json`：1 TiB 观测结果和人工 OOM 审阅标记；
+- 每个 profile 的 `profile_sweep_manifest.json`、`monitor.csv`、`train.log`：
+  持久进程内的长度顺序、分段内存采样和完整日志；
+- 每个 profile 的 `gpu_peak_hold.json`：最长项峰值是否一直保持到最短项结束；
+- 每个 profile 的 `gpu_lifecycle.json`：测试前 GPU 占用、持久训练进程会话、
+  最终残留 worker 清理以及全部长度结束后显存回到基线的确认结果；
+- 每个 sequence 的 `resource_contract.json`：训练开始前外部已有的 cgroup、swap
+  和 NUMA policy；脚本不会据此创建 1 TiB 限制；
 - APTMoE 另写 `proxy_manifest.json` 和 `full_update_verification.json`，记录精确
   参数分类、路由/placement/fast-path 来源、optimizer scope、梯度、权重变化以及
   BF16 moment 的 CPU home device。
+
+`summary.md` 和 `sweep_results.csv` 由启动训练前注册的 shell `EXIT` finalizer
+兜底生成，只运行 `server` 或只运行 `consumer` 都不会影响汇总。只要至少已有一个
+`run_config.json`，正常完成、训练失败或脚本主体提前退出都会汇总当前已有结果；
+汇总器自身失败时，原训练退出码为 0 的任务改用退出码 98。
 
 默认跳过 LLaMA-Factory 在训练结束后的完整模型保存，避免每个 sequence 重复写出
 几十 GB 权重；它不属于 optimizer-step TPS 窗口。APTMoE 同样默认不保存随机权重。

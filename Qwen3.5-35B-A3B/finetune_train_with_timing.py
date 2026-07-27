@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
+import traceback
 
 
 def _configure_kt_rank_threads() -> None:
@@ -109,14 +111,105 @@ def _run_training_in_current_rank() -> None:
     run_exp()
 
 
+def _manifest_backend(runtime_backend: str) -> str:
+    normalized = runtime_backend.strip().lower()
+    return "ktransformers" if normalized == "kt" else normalized
+
+
+def _run_persistent_sweep(manifest_path: str) -> None:
+    import torch.distributed as dist
+
+    from llamafactory.train.tuner import run_exp
+    from persistent_sweep import (
+        activate_cuda_cache_hold,
+        collect_without_releasing_cuda,
+        emit_monitor_phase,
+        load_manifest,
+        reset_accelerate_state,
+        write_case_cuda_snapshot,
+        write_case_exit,
+    )
+    from step_phase_timer import install_step_phase_timing
+
+    runtime_backend = os.environ["FFT_TRAINING_BACKEND"].strip().lower()
+    manifest_backend = _manifest_backend(runtime_backend)
+    manifest = load_manifest(manifest_path, manifest_backend)
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    original_destroy_process_group = dist.destroy_process_group
+
+    def retain_process_group(*args: object, **kwargs: object) -> None:
+        print(
+            "[persistent-sweep] retaining distributed process group "
+            "until profile end",
+            flush=True,
+        )
+
+    dist.destroy_process_group = retain_process_group
+    try:
+        for index, case in enumerate(manifest["cases"]):
+            sequence = int(case["sequence_length"])
+            for name, value in (case.get("environment") or {}).items():
+                if value is None:
+                    os.environ.pop(str(name), None)
+                else:
+                    os.environ[str(name)] = str(value)
+            os.environ["FFT_STEP_TIMING_OUT_DIR"] = str(
+                case["timing_output_dir"]
+            )
+            os.environ["FFT_STEP_TIMING_WARMUP_STEPS"] = str(
+                case["warmup_steps"]
+            )
+            os.environ["FFT_STEP_TIMING_TOKENS_PER_STEP"] = str(
+                case["tokens_per_step"]
+            )
+            emit_monitor_phase(manifest, f"seq_{sequence}")
+            print(
+                f"[persistent-sweep] BEGIN seq={sequence} "
+                f"case={index + 1}/{len(manifest['cases'])}",
+                flush=True,
+            )
+            recorder = install_step_phase_timing()
+            run_exp(args=[str(case["training_config"])])
+            recorder.write()
+            activate_cuda_cache_hold(manifest)
+            write_case_cuda_snapshot(manifest, case, manifest_backend)
+            if rank == 0:
+                write_case_exit(case, 0)
+            print(
+                f"[persistent-sweep] END seq={sequence}; CUDA caching "
+                "allocator and distributed process group retained",
+                flush=True,
+            )
+            collect_without_releasing_cuda()
+            if index + 1 < len(manifest["cases"]):
+                reset_accelerate_state()
+        emit_monitor_phase(manifest, "profile_release")
+    except BaseException:
+        if rank == 0:
+            write_case_exit(case, 1)
+        emit_monitor_phase(manifest, "profile_abort")
+        traceback.print_exc()
+        raise
+    finally:
+        dist.destroy_process_group = original_destroy_process_group
+        if dist.is_initialized():
+            original_destroy_process_group()
+
+
 def main() -> None:
     _configure_kt_rank_threads()
-    _install_timing()
     _disable_benchmark_saves()
     from qwen35_text_only import install_text_only_loading
 
     install_text_only_loading()
-    _run_training_in_current_rank()
+    if "--sweep-manifest" in sys.argv:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--sweep-manifest", required=True)
+        args = parser.parse_args()
+        _run_persistent_sweep(args.sweep_manifest)
+    else:
+        _install_timing()
+        _run_training_in_current_rank()
 
 
 if __name__ == "__main__":

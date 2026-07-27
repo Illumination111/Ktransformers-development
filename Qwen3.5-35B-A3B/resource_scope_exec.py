@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the benchmark resource scope once, then replace this process.
+"""Record the benchmark resource scope once, then replace this process.
 
 The validation happens before model loading.  ``exec`` then replaces this
 helper with the training command, so no sampler or wrapper process remains
@@ -84,8 +84,6 @@ def gib(value: int | None) -> float | None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", choices=("server", "consumer"), required=True)
-    parser.add_argument("--expected-memory-max", type=int)
-    parser.add_argument("--require-swap-zero", action="store_true")
     parser.add_argument("--numa-nodes", default="0,1")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -109,19 +107,12 @@ def main() -> None:
         "memory_swap_max_chain": swap_chain,
         "numa_nodes": args.numa_nodes,
         "numa_policy": policy,
+        "memory_policy": "observed_only_no_benchmark_cgroup_limit",
         "validation": "one_shot_before_exec",
         "status": "OK",
     }
     errors: list[str] = []
     if args.profile == "consumer":
-        if args.expected_memory_max is None:
-            errors.append("consumer expected-memory-max was not supplied")
-        elif memory_max != args.expected_memory_max:
-            errors.append(
-                f"effective memory.max is {memory_max}, expected exactly {args.expected_memory_max}"
-            )
-        if args.require_swap_zero and swap_max != 0:
-            errors.append(f"effective memory.swap.max is {swap_max}, expected 0")
         if policy not in {"interleave", "weighted interleave"}:
             errors.append(f"NUMA policy is {policy!r}, expected interleave")
     if errors:
@@ -139,7 +130,7 @@ def main() -> None:
         raise SystemExit(91)
 
     print(
-        f"[resource_scope_exec] validated profile={args.profile} cgroup={cgroup} "
+        f"[resource_scope_exec] recorded profile={args.profile} cgroup={cgroup} "
         f"memory_max={memory_max} swap_max={swap_max} numa_policy={policy}; exec training",
         flush=True,
     )
