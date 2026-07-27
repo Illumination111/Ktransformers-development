@@ -14,8 +14,8 @@
 ```text
 server：8 GPU、全局 batch 8、使用主机约 2T 内存
 consumer：2 GPU、全局 batch 2、不设 benchmark 内存上限、完成后人工审阅 1 TiB 峰值
-server sequence：32、64、128、256、512、1024、2048、4096
-consumer sequence：16、32、64、128、256、512、1024、2048
+server sequence：4096、2048、1024、512、256、128、64、32
+consumer sequence：2048、1024、512、256、128、64、32、16
 每个长度：15 steps，排除前 5 个 warmup steps
 精度：BF16
 模型：text-only Qwen3_5MoeForCausalLM
@@ -25,8 +25,8 @@ consumer sequence：16、32、64、128、256、512、1024、2048
 线程按可见物理核心数除以训练 rank 数自动计算；在当前 96 物理核心主机上，server
 为 12 线程/rank，consumer 为 48 线程/rank。
 
-下面四条完整启动命令均故意不传 `--seq-lengths`。脚本会分别使用 server 和
-consumer 自己的默认长度；尤其在
+下面四条完整启动命令均故意不传 `--seq-lengths`。脚本会让 server 从 4096 递减到
+32，让 consumer 从 2048 递减到 16；尤其在
 `--profile both` 下，不能在启动命令中设置一份公共 sequence length 列表来替代这两套
 profile 默认值。
 
@@ -225,12 +225,18 @@ memory_summary.md/json -> MANUAL_REVIEW_REQUIRED
 训练启动前只记录外部已有的 cgroup/swap 状态并验证 NUMA policy；不创建
 `MemoryMax`、不关闭 swap，也不会在内存峰值超过 1 TiB 时自动按 OOM 归类。
 
+每个 sequence 在独立进程会话中运行，并保留框架正常申请的 CUDA 显存直到该项结束。
+结束后脚本会清理本项残留 worker，确认 GPU context 消失且显存回到测试前基线，再开始
+下一个更短的 sequence。测试前 GPU 已忙会标记 `GPU_BUSY_NOT_OOM`；显存释放未确认会
+标记 `GPU_RELEASE_UNCONFIRMED_NOT_OOM` 并停止 sweep，不会把这两种资源隔离问题误报
+为训练 OOM，也不会结束同机其他任务。
+
 ## 3. 公共参数
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `--profile` | `server` | `server`、`consumer` 或 `both` |
-| `--seq-lengths` | 按 profile 选择 | 高级单-profile 覆盖项 |
+| `--seq-lengths` | 按 profile 选择 | 高级单-profile 覆盖项；输入后仍自动按从长到短执行 |
 | `--steps` | `15` | 每个 sequence 的 optimizer steps |
 | `--warmup-steps` | `5` | 前 N 步不计入稳定 TPS |
 | `--gas` | `1` | Gradient accumulation steps |
@@ -250,8 +256,8 @@ memory_summary.md/json -> MANUAL_REVIEW_REQUIRED
 默认 sequence length 为：
 
 ```text
-server: 32,64,128,256,512,1024,2048,4096
-consumer: 16,32,64,128,256,512,1024,2048
+server: 4096,2048,1024,512,256,128,64,32
+consumer: 2048,1024,512,256,128,64,32,16
 ```
 
 完整对比测试应保留这些 profile 默认值。`--seq-lengths` 只保留给临时的单-profile
@@ -397,6 +403,7 @@ test_log/<timestamp>_<backend>_BF16_FULL_SWEEP/
 ├── dataset_validation.json
 ├── server_8gpu_batch8/seq_*/
 │   ├── resource_contract.json
+│   ├── gpu_lifecycle.json
 │   ├── monitor.csv
 │   ├── memory_summary.{md,json}
 │   ├── plots/{01_gpu_memory.png,02_cpu_ram.png}

@@ -23,10 +23,16 @@ TIMING_VALIDATOR="${SCRIPT_DIR}/validate_step_timing.py"
 RESOURCE_EXEC="${SCRIPT_DIR}/resource_scope_exec.py"
 MONITOR_SCRIPT="${SCRIPT_DIR}/monitor.py"
 MEMORY_ANALYZER="${SCRIPT_DIR}/analyze_memory_usage.py"
+GPU_LIFECYCLE_GUARD="${SCRIPT_DIR}/gpu_lifecycle_guard.py"
 MEGATRAIN_ROOT="${FFT_MEGATRAIN_ROOT:-/mnt/data2/wbw/MegaTrain}"
 MEGATRAIN_ENTRYPOINT="${SCRIPT_DIR}/megatrain_qwen35_train.py"
 MEGATRAIN_CONFIG_BASE="${CONFIGS_DIR}/megatrain_qwen35_bf16.yaml"
 ACTIVE_MONITOR_PID=""
+ACTIVE_TRAIN_GUARD_PID=""
+ACTIVE_TEE_PID=""
+ACTIVE_LOG_FIFO=""
+GPU_RELEASE_TIMEOUT="${FFT_GPU_RELEASE_TIMEOUT:-60}"
+GPU_RELEASE_TOLERANCE_MIB="${FFT_GPU_RELEASE_TOLERANCE_MIB:-512}"
 
 if [[ $# -lt 1 ]]; then
     echo "Internal error: backend argument is required" >&2
@@ -41,8 +47,8 @@ esac
 
 PROFILE="server"
 FINETUNING_TYPE="full"
-readonly -a SERVER_SEQUENCE_LENGTHS=(32 64 128 256 512 1024 2048 4096)
-readonly -a CONSUMER_SEQUENCE_LENGTHS=(16 32 64 128 256 512 1024 2048)
+readonly -a SERVER_SEQUENCE_LENGTHS=(4096 2048 1024 512 256 128 64 32)
+readonly -a CONSUMER_SEQUENCE_LENGTHS=(2048 1024 512 256 128 64 32 16)
 SEQUENCE_LENGTHS_CSV=""
 SEQUENCE_LENGTHS_OVERRIDE_SET=0
 STEPS=15
@@ -93,9 +99,10 @@ Sweep and training (BF16 only):
   --lora-alpha N              LoRA alpha when TYPE=lora (default: 16)
                                 LoRA target is fixed to all
   --seq-lengths LIST           Override the selected profile default(s)
-                                server:   32,64,128,256,512,1024,2048,4096
-                                consumer: 16,32,64,128,256,512,1024,2048
+                                server:   4096,2048,1024,512,256,128,64,32
+                                consumer: 2048,1024,512,256,128,64,32,16
                                 With profile=both, every override must be valid for both
+                                All selected lengths run from largest to smallest
   --steps N                    Optimizer steps per sequence (default: 15)
   --warmup-steps N             Initial steps excluded from stable TPS (default: 5)
   --gas N                      Gradient accumulation steps (default: 1)
@@ -151,6 +158,9 @@ Other:
 Timing records only per-step forward, backward, optimizer, and total wall time.
 CPU/GPU resource sampling runs outside the phase timing path. MegaTrain's
 backend-required CUDA synchronization is explicitly labelled in its results.
+Each sequence owns its CUDA allocations until its training processes exit.
+The next sequence starts only after all owned workers and GPU contexts are gone.
+Busy GPUs and unconfirmed release use dedicated statuses and are not called OOM.
 Exact backends load Qwen3_5MoeForCausalLM without a visual tower; the APTMoE proxy reads only target config/tokenizer.
 TPS = GPUs * per-device batch * sequence length * GAS / post-warmup mean step time.
 EOF
@@ -234,6 +244,9 @@ require_positive_int "--gas" "${GRAD_ACCUM_STEPS}"
 require_positive_number "--learning-rate" "${LEARNING_RATE}"
 require_positive_int "--lora-rank" "${LORA_RANK}"
 require_positive_int "--lora-alpha" "${LORA_ALPHA}"
+require_positive_int "FFT_GPU_RELEASE_TIMEOUT" "${GPU_RELEASE_TIMEOUT}"
+require_nonnegative_int \
+    "FFT_GPU_RELEASE_TOLERANCE_MIB" "${GPU_RELEASE_TOLERANCE_MIB}"
 if [[ -n "${CPU_THREADS_OVERRIDE}" ]]; then
     require_positive_int "--cpu-threads/FFT_CPU_THREADS" "${CPU_THREADS_OVERRIDE}"
 fi
@@ -302,6 +315,9 @@ if [[ "${SEQUENCE_LENGTHS_OVERRIDE_SET}" -eq 1 ]]; then
         SEEN_SEQUENCE["${seq}"]=1
         (( seq > MAX_SEQUENCE_LENGTH )) && MAX_SEQUENCE_LENGTH="${seq}"
     done
+    mapfile -t SEQUENCE_LENGTHS_OVERRIDE < <(
+        printf '%s\n' "${SEQUENCE_LENGTHS_OVERRIDE[@]}" | sort -rn
+    )
 else
     case "${PROFILE}" in
         server|both) MAX_SEQUENCE_LENGTH=4096 ;;
@@ -381,7 +397,7 @@ check_files_and_environment() {
     [[ -d "${MODEL_PATH}" ]] || die "model directory not found: ${MODEL_PATH}"
     [[ -d "${DATASET_DIR}" ]] || die "dataset directory not found: ${DATASET_DIR}"
     [[ -f "${VALIDATOR}" && -f "${AGGREGATOR}" && -f "${TIMING_VALIDATOR}" && \
-       -f "${RESOURCE_EXEC}" ]] || \
+       -f "${RESOURCE_EXEC}" && -f "${GPU_LIFECYCLE_GUARD}" ]] || \
         die "benchmark helper scripts are missing"
     [[ -f "${MONITOR_SCRIPT}" && -f "${MEMORY_ANALYZER}" ]] || \
         die "CPU/GPU memory monitoring helpers are missing"
@@ -737,6 +753,12 @@ obj = {
     "manual_oom_review_threshold_bytes": 1 << 40,
     "automatic_memory_termination": False,
     "automatic_oom_classification": False,
+    "gpu_allocation_lifetime": "training_process_lifetime",
+    "artificial_gpu_reservation": False,
+    "empty_cache_during_training": False,
+    "gpu_release_required_before_next_sequence": True,
+    "gpu_busy_is_oom": False,
+    "gpu_release_failure_is_oom": False,
     "numa_policy": sys.argv[17],
     "resource_mode": sys.argv[18],
     "cpu_threads_per_rank": int(sys.argv[19]),
@@ -789,6 +811,30 @@ stop_active_monitor() {
     ACTIVE_MONITOR_PID=""
 }
 
+stop_active_training() {
+    if [[ -n "${ACTIVE_TRAIN_GUARD_PID}" ]] && \
+       kill -0 "${ACTIVE_TRAIN_GUARD_PID}" 2>/dev/null; then
+        kill -TERM "${ACTIVE_TRAIN_GUARD_PID}" 2>/dev/null || true
+        wait "${ACTIVE_TRAIN_GUARD_PID}" 2>/dev/null || true
+    fi
+    ACTIVE_TRAIN_GUARD_PID=""
+    if [[ -n "${ACTIVE_TEE_PID}" ]] && \
+       kill -0 "${ACTIVE_TEE_PID}" 2>/dev/null; then
+        kill -TERM "${ACTIVE_TEE_PID}" 2>/dev/null || true
+        wait "${ACTIVE_TEE_PID}" 2>/dev/null || true
+    fi
+    ACTIVE_TEE_PID=""
+    if [[ -n "${ACTIVE_LOG_FIFO}" ]]; then
+        rm -f "${ACTIVE_LOG_FIFO}"
+    fi
+    ACTIVE_LOG_FIFO=""
+}
+
+cleanup_active_processes() {
+    stop_active_training
+    stop_active_monitor
+}
+
 start_memory_monitor() {
     local run_dir="$1"
     mkdir -p "${run_dir}/.mplconfig"
@@ -821,9 +867,9 @@ analyze_memory_usage() {
         warn "Memory analysis failed; see ${run_dir}/memory_analysis.log"
 }
 
-trap stop_active_monitor EXIT
-trap 'stop_active_monitor; exit 130' INT
-trap 'stop_active_monitor; exit 143' TERM
+trap cleanup_active_processes EXIT
+trap 'cleanup_active_processes; exit 130' INT
+trap 'cleanup_active_processes; exit 143' TERM
 
 run_one_sequence() {
     local profile_name="$1" profile_dir="$2" seq="$3" devices="$4"
@@ -1080,6 +1126,15 @@ run_one_sequence() {
     )
     scoped_command+=(-- "${command[@]}")
     local -a full_command=("${RESOURCE_PREFIX[@]}" "${scoped_command[@]}")
+    local -a guarded_command=(
+        "${VALIDATOR_PYTHON}" "${GPU_LIFECYCLE_GUARD}"
+        --devices "${devices}"
+        --report "${run_dir}/gpu_lifecycle.json"
+        --cwd "${run_cwd}"
+        --release-timeout "${GPU_RELEASE_TIMEOUT}"
+        --memory-tolerance-mib "${GPU_RELEASE_TOLERANCE_MIB}"
+        -- "${full_command[@]}"
+    )
     if [[ "${BACKEND}" == "ktransformers" ]]; then
         log "${BACKEND}/${profile_name}: seq=${seq}, GPUs=${NUM_GPUS}, global_batch=${GLOBAL_BATCH_SIZE}, tokens/step=${tokens_per_step}, ${FINETUNING_TYPE}, text-only BF16, KT owner(rank0) threads=${kt_owner_threads}, non-owner rank threads=${cpu_threads}"
     elif [[ "${BACKEND}" == "aptmoe" ]]; then
@@ -1089,19 +1144,29 @@ run_one_sequence() {
     fi
 
     if [[ "${DRY_RUN}" -eq 1 ]]; then
-        print_command "${full_command[@]}"
+        print_command "${guarded_command[@]}"
         printf 'DRY_RUN\n' > "${run_dir}/exit_code.txt"
         return 0
     fi
 
     local exit_code=0
     start_memory_monitor "${run_dir}"
-    pushd "${run_cwd}" >/dev/null
+    ACTIVE_LOG_FIFO="${run_dir}/.train-log.fifo"
+    rm -f "${ACTIVE_LOG_FIFO}"
+    mkfifo "${ACTIVE_LOG_FIFO}"
+    tee "${train_log}" < "${ACTIVE_LOG_FIFO}" &
+    ACTIVE_TEE_PID=$!
     set +e
-    "${full_command[@]}" 2>&1 | tee "${train_log}"
-    exit_code="${PIPESTATUS[0]}"
+    "${guarded_command[@]}" > "${ACTIVE_LOG_FIFO}" 2>&1 &
+    ACTIVE_TRAIN_GUARD_PID=$!
+    wait "${ACTIVE_TRAIN_GUARD_PID}"
+    exit_code=$?
+    ACTIVE_TRAIN_GUARD_PID=""
+    wait "${ACTIVE_TEE_PID}"
+    ACTIVE_TEE_PID=""
     set -e
-    popd >/dev/null
+    rm -f "${ACTIVE_LOG_FIFO}"
+    ACTIVE_LOG_FIFO=""
     local monitor_failed=0
     if [[ -z "${ACTIVE_MONITOR_PID}" ]] || \
        ! kill -0 "${ACTIVE_MONITOR_PID}" 2>/dev/null; then
@@ -1192,11 +1257,18 @@ run_profile() {
     fi
 
     log "Profile ${profile_name} sequences: ${profile_sequence_lengths[*]}"
-    local profile_status=0 seq
+    local profile_status=0 seq sequence_status=0
     for seq in "${profile_sequence_lengths[@]}"; do
-        if ! run_one_sequence \
+        if run_one_sequence \
             "${profile_name}" "${profile_dir}" "${seq}" "${devices}"; then
+            continue
+        else
+            sequence_status=$?
             profile_status=1
+            if [[ "${sequence_status}" -eq 87 || "${sequence_status}" -eq 88 ]]; then
+                warn "Stopping sweep: selected GPUs were busy or prior allocations were not confirmed released; this is not classified as OOM"
+                break
+            fi
             if [[ "${CONTINUE_ON_ERROR}" -eq 0 ]]; then
                 warn "Stopping profile after first failure; use --continue-on-error to keep sweeping"
                 break

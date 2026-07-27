@@ -4,8 +4,8 @@ KTransformers、DeepSpeed 和 MegaTrain 测真实文本模型全量微调；APTM
 权重的组件同构 full-update proxy。KTransformers/DeepSpeed 还可显式选择 LoRA，
 MegaTrain/APTMoE 在本比较中仅支持 full。目标配置固定为本地
 `/mnt/data3/models/Qwen3.5-35B-A3B`，训练与后端混合精度均显式设为
-BF16。server 默认按 `32,64,128,256,512,1024,2048,4096`，consumer
-默认按 `16,32,64,128,256,512,1024,2048` 测试。每种 sequence length 分别运行
+BF16。server 默认按 `4096,2048,1024,512,256,128,64,32`，consumer
+默认按 `2048,1024,512,256,128,64,32,16` 从最长到最短测试。每种 sequence length 分别运行
 15 个 optimizer steps，去除前 5 个 warmup steps 后计算稳定 TPS。这里的 5 步
 是性能统计排除窗口；训练配置的学习率 warmup 为 0。
 
@@ -49,6 +49,12 @@ KTransformers、DeepSpeed 和 APTMoE 的计时器只在三个阶段的 API 边�
 每个 sequence 训练进程之外会启动一个 2 秒间隔的系统采样器，记录训练进程树 CPU
 RSS、整机 RAM、训练进程 GPU 显存、整卡显存和 GPU 利用率。采样器不在 phase timer
 内部，不写逐 step 文件，也不会因内存越线向训练进程发送信号。
+
+每项训练在独立进程会话中运行。框架正常申请的 CUDA 显存会保留到该项训练进程结束；
+结束后脚本清理本项残留 worker，并等待所选 GPU context 消失、显存回到测试前基线，
+确认后才启动下一个更短的 sequence。所选 GPU 在启动前已有 compute process 时记为
+`GPU_BUSY_NOT_OOM`；释放无法确认时记为 `GPU_RELEASE_UNCONFIRMED_NOT_OOM` 并停止
+sweep。两者都不会当成训练 OOM，也不会清理同机其他任务。
 
 因此三个阶段是训练 API 的 host wall time，不应解释为纯 GPU kernel 时间。DeepSpeed
 的 optimizer 时间对应 `DeepSpeedEngine.step()` 整段，包含 ZeRO/offload 的更新工作，
@@ -123,8 +129,8 @@ bash run_finetune_perf_test_bf16_megatrain.sh \
 
 `--profile both` 按 server、consumer 顺序运行。可以通过
 `--seq-lengths 32,64` 缩小调试范围；该参数会覆盖所选 profile 的默认值，
-与 `--profile both` 一起使用时只能包含两个 profile 共有的长度。正式对比应保留各
-profile 的默认八档。
+与 `--profile both` 一起使用时只能包含两个 profile 共有的长度。无论输入顺序如何，
+脚本都会自动从最长到最短执行。正式对比应保留各 profile 的默认八档。
 
 ## APTMoE deployment proxy（已实现，非等价后端）
 
@@ -302,6 +308,8 @@ bash run_finetune_perf_test_bf16_aptmoe.sh --profile consumer
 - 每个 sequence 的 `plots/01_gpu_memory.png`、`plots/02_cpu_ram.png`：
   GPU 显存与 CPU 内存曲线；
 - 每个 sequence 的 `memory_summary.md/json`：1 TiB 观测结果和人工 OOM 审阅标记；
+- 每个 sequence 的 `gpu_lifecycle.json`：测试前 GPU 占用、训练进程会话、残留
+  worker 清理以及显存回到基线的确认结果；
 - 每个 sequence 的 `resource_contract.json`：训练开始前外部已有的 cgroup、swap
   和 NUMA policy；脚本不会据此创建 1 TiB 限制；
 - APTMoE 另写 `proxy_manifest.json` 和 `full_update_verification.json`，记录精确

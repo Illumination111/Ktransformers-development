@@ -12,10 +12,13 @@ DOC_DIR="$(cd "${SCRIPT_DIR}/../docs/aptmoe" && pwd)"
 APTMOE_ROOT="${FFT_APTMOE_ROOT:-/mnt/data2/wbw/APTMoE-baseline}"
 APTMOE_PYTHON="${FFT_APTMOE_PYTHON:-}"
 LOG_BASE="${FFT_LOG_BASE:-${SCRIPT_DIR}/test_log}"
+GPU_LIFECYCLE_GUARD="${SCRIPT_DIR}/gpu_lifecycle_guard.py"
+GPU_RELEASE_TIMEOUT="${FFT_GPU_RELEASE_TIMEOUT:-60}"
+GPU_RELEASE_TOLERANCE_MIB="${FFT_GPU_RELEASE_TOLERANCE_MIB:-512}"
 
 PROFILE="server"
 FINETUNING_TYPE="full"
-SEQUENCE_LENGTHS_CSV="512,1024"
+SEQUENCE_LENGTHS_CSV="1024,512"
 MEASURE_STEPS=3
 WARMUP_STEPS=1
 TOP_K=2
@@ -25,6 +28,7 @@ DEVICES="0,1,2,3,4,5,6,7"
 MASTER_PORT=29501
 CONTINUE_ON_ERROR=0
 DRY_RUN=0
+ACTIVE_TRAIN_GUARD_PID=""
 
 usage() {
     cat <<EOF
@@ -36,7 +40,7 @@ This runs the synthetic QWEN35_397B APTMoE benchmark documented in:
 Options:
   --profile server              Only the documented 8-GPU server profile is valid
   --finetuning-type full|lora   Default: full
-  --seq-lengths LIST            Default: 512,1024
+  --seq-lengths LIST            Default: 1024,512; always runs largest first
   --top-k N                     Experts/token; default: 2
                                 The real 397B config is top-10, but documented
                                 runnable sweeps use top-1/2/4 because of OOM
@@ -61,6 +65,8 @@ Fixed authoritative parameters:
 
 TPS is reported by APTMoE as batch_size * sequence_length / step_time.
 The eight ranks form one pipeline; TPS must not be multiplied by GPU count.
+Each item retains its normal CUDA allocations until training exits. The next
+sequence starts only after owned workers and GPU contexts have been released.
 EOF
 }
 
@@ -83,6 +89,10 @@ need_value() {
 
 require_positive_int() {
     [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "$1 must be a positive integer, got: $2"
+}
+
+require_nonnegative_int() {
+    [[ "$2" =~ ^[0-9]+$ ]] || die "$1 must be a non-negative integer, got: $2"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -158,6 +168,9 @@ require_positive_int "--top-k" "${TOP_K}"
 require_positive_int "--lora-rank" "${LORA_RANK}"
 require_positive_int "--lora-alpha" "${LORA_ALPHA}"
 require_positive_int "--master-port" "${MASTER_PORT}"
+require_positive_int "FFT_GPU_RELEASE_TIMEOUT" "${GPU_RELEASE_TIMEOUT}"
+require_nonnegative_int \
+    "FFT_GPU_RELEASE_TOLERANCE_MIB" "${GPU_RELEASE_TOLERANCE_MIB}"
 (( TOP_K <= 512 )) || die "--top-k cannot exceed the configured 512 experts"
 (( MASTER_PORT <= 65535 )) || die "--master-port must not exceed 65535"
 
@@ -180,6 +193,9 @@ for seq in "${SEQUENCE_LENGTHS[@]}"; do
     [[ -z "${SEEN_SEQUENCES[${seq}]:-}" ]] || die "duplicate sequence length: ${seq}"
     SEEN_SEQUENCES["${seq}"]=1
 done
+mapfile -t SEQUENCE_LENGTHS < <(
+    printf '%s\n' "${SEQUENCE_LENGTHS[@]}" | sort -rn
+)
 if [[ "${FINETUNING_TYPE}" == "full" ]]; then
     if (( TOP_K >= 4 )); then
         warn "docs/aptmoe reports QWEN35_397B full training top-k >= 4 is killed by CPU RAM pressure"
@@ -216,6 +232,8 @@ fi
     die "APTMoE Python was not found; pass --aptmoe-python"
 [[ -d "${APTMOE_ROOT}" ]] || die "APTMoE root not found: ${APTMOE_ROOT}"
 [[ -f "${APTMOE_ROOT}/main.py" ]] || die "APTMoE main.py not found under ${APTMOE_ROOT}"
+[[ -f "${GPU_LIFECYCLE_GUARD}" ]] || \
+    die "GPU lifecycle guard not found: ${GPU_LIFECYCLE_GUARD}"
 TORCHRUN="$(dirname "${APTMOE_PYTHON}")/torchrun"
 [[ -x "${TORCHRUN}" ]] || die "torchrun not found beside ${APTMOE_PYTHON}"
 
@@ -358,6 +376,19 @@ print_command() {
     printf '\n'
 }
 
+stop_active_training() {
+    if [[ -n "${ACTIVE_TRAIN_GUARD_PID}" ]] && \
+       kill -0 "${ACTIVE_TRAIN_GUARD_PID}" 2>/dev/null; then
+        kill -TERM "${ACTIVE_TRAIN_GUARD_PID}" 2>/dev/null || true
+        wait "${ACTIVE_TRAIN_GUARD_PID}" 2>/dev/null || true
+    fi
+    ACTIVE_TRAIN_GUARD_PID=""
+}
+
+trap stop_active_training EXIT
+trap 'stop_active_training; exit 130' INT
+trap 'stop_active_training; exit 143' TERM
+
 verify_aptmoe_contract
 if [[ "${DRY_RUN}" -eq 0 ]]; then
     preflight_machine
@@ -407,19 +438,29 @@ for seq in "${SEQUENCE_LENGTHS[@]}"; do
             --lora_target=all
         )
     fi
+    guarded_command=(
+        "${APTMOE_PYTHON}" "${GPU_LIFECYCLE_GUARD}"
+        --devices "${DEVICES}"
+        --report "${run_dir}/gpu_lifecycle.json"
+        --cwd "${APTMOE_ROOT}"
+        --release-timeout "${GPU_RELEASE_TIMEOUT}"
+        --memory-tolerance-mib "${GPU_RELEASE_TOLERANCE_MIB}"
+        -- "${command[@]}"
+    )
+
     log "seq=${seq}: one pipeline processes ${seq} tokens/step (do not multiply by 8 GPUs)"
     if [[ "${DRY_RUN}" -eq 1 ]]; then
-        print_command bash -c "cd $(printf '%q' "${APTMOE_ROOT}") && $(printf '%q ' "${command[@]}")>$(printf '%q' "${train_log}") 2>&1"
+        print_command bash -c "$(printf '%q ' "${guarded_command[@]}")>$(printf '%q' "${train_log}") 2>&1"
         run_index=$((run_index + 1))
         continue
     fi
 
     set +e
-    (
-        cd "${APTMOE_ROOT}"
-        "${command[@]}"
-    ) >"${train_log}" 2>&1
+    "${guarded_command[@]}" >"${train_log}" 2>&1 &
+    ACTIVE_TRAIN_GUARD_PID=$!
+    wait "${ACTIVE_TRAIN_GUARD_PID}"
     exit_code=$?
+    ACTIVE_TRAIN_GUARD_PID=""
     set -e
     printf '%s\n' "${exit_code}" > "${run_dir}/exit_code.txt"
 
@@ -430,6 +471,10 @@ for seq in "${SEQUENCE_LENGTHS[@]}"; do
         warn "seq=${seq} failed with exit code ${exit_code}; see ${train_log}"
         tail -n 30 "${train_log}" >&2 || true
         overall_status=1
+        if [[ "${exit_code}" -eq 87 || "${exit_code}" -eq 88 ]]; then
+            warn "stopping sweep because the selected GPUs were busy or release was not confirmed; this is not classified as OOM"
+            break
+        fi
         if [[ "${CONTINUE_ON_ERROR}" -eq 0 ]]; then
             break
         fi
