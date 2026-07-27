@@ -22,9 +22,16 @@ def _peak(values: list[float]) -> float | None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--log-dir", type=Path, required=True)
+    parser.add_argument("--monitor-csv", type=Path)
+    parser.add_argument("--phase")
     args = parser.parse_args()
     log_dir = args.log_dir.resolve()
-    monitor = load_monitor_csv(log_dir / "monitor.csv")
+    monitor_csv = (
+        args.monitor_csv.resolve()
+        if args.monitor_csv is not None
+        else log_dir / "monitor.csv"
+    )
+    monitor = load_monitor_csv(monitor_csv, phase=args.phase)
     plots_dir = log_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
@@ -56,6 +63,8 @@ def main() -> None:
 
     report: dict[str, Any] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "monitor_csv": str(monitor_csv),
+        "monitor_phase": args.phase,
         "monitor_samples": len(monitor.get("elapsed", [])),
         "cpu_memory_scope": (
             "training_process_tree_rss_sum"

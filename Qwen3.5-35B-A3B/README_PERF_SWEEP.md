@@ -46,15 +46,25 @@ KTransformers、DeepSpeed 和 APTMoE 的计时器只在三个阶段的 API 边�
 脚本强制设置 `DS_PROBE_MODE=off`、`KT_BACKWARD_TIMING=off` 和
 `KT_SFT_PROFILE=0`。
 
-每个 sequence 训练进程之外会启动一个 2 秒间隔的系统采样器，记录训练进程树 CPU
+每个 profile 的持久训练进程之外会启动一个 2 秒间隔的系统采样器，记录训练进程树 CPU
 RSS、整机 RAM、训练进程 GPU 显存、整卡显存和 GPU 利用率。采样器不在 phase timer
 内部，不写逐 step 文件，也不会因内存越线向训练进程发送信号。
 
-每项训练在独立进程会话中运行。框架正常申请的 CUDA 显存会保留到该项训练进程结束；
-结束后脚本清理本项残留 worker，并等待所选 GPU context 消失、显存回到测试前基线，
-确认后才启动下一个更短的 sequence。所选 GPU 在启动前已有 compute process 时记为
-`GPU_BUSY_NOT_OOM`；释放无法确认时记为 `GPU_RELEASE_UNCONFIRMED_NOT_OOM` 并停止
-sweep。两者都不会当成训练 OOM，也不会清理同机其他任务。
+每个 profile 只启动一次 rank/worker 集合，在同一批持久进程中从最长 sequence
+切换到最短 sequence。最长项完成时激活 CUDA cache hold：释放 Python 模型对象时不
+调用 `torch.cuda.empty_cache()`，同一进程的 caching allocator/最长 buffer 会继续
+占据已经达到的峰值，直至该 profile 的最后一个长度完成，随后进程退出才统一释放。
+KTransformers、DeepSpeed 和 APTMoE 的 NCCL process group，以及 MegaTrain 的 GPU
+worker，也都跨 sequence 保留到 profile 结束。这不是另起一个显存占坑进程，因此
+不会与下一长度的训练 allocator 竞争。
+
+profile 级 `monitor.csv` 按 `seq_<长度>` phase 记录全程曲线；
+`gpu_peak_hold.json` 会逐卡检查后续每个长度的最小任务显存没有跌破最长项峰值
+（默认允许 512 MiB 采样误差）。不满足时标记
+`GPU_PEAK_HOLD_BROKEN_NOT_OOM` 并使该 profile 失败。所选 GPU 启动前已有 compute
+process 时标记 `GPU_BUSY_NOT_OOM`；全部长度结束后的统一释放无法确认时标记
+`GPU_RELEASE_UNCONFIRMED_NOT_OOM`。这些资源隔离错误都不会当成训练 OOM，也不会
+清理同机其他任务。
 
 因此三个阶段是训练 API 的 host wall time，不应解释为纯 GPU kernel 时间。DeepSpeed
 的 optimizer 时间对应 `DeepSpeedEngine.step()` 整段，包含 ZeRO/offload 的更新工作，
@@ -303,13 +313,16 @@ bash run_finetune_perf_test_bf16_aptmoe.sh --profile consumer
 - `summary.md`：按 profile 汇总的对比表；
 - `dataset_validation.json`：Qwen3.5 tokenizer 下的数据长度与 BF16 模型校验；
 - `run_config.json`：源架构、文本加载架构以及 `text_only` 模态契约；
-- 每个 sequence 的 `monitor.csv`、`monitor.log`：全量训练过程的 CPU/GPU 内存
-  和利用率原始采样；
+- 每个 profile 的 `monitor.csv`、`monitor.log`：全量训练过程的 CPU/GPU 内存和
+  利用率原始采样，使用 `seq_<长度>` phase 区分各 sequence；
 - 每个 sequence 的 `plots/01_gpu_memory.png`、`plots/02_cpu_ram.png`：
   GPU 显存与 CPU 内存曲线；
 - 每个 sequence 的 `memory_summary.md/json`：1 TiB 观测结果和人工 OOM 审阅标记；
-- 每个 sequence 的 `gpu_lifecycle.json`：测试前 GPU 占用、训练进程会话、残留
-  worker 清理以及显存回到基线的确认结果；
+- 每个 profile 的 `profile_sweep_manifest.json`、`monitor.csv`、`train.log`：
+  持久进程内的长度顺序、分段内存采样和完整日志；
+- 每个 profile 的 `gpu_peak_hold.json`：最长项峰值是否一直保持到最短项结束；
+- 每个 profile 的 `gpu_lifecycle.json`：测试前 GPU 占用、持久训练进程会话、
+  最终残留 worker 清理以及全部长度结束后显存回到基线的确认结果；
 - 每个 sequence 的 `resource_contract.json`：训练开始前外部已有的 cgroup、swap
   和 NUMA policy；脚本不会据此创建 1 TiB 限制；
 - APTMoE 另写 `proxy_manifest.json` 和 `full_update_verification.json`，记录精确

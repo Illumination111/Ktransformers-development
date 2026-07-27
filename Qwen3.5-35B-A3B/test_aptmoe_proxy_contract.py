@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +15,7 @@ import numpy as np
 import torch
 
 from aggregate_sweep_results import aggregate_run
+from aptmoe_qwen35_proxy_train import _configure_distributed
 from aptmoe_proxy.placement import (
     EXPECTED_EXPERT_BF16_BYTES,
     ProxyPlacementSolver,
@@ -31,6 +34,41 @@ from qwen35_route_capture import RouteTraceCapture, _install_kt_route_hooks
 
 
 MODEL_PATH = Path("/mnt/data3/models/Qwen3.5-35B-A3B")
+
+
+class PersistentDistributedContractTest(unittest.TestCase):
+    def test_existing_process_group_is_not_reinitialized(self) -> None:
+        args = Namespace(num_gpus=4, seed=42)
+        with (
+            patch.dict(os.environ, {"LOCAL_RANK": "2"}),
+            patch(
+                "aptmoe_qwen35_proxy_train.torch.cuda.is_available",
+                return_value=True,
+            ),
+            patch(
+                "aptmoe_qwen35_proxy_train.dist.is_initialized",
+                return_value=True,
+            ),
+            patch(
+                "aptmoe_qwen35_proxy_train.dist.init_process_group"
+            ) as init_process_group,
+            patch(
+                "aptmoe_qwen35_proxy_train.dist.get_rank",
+                return_value=2,
+            ),
+            patch(
+                "aptmoe_qwen35_proxy_train.dist.get_world_size",
+                return_value=4,
+            ),
+            patch("aptmoe_qwen35_proxy_train.torch.cuda.set_device"),
+            patch("aptmoe_qwen35_proxy_train.torch.set_num_threads"),
+        ):
+            rank, world_size, local_rank, initialized_here = (
+                _configure_distributed(args)
+            )
+        self.assertEqual((rank, world_size, local_rank), (2, 4, 2))
+        self.assertFalse(initialized_here)
+        init_process_group.assert_not_called()
 
 
 class ComponentContractTest(unittest.TestCase):

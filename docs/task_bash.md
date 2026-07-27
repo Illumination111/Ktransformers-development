@@ -225,11 +225,18 @@ memory_summary.md/json -> MANUAL_REVIEW_REQUIRED
 训练启动前只记录外部已有的 cgroup/swap 状态并验证 NUMA policy；不创建
 `MemoryMax`、不关闭 swap，也不会在内存峰值超过 1 TiB 时自动按 OOM 归类。
 
-每个 sequence 在独立进程会话中运行，并保留框架正常申请的 CUDA 显存直到该项结束。
-结束后脚本会清理本项残留 worker，确认 GPU context 消失且显存回到测试前基线，再开始
-下一个更短的 sequence。测试前 GPU 已忙会标记 `GPU_BUSY_NOT_OOM`；显存释放未确认会
-标记 `GPU_RELEASE_UNCONFIRMED_NOT_OOM` 并停止 sweep，不会把这两种资源隔离问题误报
-为训练 OOM，也不会结束同机其他任务。
+每个 profile 只启动一次 rank/worker 集合。consumer 会在同一批持久进程中依次运行
+`2048 → 1024 → … → 16`；2048 完成后不调用 `torch.cuda.empty_cache()`，其 CUDA
+caching allocator/最长 buffer 达到的峰值一直保留到 16 完成，之后进程退出才统一
+释放。KTransformers、DeepSpeed 和 APTMoE 的 NCCL process group，以及 MegaTrain
+的 GPU worker，也都只在 profile 结束后清理。server 同理保留 4096 的峰值直到 32
+完成。
+
+profile 级 `gpu_peak_hold.json` 会用 `monitor.csv` 的 phase 分段逐卡验证后续长度的
+最小任务显存没有跌破最长项峰值（默认容差 512 MiB）。验证失败标记
+`GPU_PEAK_HOLD_BROKEN_NOT_OOM`；测试前 GPU 已忙标记 `GPU_BUSY_NOT_OOM`；最后统一
+释放未确认标记 `GPU_RELEASE_UNCONFIRMED_NOT_OOM`。这些资源隔离状态都不会误报为
+训练 OOM，也不会结束同机其他任务。
 
 ## 3. 公共参数
 
@@ -248,7 +255,7 @@ memory_summary.md/json -> MANUAL_REVIEW_REQUIRED
 | `--dataset-name` | `fft_real_100` | `dataset_info.json` 中的数据集名称 |
 | `--log-base` | 当前目录下 `test_log` | 测试结果根目录 |
 | `--kt-distributed-checkpoint-reuse` | `on` | KTransformers 多卡 checkpoint 重算复用第一次 CPU MoE forward；可设为 `off` 做 A/B 对照 |
-| `--continue-on-error` | 关闭 | 某个长度失败后继续后续测试 |
+| `--continue-on-error` | 关闭 | 兼容参数；持久 CUDA profile 一旦执行失败会停止，避免在损坏的 CUDA 状态中继续 |
 | `--keep-model-output` | 关闭 | 保留最终模型；默认跳过完整权重保存 |
 | `--skip-dataset-check` | 关闭 | 跳过 tokenizer 长度校验 |
 | `--dry-run` | 关闭 | 只生成配置并打印命令 |
@@ -401,14 +408,18 @@ test_log/<timestamp>_<backend>_BF16_FULL_SWEEP/
 ├── summary.md
 ├── sweep_results.csv
 ├── dataset_validation.json
-├── server_8gpu_batch8/seq_*/
+├── server_8gpu_batch8/
+│   ├── profile_sweep_manifest.json
 │   ├── resource_contract.json
 │   ├── gpu_lifecycle.json
+│   ├── gpu_peak_hold.json
 │   ├── monitor.csv
-│   ├── memory_summary.{md,json}
-│   ├── plots/{01_gpu_memory.png,02_cpu_ram.png}
-│   └── step_timing/step_timing.{json,csv,md}
-└── consumer_2gpu_batch2/seq_*/
+│   ├── train.log
+│   └── seq_*/
+│       ├── memory_summary.{md,json}
+│       ├── plots/{01_gpu_memory.png,02_cpu_ram.png}
+│       └── step_timing/step_timing.{json,csv,md}
+└── consumer_2gpu_batch2/（同样结构）
 ```
 
 稳定 TPS 公式为：

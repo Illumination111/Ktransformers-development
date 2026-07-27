@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Run one benchmark item and verify that its GPU contexts are released.
+"""Run one persistent benchmark profile and verify final GPU release.
 
-The training process owns its allocations for its entire lifetime.  This guard
-does not call empty_cache() or reserve artificial buffers: CUDA/PyTorch keeps
-the allocations it needs while training, and process exit is the hard lifetime
-boundary.  Any worker left behind after the launcher exits is terminated before
-the next benchmark item starts.
+The profile process owns its allocations while it moves from the longest to the
+shortest sequence. This guard does not reserve artificial buffers: process exit
+is the final lifetime boundary. Any worker left behind after the launcher exits
+is terminated before another profile starts.
 """
 
 from __future__ import annotations
@@ -301,11 +300,11 @@ def main() -> int:
         "schema_version": 1,
         "started_at": utc_now(),
         "devices": args.devices,
-        "allocation_lifetime": "training_process_lifetime",
+        "allocation_lifetime": "persistent_profile_process_lifetime",
         "artificial_gpu_reservation": False,
-        "empty_cache_during_training": False,
+        "empty_cache_after_longest_sequence": False,
         "exclusive_fft_gpu_locks": True,
-        "release_required_before_next_test": True,
+        "release_required_before_next_profile": True,
         "gpu_busy_is_oom": False,
         "release_failure_is_oom": False,
         "command": command,

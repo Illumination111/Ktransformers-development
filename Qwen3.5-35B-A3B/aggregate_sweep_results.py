@@ -54,6 +54,8 @@ RESULT_COLUMNS = [
     "gpu_memory_peak_gib",
     "gpu_lifecycle_status",
     "gpu_release_confirmed",
+    "gpu_peak_hold_status",
+    "gpu_peak_hold_confirmed",
     "memory_limit",
     "numa_policy",
     "timing_mode",
@@ -92,6 +94,9 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
     timing_path = run_dir / "step_timing" / "step_timing.json"
     memory_path = run_dir / "memory_summary.json"
     gpu_lifecycle_path = run_dir / "gpu_lifecycle.json"
+    if not gpu_lifecycle_path.is_file():
+        gpu_lifecycle_path = run_dir.parent / "gpu_lifecycle.json"
+    gpu_peak_hold_path = run_dir.parent / "gpu_peak_hold.json"
     row: dict[str, Any] = {
         **{key: config.get(key) for key in RESULT_COLUMNS},
         "benchmark_class": config.get(
@@ -110,6 +115,8 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
         "gpu_memory_peak_gib": None,
         "gpu_lifecycle_status": None,
         "gpu_release_confirmed": None,
+        "gpu_peak_hold_status": None,
+        "gpu_peak_hold_confirmed": None,
         "timing_mode": None,
         "full_update_verified": None,
         "exit_code": exit_code,
@@ -142,6 +149,12 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
         row["gpu_release_confirmed"] = lifecycle.get(
             "release_confirmed"
         )
+    if gpu_peak_hold_path.is_file():
+        peak_hold = json.loads(
+            gpu_peak_hold_path.read_text(encoding="utf-8")
+        )
+        row["gpu_peak_hold_status"] = peak_hold.get("status")
+        row["gpu_peak_hold_confirmed"] = peak_hold.get("confirmed")
     if exit_code == "DRY_RUN":
         row["status"] = "DRY_RUN"
         return row
@@ -152,6 +165,10 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
     if exit_code == "88":
         row["status"] = "GPU_RELEASE_UNCONFIRMED_NOT_OOM"
         row["oom_classification"] = "NOT_OOM_RELEASE_UNCONFIRMED"
+        return row
+    if exit_code == "97":
+        row["status"] = "GPU_PEAK_HOLD_BROKEN_NOT_OOM"
+        row["oom_classification"] = "NOT_OOM_PEAK_HOLD_BROKEN"
         return row
     if exit_code != "0":
         row["status"] = "FAILED"
@@ -564,8 +581,8 @@ def write_markdown(
         f"- 结果根目录：`{root}`",
         "- 仅记录每个 optimizer step 的 forward、backward、optimizer 和 total host wall time。",
         "- CPU/GPU 内存由 step 计时路径之外的进程采样器记录，不计入 phase timer；consumer 不再设置 1 TiB cgroup hard limit，也不会因越线自动终止。",
-        "- 每个 profile 从最长 sequence 开始递减；每项训练在独立进程会话中持有正常 CUDA 分配，退出后必须确认 worker 和 GPU context 已释放才会开始下一项。",
-        "- GPU_BUSY_NOT_OOM 和 GPU_RELEASE_UNCONFIRMED_NOT_OOM 是资源隔离状态，不按训练 OOM 记录。",
+        "- 每个 profile 只启动一次持久训练进程/worker 集合；从最长 sequence 开始，CUDA allocator 峰值必须保持到最短 sequence 完成，随后才统一释放。",
+        "- GPU_BUSY_NOT_OOM、GPU_PEAK_HOLD_BROKEN_NOT_OOM 和 GPU_RELEASE_UNCONFIRMED_NOT_OOM 是资源隔离状态，不按训练 OOM 记录。",
         "- KTransformers、DeepSpeed、APTMoE 不强制 CUDA 同步；MegaTrain 后端自身包含必要的 CUDA 同步，并在 timing_mode/status 中单独标注。",
         "- CPU 峰值超过 1 TiB 与否仅作为观测结果，是否按 OOM 记录始终保留人工判断。",
         "- TPS 仅使用 `global_step > warmup_steps` 的稳定窗口。",
@@ -615,8 +632,8 @@ def write_markdown(
                 cpu_line,
                 f"- 内存策略：{first.get('memory_limit')}；NUMA：{first.get('numa_policy')}",
                 "",
-                "| Seq | Stable steps | Mean step (s) | TPS | Forward (s) | Backward (s) | Optimizer (s) | CPU peak (GB) | >1 TiB | GPU peak (GiB) | GPU release | OOM review | Status |",
-                "|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|---|---|",
+                "| Seq | Stable steps | Mean step (s) | TPS | Forward (s) | Backward (s) | Optimizer (s) | CPU peak (GB) | >1 TiB | GPU peak (GiB) | Peak held | GPU release | OOM review | Status |",
+                "|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|---|---|---|",
             ]
         )
         for row in sorted(
@@ -625,7 +642,7 @@ def write_markdown(
             reverse=True,
         ):
             lines.append(
-                "| {seq} | {steps} | {step} | {tps} | {forward} | {backward} | {optimizer} | {cpu_peak} | {exceeds} | {gpu_peak} | {gpu_release} | {oom} | {status} |".format(
+                "| {seq} | {steps} | {step} | {tps} | {forward} | {backward} | {optimizer} | {cpu_peak} | {exceeds} | {gpu_peak} | {peak_held} | {gpu_release} | {oom} | {status} |".format(
                     seq=row["sequence_length"],
                     steps=row.get("stable_steps") or "-",
                     step=fmt(row.get("mean_step_sec")),
@@ -642,6 +659,13 @@ def write_markdown(
                         else "-"
                     ),
                     gpu_peak=fmt(row.get("gpu_memory_peak_gib"), 2),
+                    peak_held=(
+                        "yes"
+                        if row.get("gpu_peak_hold_confirmed") is True
+                        else "no"
+                        if row.get("gpu_peak_hold_confirmed") is False
+                        else "-"
+                    ),
                     gpu_release=(
                         "yes"
                         if row.get("gpu_release_confirmed") is True

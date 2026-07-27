@@ -55,7 +55,7 @@ GPU_COLORS = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c", 
 # --------------------------------------------------------------------------- #
 # 解析 monitor.csv
 # --------------------------------------------------------------------------- #
-def load_monitor_csv(csv_path: Path) -> dict:
+def load_monitor_csv(csv_path: Path, phase: str | None = None) -> dict:
     """
     返回 dict：
       {
@@ -91,6 +91,8 @@ def load_monitor_csv(csv_path: Path) -> dict:
     with csv_path.open() as f:
         reader = csv.DictReader(f)
         rows = list(reader)
+    if phase is not None:
+        rows = [row for row in rows if row.get("phase") == phase]
 
     if not rows:
         return data

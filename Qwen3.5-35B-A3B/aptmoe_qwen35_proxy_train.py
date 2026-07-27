@@ -255,10 +255,14 @@ def _audit_only(args: argparse.Namespace) -> None:
     )
 
 
-def _configure_distributed(args: argparse.Namespace) -> tuple[int, int, int]:
+def _configure_distributed(
+    args: argparse.Namespace,
+) -> tuple[int, int, int, bool]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for an APTMoE proxy training run")
-    dist.init_process_group(backend="nccl")
+    initialized_here = not dist.is_initialized()
+    if initialized_here:
+        dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -276,7 +280,7 @@ def _configure_distributed(args: argparse.Namespace) -> tuple[int, int, int]:
     torch.set_num_threads(max(1, thread_count))
     random.seed(args.seed + rank)
     torch.manual_seed(args.seed + rank)
-    return rank, world_size, local_rank
+    return rank, world_size, local_rank, initialized_here
 
 
 def _save_random_weight_shard(
@@ -342,7 +346,9 @@ def run(args: argparse.Namespace) -> None:
     )
     from aptmoe_proxy.storage import resolve_simulation_root
 
-    rank, world_size, local_rank = _configure_distributed(args)
+    rank, world_size, local_rank, initialized_here = _configure_distributed(
+        args
+    )
     simulation_root = resolve_simulation_root(args.simulation_root)
     if rank == 0:
         simulation_root.mkdir(parents=True, exist_ok=True)
@@ -563,7 +569,8 @@ def run(args: argparse.Namespace) -> None:
             f"timing={args.step_timing_output_dir}",
             flush=True,
         )
-    dist.destroy_process_group()
+    if initialized_here:
+        dist.destroy_process_group()
 
 
 def main() -> None:
