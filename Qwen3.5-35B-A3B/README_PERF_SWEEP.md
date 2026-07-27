@@ -329,6 +329,11 @@ bash run_finetune_perf_test_bf16_aptmoe.sh --profile consumer
   参数分类、路由/placement/fast-path 来源、optimizer scope、梯度、权重变化以及
   BF16 moment 的 CPU home device。
 
+`summary.md` 和 `sweep_results.csv` 由启动训练前注册的 shell `EXIT` finalizer
+兜底生成，只运行 `server` 或只运行 `consumer` 都不会影响汇总。只要至少已有一个
+`run_config.json`，正常完成、训练失败或脚本主体提前退出都会汇总当前已有结果；
+汇总器自身失败时，原训练退出码为 0 的任务改用退出码 98。
+
 默认跳过 LLaMA-Factory 在训练结束后的完整模型保存，避免每个 sequence 重复写出
 几十 GB 权重；它不属于 optimizer-step TPS 窗口。APTMoE 同样默认不保存随机权重。
 需要保留时显式传入 `--keep-model-output`；APTMoE 只允许写入 Git-ignored 的

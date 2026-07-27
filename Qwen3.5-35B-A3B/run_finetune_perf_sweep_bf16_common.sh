@@ -39,6 +39,7 @@ GPU_RELEASE_TIMEOUT="${FFT_GPU_RELEASE_TIMEOUT:-60}"
 GPU_RELEASE_TOLERANCE_MIB="${FFT_GPU_RELEASE_TOLERANCE_MIB:-512}"
 GPU_PEAK_HOLD_TOLERANCE_MIB="${FFT_GPU_PEAK_HOLD_TOLERANCE_MIB:-512}"
 PREPARE_ONLY=0
+SUMMARY_FINALIZED=0
 
 if [[ $# -lt 1 ]]; then
     echo "Internal error: backend argument is required" >&2
@@ -857,6 +858,34 @@ cleanup_active_processes() {
     stop_active_monitor
 }
 
+generate_sweep_summary() {
+    [[ -n "${RUN_ROOT}" && -d "${RUN_ROOT}" ]] || return 0
+    [[ "${SUMMARY_FINALIZED}" -eq 0 ]] || return 0
+    compgen -G "${RUN_ROOT}/*/seq_*/run_config.json" >/dev/null || return 0
+    SUMMARY_FINALIZED=1
+    if "${VALIDATOR_PYTHON}" "${AGGREGATOR}" --root "${RUN_ROOT}"; then
+        log "Sweep summary: ${RUN_ROOT}/summary.md"
+        log "Machine-readable results: ${RUN_ROOT}/sweep_results.csv"
+        return 0
+    fi
+    warn "Sweep aggregation failed for ${RUN_ROOT}"
+    return 98
+}
+
+finalize_sweep_on_exit() {
+    local original_status="${1:-0}"
+    local summary_status=0
+    trap - EXIT
+    set +e
+    cleanup_active_processes
+    generate_sweep_summary
+    summary_status=$?
+    if [[ "${original_status}" -eq 0 && "${summary_status}" -ne 0 ]]; then
+        original_status="${summary_status}"
+    fi
+    exit "${original_status}"
+}
+
 start_memory_monitor() {
     local run_dir="$1"
     mkdir -p "${run_dir}/.mplconfig"
@@ -896,9 +925,9 @@ analyze_memory_usage() {
         warn "Memory analysis failed; see ${run_dir}/memory_analysis.log"
 }
 
-trap cleanup_active_processes EXIT
-trap 'cleanup_active_processes; exit 130' INT
-trap 'cleanup_active_processes; exit 143' TERM
+trap 'finalize_sweep_on_exit $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 run_one_sequence() {
     local profile_name="$1" profile_dir="$2" seq="$3" devices="$4"
@@ -1799,7 +1828,7 @@ for selected_profile in "${PROFILES[@]}"; do
     fi
 done
 
-"${VALIDATOR_PYTHON}" "${AGGREGATOR}" --root "${RUN_ROOT}"
-log "Sweep summary: ${RUN_ROOT}/summary.md"
-log "Machine-readable results: ${RUN_ROOT}/sweep_results.csv"
+if ! generate_sweep_summary; then
+    [[ "${overall_status}" -ne 0 ]] || overall_status=98
+fi
 exit "${overall_status}"

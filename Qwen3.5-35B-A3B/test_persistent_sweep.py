@@ -11,7 +11,22 @@ from persistent_sweep import load_manifest
 from verify_gpu_peak_hold import verify
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
 class PersistentSweepTest(unittest.TestCase):
+    def test_summary_finalizer_is_registered_before_training(self) -> None:
+        script = (
+            SCRIPT_DIR / "run_finetune_perf_sweep_bf16_common.sh"
+        ).read_text(encoding="utf-8")
+        trap = "trap 'finalize_sweep_on_exit $?' EXIT"
+        self.assertIn(trap, script)
+        self.assertLess(script.index(trap), script.index("run_one_sequence()"))
+        self.assertIn(
+            '"${VALIDATOR_PYTHON}" "${AGGREGATOR}" --root "${RUN_ROOT}"',
+            script,
+        )
+
     def test_ktransformers_runtime_alias_matches_manifest_backend(self) -> None:
         self.assertEqual(_manifest_backend("kt"), "ktransformers")
         self.assertEqual(_manifest_backend("deepspeed"), "deepspeed")

@@ -422,6 +422,11 @@ test_log/<timestamp>_<backend>_BF16_FULL_SWEEP/
 └── consumer_2gpu_batch2/（同样结构）
 ```
 
+`summary.md` 与 `sweep_results.csv` 不要求同时运行两个 profile。启动训练前会注册
+`EXIT` finalizer；只运行 consumer/server、训练失败或脚本主体提前结束时，只要已经
+生成至少一个 `run_config.json`，都会对现有结果执行汇总。若汇总器自身失败且训练
+原退出码为 0，脚本以 98 退出。
+
 稳定 TPS 公式为：
 
 ```text
