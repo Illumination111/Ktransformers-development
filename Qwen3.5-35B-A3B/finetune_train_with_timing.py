@@ -6,6 +6,7 @@ import argparse
 import os
 import sys
 import traceback
+from pathlib import Path
 
 
 def _configure_kt_rank_threads() -> None:
@@ -116,6 +117,25 @@ def _manifest_backend(runtime_backend: str) -> str:
     return "ktransformers" if normalized == "kt" else normalized
 
 
+def _load_training_config(path: str) -> dict[str, object]:
+    """Load one generated YAML before passing it to LLaMA-Factory.
+
+    ``run_exp(args=...)`` treats a non-None list as already-tokenized CLI
+    arguments.  Passing ``[path]`` therefore does not trigger LLaMA-Factory's
+    YAML loading branch and leaves required fields such as
+    ``model_name_or_path`` unset.
+    """
+    from omegaconf import OmegaConf
+
+    config_path = Path(path).resolve()
+    config = OmegaConf.to_container(OmegaConf.load(config_path))
+    if not isinstance(config, dict):
+        raise TypeError(
+            f"Training config must contain a YAML mapping: {config_path}"
+        )
+    return config
+
+
 def _run_persistent_sweep(manifest_path: str) -> None:
     import torch.distributed as dist
 
@@ -169,7 +189,7 @@ def _run_persistent_sweep(manifest_path: str) -> None:
                 flush=True,
             )
             recorder = install_step_phase_timing()
-            run_exp(args=[str(case["training_config"])])
+            run_exp(args=_load_training_config(str(case["training_config"])))
             recorder.write()
             activate_cuda_cache_hold(manifest)
             write_case_cuda_snapshot(manifest, case, manifest_backend)

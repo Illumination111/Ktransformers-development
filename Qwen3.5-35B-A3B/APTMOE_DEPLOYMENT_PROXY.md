@@ -198,7 +198,13 @@ stage 的 predictor queue。`FwdStageLoad` 按上一 microbatch 的实测 popula
 load stream 上卡，cold experts 保持 CPU home。top-8 dispatch 逐 expert 加权并
 `index_add_`，不是只跑 top-1。动态补载会完整出队当前层的缺失 experts，不把
 cold-start 队列遗留到稳定窗口；历史 popularity 在原始 forward 后固定，checkpoint
-反向重算产生的第二次路由不会被重复计数。
+反向重算产生的第二次路由不会被重复计数。profiled solver 返回空列表表示本层全部
+expert 留在 CPU，正式路径会原样接受，不会再用 `prefetch_portion` 随机替换；
+`prefetch_portion` 仅属于显式允许的 unprofiled smoke 路径。
+
+stage 39 在有 labels 时按 1024 个 token 分块执行 LM head 和 FP32 cross entropy，
+数值与完整 logits 的 sum/mean reduction 相同，但不会同时物化全序列 BF16 logits、
+shift contiguous 副本和 FP32 副本。没有 labels 的推理/审计路径仍返回完整 logits。
 
 ### 3. 真实 full update 与审计
 

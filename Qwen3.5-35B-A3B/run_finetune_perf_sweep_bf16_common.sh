@@ -54,8 +54,10 @@ esac
 
 PROFILE="server"
 FINETUNING_TYPE="full"
-readonly -a SERVER_SEQUENCE_LENGTHS=(4096 2048 1024 512 256 128 64 32)
-readonly -a CONSUMER_SEQUENCE_LENGTHS=(2048 1024 512 256 128 64 32 16)
+# Restore the sweep behavior from before the GPU lifecycle/peak-hold mechanism:
+# every sequence is an independent process and the original order is preserved.
+readonly -a SERVER_SEQUENCE_LENGTHS=(32 64 128 256 512 1024 2048 4096)
+readonly -a CONSUMER_SEQUENCE_LENGTHS=(16 32 64 128 256 512 1024 2048)
 SEQUENCE_LENGTHS_CSV=""
 SEQUENCE_LENGTHS_OVERRIDE_SET=0
 STEPS=15
@@ -106,10 +108,10 @@ Sweep and training (BF16 only):
   --lora-alpha N              LoRA alpha when TYPE=lora (default: 16)
                                 LoRA target is fixed to all
   --seq-lengths LIST           Override the selected profile default(s)
-                                server:   4096,2048,1024,512,256,128,64,32
-                                consumer: 2048,1024,512,256,128,64,32,16
+                                server:   32,64,128,256,512,1024,2048,4096
+                                consumer: 16,32,64,128,256,512,1024,2048
                                 With profile=both, every override must be valid for both
-                                All selected lengths run from largest to smallest
+                                Explicit override order is preserved
   --steps N                    Optimizer steps per sequence (default: 15)
   --warmup-steps N             Initial steps excluded from stable TPS (default: 5)
   --gas N                      Gradient accumulation steps (default: 1)
@@ -165,10 +167,8 @@ Other:
 Timing records only per-step forward, backward, optimizer, and total wall time.
 CPU/GPU resource sampling runs outside the phase timing path. MegaTrain's
 backend-required CUDA synchronization is explicitly labelled in its results.
-Each profile uses one persistent rank/worker set. The longest sequence runs
-first; its CUDA allocator peak stays held through every shorter sequence and is
-released only after the profile ends. Busy GPUs, a broken peak hold, and an
-unconfirmed final release use dedicated statuses and are not called OOM.
+Every sequence runs in an independent process. It exits before the next sequence
+starts; there is no CUDA peak hold, artificial reservation, or lifecycle guard.
 Exact backends load Qwen3_5MoeForCausalLM without a visual tower; the APTMoE proxy reads only target config/tokenizer.
 TPS = GPUs * per-device batch * sequence length * GAS / post-warmup mean step time.
 EOF
@@ -252,11 +252,6 @@ require_positive_int "--gas" "${GRAD_ACCUM_STEPS}"
 require_positive_number "--learning-rate" "${LEARNING_RATE}"
 require_positive_int "--lora-rank" "${LORA_RANK}"
 require_positive_int "--lora-alpha" "${LORA_ALPHA}"
-require_positive_int "FFT_GPU_RELEASE_TIMEOUT" "${GPU_RELEASE_TIMEOUT}"
-require_nonnegative_int \
-    "FFT_GPU_RELEASE_TOLERANCE_MIB" "${GPU_RELEASE_TOLERANCE_MIB}"
-require_nonnegative_int \
-    "FFT_GPU_PEAK_HOLD_TOLERANCE_MIB" "${GPU_PEAK_HOLD_TOLERANCE_MIB}"
 if [[ -n "${CPU_THREADS_OVERRIDE}" ]]; then
     require_positive_int "--cpu-threads/FFT_CPU_THREADS" "${CPU_THREADS_OVERRIDE}"
 fi
@@ -325,9 +320,6 @@ if [[ "${SEQUENCE_LENGTHS_OVERRIDE_SET}" -eq 1 ]]; then
         SEEN_SEQUENCE["${seq}"]=1
         (( seq > MAX_SEQUENCE_LENGTH )) && MAX_SEQUENCE_LENGTH="${seq}"
     done
-    mapfile -t SEQUENCE_LENGTHS_OVERRIDE < <(
-        printf '%s\n' "${SEQUENCE_LENGTHS_OVERRIDE[@]}" | sort -rn
-    )
 else
     case "${PROFILE}" in
         server|both) MAX_SEQUENCE_LENGTH=4096 ;;
@@ -407,8 +399,7 @@ check_files_and_environment() {
     [[ -d "${MODEL_PATH}" ]] || die "model directory not found: ${MODEL_PATH}"
     [[ -d "${DATASET_DIR}" ]] || die "dataset directory not found: ${DATASET_DIR}"
     [[ -f "${VALIDATOR}" && -f "${AGGREGATOR}" && -f "${TIMING_VALIDATOR}" && \
-       -f "${RESOURCE_EXEC}" && -f "${GPU_LIFECYCLE_GUARD}" && \
-       -f "${GPU_PEAK_HOLD_VERIFIER}" ]] || \
+       -f "${RESOURCE_EXEC}" ]] || \
         die "benchmark helper scripts are missing"
     [[ -f "${MONITOR_SCRIPT}" && -f "${MEMORY_ANALYZER}" ]] || \
         die "CPU/GPU memory monitoring helpers are missing"
@@ -642,6 +633,7 @@ make_train_config() {
     # that second call from silently restoring LLaMA-Factory's reentrant default.
     set_yaml_value "${config}" gradient_checkpointing_kwargs "{use_reentrant: false}"
     if [[ "${BACKEND}" == "ktransformers" ]]; then
+        set_yaml_value "${config}" pure_bf16 "true"
         set_yaml_value "${config}" use_kt "true"
         set_yaml_value "${config}" kt_weight_path "${MODEL_PATH}"
     else
@@ -768,13 +760,14 @@ obj = {
     "manual_oom_review_threshold_bytes": 1 << 40,
     "automatic_memory_termination": False,
     "automatic_oom_classification": False,
-    "gpu_allocation_lifetime": "profile_process_lifetime",
+    "gpu_allocation_lifetime": "sequence_process_lifetime",
     "artificial_gpu_reservation": False,
-    "empty_cache_after_longest_sequence": False,
-    "persistent_profile_process": True,
-    "longest_sequence_peak_held_until_profile_end": True,
+    "empty_cache_after_longest_sequence": None,
+    "persistent_profile_process": False,
+    "longest_sequence_peak_held_until_profile_end": False,
     "gpu_release_required_before_next_sequence": False,
-    "gpu_release_required_after_profile": True,
+    "gpu_release_required_after_profile": False,
+    "gpu_lifecycle_guard_enabled": False,
     "gpu_busy_is_oom": False,
     "gpu_peak_hold_failure_is_oom": False,
     "gpu_release_failure_is_oom": False,
@@ -1146,6 +1139,7 @@ run_one_sequence() {
                 HF_DATASETS_OFFLINE=1
                 TRANSFORMERS_OFFLINE=1
                 CUDA_VISIBLE_DEVICES="${devices}"
+                PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
                 FFT_APTMOE_SIMULATION_ROOT="${APTMOE_SIMULATION_ROOT}"
                 CUDA_CACHE_PATH="${APTMOE_SIMULATION_ROOT}/cache/cuda"
                 TORCH_EXTENSIONS_DIR="${APTMOE_SIMULATION_ROOT}/cache/torch_extensions"
@@ -1188,15 +1182,7 @@ run_one_sequence() {
     )
     scoped_command+=(-- "${command[@]}")
     local -a full_command=("${RESOURCE_PREFIX[@]}" "${scoped_command[@]}")
-    local -a guarded_command=(
-        "${VALIDATOR_PYTHON}" "${GPU_LIFECYCLE_GUARD}"
-        --devices "${devices}"
-        --report "${run_dir}/gpu_lifecycle.json"
-        --cwd "${run_cwd}"
-        --release-timeout "${GPU_RELEASE_TIMEOUT}"
-        --memory-tolerance-mib "${GPU_RELEASE_TOLERANCE_MIB}"
-        -- "${full_command[@]}"
-    )
+    local -a execution_command=("${full_command[@]}")
     if [[ "${BACKEND}" == "ktransformers" ]]; then
         log "${BACKEND}/${profile_name}: seq=${seq}, GPUs=${NUM_GPUS}, global_batch=${GLOBAL_BATCH_SIZE}, tokens/step=${tokens_per_step}, ${FINETUNING_TYPE}, text-only BF16, KT owner(rank0) threads=${kt_owner_threads}, non-owner rank threads=${cpu_threads}"
     elif [[ "${BACKEND}" == "aptmoe" ]]; then
@@ -1206,7 +1192,7 @@ run_one_sequence() {
     fi
 
     if [[ "${DRY_RUN}" -eq 1 ]]; then
-        print_command "${guarded_command[@]}"
+        print_command "${execution_command[@]}"
         printf 'DRY_RUN\n' > "${run_dir}/exit_code.txt"
         return 0
     fi
@@ -1219,7 +1205,10 @@ run_one_sequence() {
     tee "${train_log}" < "${ACTIVE_LOG_FIFO}" &
     ACTIVE_TEE_PID=$!
     set +e
-    "${guarded_command[@]}" > "${ACTIVE_LOG_FIFO}" 2>&1 &
+    (
+        cd "${run_cwd}"
+        exec "${execution_command[@]}"
+    ) > "${ACTIVE_LOG_FIFO}" 2>&1 &
     ACTIVE_TRAIN_GUARD_PID=$!
     wait "${ACTIVE_TRAIN_GUARD_PID}"
     exit_code=$?
@@ -1606,6 +1595,7 @@ run_persistent_profile() {
                 HF_DATASETS_OFFLINE=1
                 TRANSFORMERS_OFFLINE=1
                 CUDA_VISIBLE_DEVICES="${devices}"
+                PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
                 FFT_APTMOE_SIMULATION_ROOT="${APTMOE_SIMULATION_ROOT}"
                 CUDA_CACHE_PATH="${APTMOE_SIMULATION_ROOT}/cache/cuda"
                 TORCH_EXTENSIONS_DIR="${APTMOE_SIMULATION_ROOT}/cache/torch_extensions"
@@ -1674,6 +1664,7 @@ run_persistent_profile() {
         warn "Training succeeded but the profile memory monitor exited early"
         exit_code=89
     fi
+    local peak_hold_failed=0
     if [[ "${exit_code}" -eq 0 ]]; then
         if ! "${VALIDATOR_PYTHON}" "${GPU_PEAK_HOLD_VERIFIER}" \
             --manifest "${manifest}" \
@@ -1681,17 +1672,17 @@ run_persistent_profile() {
             --output "${profile_dir}/gpu_peak_hold.json" \
             --tolerance-mib "${GPU_PEAK_HOLD_TOLERANCE_MIB}"; then
             warn "Longest-sequence GPU peak was not held across the profile"
-            exit_code=97
+            peak_hold_failed=1
         fi
     fi
-    if [[ "${exit_code}" =~ ^(87|88|89|97)$ ]]; then
+    if [[ "${exit_code}" =~ ^(87|88|89)$ ]]; then
         for seq in "${profile_sequence_lengths[@]}"; do
             printf '%s\n' "${exit_code}" > \
                 "${profile_dir}/seq_${seq}/exit_code.txt"
         done
     fi
 
-    local profile_post_status=0
+    local profile_post_status="${peak_hold_failed}"
     for seq in "${profile_sequence_lengths[@]}"; do
         local run_dir="${profile_dir}/seq_${seq}"
         analyze_memory_usage \
@@ -1771,9 +1762,20 @@ run_profile() {
     fi
 
     log "Profile ${profile_name} sequences: ${profile_sequence_lengths[*]}"
-    run_persistent_profile \
-        "${profile_name}" "${profile_dir}" "${devices}" \
-        "${profile_sequence_lengths[@]}"
+    log "Independent sequence processes; GPU lifecycle/peak-hold protection disabled"
+    local profile_status=0 seq
+    for seq in "${profile_sequence_lengths[@]}"; do
+        if run_one_sequence \
+            "${profile_name}" "${profile_dir}" "${seq}" "${devices}"; then
+            continue
+        fi
+        profile_status=1
+        if [[ "${CONTINUE_ON_ERROR}" -eq 0 ]]; then
+            warn "Stopping profile after first failure; use --continue-on-error to keep sweeping"
+            break
+        fi
+    done
+    return "${profile_status}"
 }
 
 check_files_and_environment

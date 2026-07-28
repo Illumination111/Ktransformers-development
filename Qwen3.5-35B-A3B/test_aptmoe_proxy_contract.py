@@ -16,6 +16,10 @@ import torch
 
 from aggregate_sweep_results import aggregate_run
 from aptmoe_qwen35_proxy_train import _configure_distributed
+from aptmoe_proxy.model import (
+    _chunked_causal_lm_loss,
+    _solve_stage_hot_experts,
+)
 from aptmoe_proxy.placement import (
     EXPECTED_EXPERT_BF16_BYTES,
     ProxyPlacementSolver,
@@ -357,6 +361,36 @@ class RouteContractTest(unittest.TestCase):
 
 
 class PlacementAndStorageTest(unittest.TestCase):
+    def test_profiled_empty_placement_is_not_randomly_replaced(self) -> None:
+        class EmptyPlacement:
+            def solve(self, *_args, **_kwargs):
+                return []
+
+        self.assertEqual(
+            _solve_stage_hot_experts(
+                EmptyPlacement(),
+                [0, 0, 0, 0],
+                layer_type="linear_attention",
+                is_first_stage=False,
+                is_last_stage=False,
+            ),
+            [],
+        )
+
+    def test_missing_placement_decision_fails_instead_of_prefetching(self) -> None:
+        class MissingPlacement:
+            def solve(self, *_args, **_kwargs):
+                return None
+
+        with self.assertRaisesRegex(RuntimeError, "no decision"):
+            _solve_stage_hot_experts(
+                MissingPlacement(),
+                [0, 0, 0, 0],
+                layer_type="linear_attention",
+                is_first_stage=False,
+                is_last_stage=False,
+            )
+
     def test_profiled_solver_uses_aptmoe_compute_load_rule(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             lookup = Path(directory) / "lookup.json"
@@ -421,6 +455,64 @@ class PlacementAndStorageTest(unittest.TestCase):
                     allow_unprofiled=False,
                     required_max_tokens=3,
                 )
+
+    def test_chunked_causal_lm_loss_matches_full_logits(self) -> None:
+        torch.manual_seed(7)
+        full_head = torch.nn.Linear(8, 13, bias=False)
+        chunked_head = torch.nn.Linear(8, 13, bias=False)
+        chunked_head.load_state_dict(full_head.state_dict())
+        full_hidden = torch.randn(2, 5, 8, requires_grad=True)
+        chunked_hidden = full_hidden.detach().clone().requires_grad_(True)
+        labels = torch.tensor(
+            [
+                [1, 2, 3, -100, 5],
+                [6, 7, 8, 9, 10],
+            ]
+        )
+
+        full_logits = full_head(full_hidden)
+        expected = torch.nn.functional.cross_entropy(
+            full_logits[..., :-1, :].contiguous().view(-1, 13),
+            labels[..., 1:].contiguous().view(-1),
+            ignore_index=-100,
+        )
+        actual = _chunked_causal_lm_loss(
+            chunked_head,
+            chunked_hidden,
+            labels,
+            num_items_in_batch=None,
+            chunk_size=3,
+        )
+        torch.testing.assert_close(actual, expected)
+
+        expected.backward()
+        actual.backward()
+        torch.testing.assert_close(chunked_hidden.grad, full_hidden.grad)
+        torch.testing.assert_close(
+            chunked_head.weight.grad,
+            full_head.weight.grad,
+        )
+
+    def test_chunked_causal_lm_loss_preserves_num_items_scaling(self) -> None:
+        torch.manual_seed(8)
+        head = torch.nn.Linear(4, 7, bias=False)
+        hidden = torch.randn(1, 4, 4)
+        labels = torch.tensor([[1, 2, -100, 4]])
+        logits = head(hidden)
+        expected = torch.nn.functional.cross_entropy(
+            logits[..., :-1, :].contiguous().view(-1, 7),
+            labels[..., 1:].contiguous().view(-1),
+            ignore_index=-100,
+            reduction="sum",
+        ) / 9
+        actual = _chunked_causal_lm_loss(
+            head,
+            hidden,
+            labels,
+            num_items_in_batch=9,
+            chunk_size=2,
+        )
+        torch.testing.assert_close(actual, expected)
 
     def test_large_artifact_path_cannot_escape_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
