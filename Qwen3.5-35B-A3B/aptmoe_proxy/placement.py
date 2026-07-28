@@ -211,6 +211,7 @@ class ProxyPlacementSolver:
             "lookup_path": str(self.lookup_path) if self.lookup_path else None,
             "lookup_sha256": self.lookup_sha256,
             "prefetch_portion": self.prefetch_portion,
+            "profiled_empty_gpu_set_policy": "respect_cpu_placement",
             "num_experts": self.num_experts,
             "num_chunks": self.num_chunks,
             "deployment_profile": self.expected_profile,

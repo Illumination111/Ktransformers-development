@@ -16,7 +16,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from model.transformer_lm import OffloadInputBegin, OffloadInputEnd
-from Runtime.OffloadRuntime.offload import ModelShard, random_stageload_list
+from Runtime.OffloadRuntime.offload import ModelShard
 
 from qwen35_aptmoe_proxy_components import (
     Qwen35RoutedExpert,
@@ -26,6 +26,72 @@ from qwen35_aptmoe_proxy_components import (
 
 from .placement import ProxyPlacementSolver
 from .routes import RouteController
+
+
+LOSS_TOKEN_CHUNK_SIZE = 1024
+
+
+def _solve_stage_hot_experts(
+    solver: ProxyPlacementSolver,
+    assigned_tokens_list: list[int],
+    *,
+    layer_type: str,
+    is_first_stage: bool,
+    is_last_stage: bool,
+) -> list[int]:
+    """Return the profiled placement without changing an intentional empty set."""
+    hot_expert_ids = solver.solve(
+        assigned_tokens_list,
+        layer_type=layer_type,
+        is_first_stage=is_first_stage,
+        is_last_stage=is_last_stage,
+    )
+    if hot_expert_ids is None:
+        raise RuntimeError("placement solver returned no decision")
+    return list(hot_expert_ids)
+
+
+def _chunked_causal_lm_loss(
+    lm_head: nn.Module,
+    hidden_states: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    num_items_in_batch: int | None,
+    chunk_size: int = LOSS_TOKEN_CHUNK_SIZE,
+) -> torch.Tensor:
+    """Compute the exact causal-LM CE without a sequence-wide logits tensor."""
+    if chunk_size <= 0:
+        raise ValueError(f"loss chunk size must be positive, got {chunk_size}")
+    if hidden_states.shape[:-1] != labels.shape:
+        raise ValueError(
+            "hidden-state and label batch/sequence dimensions must match: "
+            f"{hidden_states.shape[:-1]} != {labels.shape}"
+        )
+
+    flat_hidden = hidden_states[..., :-1, :].reshape(
+        -1,
+        hidden_states.shape[-1],
+    )
+    flat_labels = labels[..., 1:].reshape(-1)
+    loss_sum = torch.zeros(
+        (),
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    for start in range(0, flat_labels.numel(), chunk_size):
+        stop = min(start + chunk_size, flat_labels.numel())
+        chunk_logits = lm_head(flat_hidden[start:stop])
+        loss_sum = loss_sum + F.cross_entropy(
+            chunk_logits.float(),
+            flat_labels[start:stop],
+            ignore_index=-100,
+            reduction="sum",
+        )
+
+    if num_items_in_batch is not None:
+        return loss_sum / max(1, num_items_in_batch)
+    valid_items = torch.count_nonzero(flat_labels != -100)
+    return loss_sum / valid_items
 
 
 class APTQwen35RoutedExpert(Qwen35RoutedExpert):
@@ -156,7 +222,8 @@ class APTQwen35MoELayer(nn.Module):
         self.historical_assigned_tokens_list = [0] * config.num_experts
 
     def _queue_hot_experts(self, counts: list[int]) -> None:
-        gpu_expert_ids = self.R_solver.solve(
+        gpu_expert_ids = _solve_stage_hot_experts(
+            self.R_solver,
             counts,
             layer_type=self.layer_type,
             is_first_stage=self.is_first_stage,
@@ -390,21 +457,14 @@ class APTQwen35Stage(nn.Sequential):
 
         assert self.final_norm is not None
         hidden_states = self.final_norm(hidden_states)
-        logits = self.lm_head(hidden_states)
         if labels is None:
-            return logits
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        reduction = "sum" if num_items_in_batch is not None else "mean"
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)).float(),
-            shift_labels.reshape(-1),
-            ignore_index=-100,
-            reduction=reduction,
+            return self.lm_head(hidden_states)
+        return _chunked_causal_lm_loss(
+            self.lm_head,
+            hidden_states,
+            labels,
+            num_items_in_batch=num_items_in_batch,
         )
-        if num_items_in_batch is not None:
-            loss = loss / max(1, num_items_in_batch)
-        return loss
 
 
 class Qwen35ModelShard(ModelShard):
@@ -444,17 +504,13 @@ class Qwen35ModelShard(ModelShard):
             counts = list(
                 layer.moe_layer.historical_assigned_tokens_list
             )
-            hot_expert_ids = self.R_solver.solve(
+            hot_expert_ids = _solve_stage_hot_experts(
+                self.R_solver,
                 counts,
                 layer_type=layer.self_attn.layer_type,
                 is_first_stage=self.model_shard.is_first_stage,
                 is_last_stage=self.model_shard.is_last_stage,
             )
-            if not hot_expert_ids:
-                hot_expert_ids = random_stageload_list(
-                    len(layer.moe_layer.experts),
-                    portion=self.R_solver.prefetch_portion,
-                )
             hot_by_layer[layer.layer_id] = hot_expert_ids
             for expert_id in hot_expert_ids:
                 load_model.append(layer.moe_layer.experts[expert_id])
@@ -522,17 +578,13 @@ class Qwen35ModelShard(ModelShard):
                     layer.moe_layer.shared_experts,
                 )
             )
-            hot_expert_ids = self.R_solver.solve(
+            hot_expert_ids = _solve_stage_hot_experts(
+                self.R_solver,
                 layer.moe_layer.assigned_tokens_list,
                 layer_type=layer.self_attn.layer_type,
                 is_first_stage=self.model_shard.is_first_stage,
                 is_last_stage=self.model_shard.is_last_stage,
             )
-            if not hot_expert_ids:
-                hot_expert_ids = random_stageload_list(
-                    len(layer.moe_layer.experts),
-                    portion=self.R_solver.prefetch_portion,
-                )
             for expert_id in hot_expert_ids:
                 load_model.append(layer.moe_layer.experts[expert_id])
         self.CommScheduler.load_execute(

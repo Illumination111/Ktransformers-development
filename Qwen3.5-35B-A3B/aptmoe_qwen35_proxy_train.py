@@ -337,6 +337,7 @@ def run(args: argparse.Namespace) -> None:
     from Runtime.OffloadRuntime import offload as offload_runtime
 
     from aptmoe_proxy import ProxyPlacementSolver, RouteController
+    from aptmoe_proxy.model import LOSS_TOKEN_CHUNK_SIZE
     from aptmoe_proxy.runtime import (
         ProxyPipelineRuntime,
         build_proxy_pipeline,
@@ -502,6 +503,11 @@ def run(args: argparse.Namespace) -> None:
             "parameter_categories": actual_categories,
             "route": routes.manifest(),
             "placement": placement.manifest(),
+            "loss": {
+                "implementation": "token_chunked_cross_entropy",
+                "token_chunk_size": LOSS_TOKEN_CHUNK_SIZE,
+                "materializes_sequence_wide_logits": False,
+            },
             "runtime_versions": _runtime_versions(),
             "aptmoe_root": str(aptmoe_root),
             "aptmoe_source": _git_identity(aptmoe_root),

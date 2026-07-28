@@ -87,6 +87,9 @@ num_stages: 40
 aptmoe_global_batch_size: null
 layers_per_stage: 1
 inter_stage_only: true
+# Used only by explicitly allowed unprofiled smoke runs.  A formal profiled
+# solver result of [] means all experts stay on CPU and is never replaced by
+# random prefetching.
 prefetch_portion: 0.6
 routing_source: replayed_exact_qwen35_topk_indices
 route_trace: null  # required for formal runs; capture with an exact backend
