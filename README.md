@@ -151,29 +151,32 @@ bash run_fft_test_4gpu_int8.sh  # 参数同上；需 AMXINT8 权重路径可用
 
 | 脚本 | 后端 | GPU | 说明 |
 |------|------|-----|------|
-| `run_full_ft_test_1gpu_bf16.sh` | AMXBF16 | 固定 4（FSDP） | 真实 Full-FT；脚本名含 1gpu，实际为 4 卡 FSDP |
-| `run_full_ft_test_4gpu_int8.sh` | AMXINT8 | 固定 4（FSDP） | 在线量化，无需单独 INT8 缓存 |
+| `run_finetune_perf_test_bf16_ktransformers.sh` | KTransformers AMXBF16 | server 8 / consumer 2 | 与 Qwen3.5 相同的 BF16 Full-FT sequence sweep |
+| `run_full_ft_test_1gpu_bf16.sh` | KTransformers AMXBF16 | server 8 / consumer 2 | 兼容入口，转发到上述 canonical 脚本 |
+| `run_full_ft_test_4gpu_int8.sh` | KTransformers AMXINT8 | 固定 4（FSDP） | 旧版单长度流程，不属于当前 BF16 sweep |
 
 ```bash
 cd GLM-4.5-Air
 
-bash run_full_ft_test_1gpu_bf16.sh \
-  [--skip-phase4] [--only-phase4] \
-  [--gpu 0] [--gpu-ids 0,1,2,3] \
-  [--phase4-steps 15] [--dry-run]
-
-bash run_full_ft_test_4gpu_int8.sh   # 参数同上
+bash run_finetune_perf_test_bf16_ktransformers.sh --profile server
+bash run_finetune_perf_test_bf16_ktransformers.sh --profile consumer
+bash run_finetune_perf_test_bf16_ktransformers.sh --profile both
 ```
 
 | 参数 | 含义 |
 |------|------|
-| `--gpu N` | 起始 GPU id，再按 4 卡连续展开 |
-| `--gpu-ids a,b,c,d` | 显式指定 4 个 CUDA 设备 |
-| `--gpus N` | 仅支持 `4` |
-| `--phase4-steps N` | Phase4 步数（默认 15） |
-| `--skip-phase4` / `--only-phase4` / `--dry-run` | 阶段控制 / 干跑 |
+| `--profile server\|consumer\|both` | server=8 卡/global batch 8；consumer=2 卡/global batch 2 |
+| `--seq-lengths LIST` | 覆盖默认序列并保留给定顺序 |
+| `--steps N` / `--warmup-steps N` | 每个长度的 optimizer steps / TPS 排除步数 |
+| `--devices LIST` | 物理 GPU 列表；profile 取前 N 张 |
+| `--dry-run` | 只生成配置和命令 |
 
-主要产物：`monitor.csv`、内存拆解文本、`phase4_analysis.txt`、plots。
+默认 sequence 与 Qwen3.5 KTransformers 一致：server 为
+`32,64,128,256,512,1024,2048,4096`，consumer 为
+`16,32,64,128,256,512,1024,2048`。每个长度使用独立进程。
+
+主要产物：每个 sequence 的 `step_timing.json`、`monitor.csv`、内存曲线，
+以及 sweep 根目录的 `summary.md` 和 `sweep_results.csv`。
 
 ---
 
