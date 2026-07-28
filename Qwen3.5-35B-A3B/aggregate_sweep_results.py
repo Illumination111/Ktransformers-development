@@ -121,6 +121,14 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
         "full_update_verified": None,
         "exit_code": exit_code,
         "run_dir": str(run_dir),
+        "persistent_profile_process": config.get(
+            "persistent_profile_process",
+            False,
+        ),
+        "gpu_lifecycle_guard_enabled": config.get(
+            "gpu_lifecycle_guard_enabled",
+            False,
+        ),
     }
     if memory_path.is_file():
         memory = json.loads(memory_path.read_text(encoding="utf-8"))
@@ -155,6 +163,12 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
         )
         row["gpu_peak_hold_status"] = peak_hold.get("status")
         row["gpu_peak_hold_confirmed"] = peak_hold.get("confirmed")
+    peak_hold_broken = (
+        exit_code == "97"
+        or row["gpu_peak_hold_confirmed"] is False
+    )
+    if peak_hold_broken:
+        row["oom_classification"] = "NOT_OOM_PEAK_HOLD_BROKEN"
     if exit_code == "DRY_RUN":
         row["status"] = "DRY_RUN"
         return row
@@ -166,11 +180,7 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
         row["status"] = "GPU_RELEASE_UNCONFIRMED_NOT_OOM"
         row["oom_classification"] = "NOT_OOM_RELEASE_UNCONFIRMED"
         return row
-    if exit_code == "97":
-        row["status"] = "GPU_PEAK_HOLD_BROKEN_NOT_OOM"
-        row["oom_classification"] = "NOT_OOM_PEAK_HOLD_BROKEN"
-        return row
-    if exit_code != "0":
+    if exit_code not in {"0", "97"}:
         row["status"] = "FAILED"
         return row
     if not timing_path.is_file():
@@ -322,6 +332,8 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
         row["status"] = "TIMING_FIELDS_MISSING"
     elif int(row["stable_steps"] or 0) != expected_stable:
         row["status"] = "INCOMPLETE_STABLE_WINDOW"
+    elif peak_hold_broken:
+        row["status"] = "GPU_PEAK_HOLD_BROKEN_NOT_OOM"
     else:
         row["status"] = (
             "SMOKE_ONLY"
@@ -575,14 +587,30 @@ def write_markdown(
     rows: list[dict[str, Any]],
     plot_paths: list[Path] | None = None,
 ) -> None:
+    persistence_modes = {
+        bool(row.get("persistent_profile_process"))
+        for row in rows
+    }
+    if persistence_modes == {True}:
+        lifecycle_lines = [
+            "- 每个 profile 只启动一次持久训练进程/worker 集合；从最长 sequence 开始，CUDA allocator 峰值必须保持到最短 sequence 完成，随后才统一释放。",
+            "- GPU_BUSY_NOT_OOM、GPU_PEAK_HOLD_BROKEN_NOT_OOM 和 GPU_RELEASE_UNCONFIRMED_NOT_OOM 是资源隔离状态，不按训练 OOM 记录。",
+        ]
+    elif persistence_modes == {False}:
+        lifecycle_lines = [
+            "- 每个 sequence 使用独立训练进程；该进程退出后才启动下一个 sequence，不保留 CUDA allocator 峰值，也不启用 GPU lifecycle guard。",
+        ]
+    else:
+        lifecycle_lines = [
+            "- 本结果包含持久 profile 和独立 sequence 两种进程生命周期；具体模式以各 run_config.json 为准。",
+        ]
     lines = [
         "# Qwen3.5-35B-A3B BF16 TPS Sweep",
         "",
         f"- 结果根目录：`{root}`",
         "- 仅记录每个 optimizer step 的 forward、backward、optimizer 和 total host wall time。",
         "- CPU/GPU 内存由 step 计时路径之外的进程采样器记录，不计入 phase timer；consumer 不再设置 1 TiB cgroup hard limit，也不会因越线自动终止。",
-        "- 每个 profile 只启动一次持久训练进程/worker 集合；从最长 sequence 开始，CUDA allocator 峰值必须保持到最短 sequence 完成，随后才统一释放。",
-        "- GPU_BUSY_NOT_OOM、GPU_PEAK_HOLD_BROKEN_NOT_OOM 和 GPU_RELEASE_UNCONFIRMED_NOT_OOM 是资源隔离状态，不按训练 OOM 记录。",
+        *lifecycle_lines,
         "- KTransformers、DeepSpeed、APTMoE 不强制 CUDA 同步；MegaTrain 后端自身包含必要的 CUDA 同步，并在 timing_mode/status 中单独标注。",
         "- CPU 峰值超过 1 TiB 与否仅作为观测结果，是否按 OOM 记录始终保留人工判断。",
         "- TPS 仅使用 `global_step > warmup_steps` 的稳定窗口。",
