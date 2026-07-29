@@ -104,12 +104,14 @@ def run_case(
         response_field=config.response_field,
         system_prompt=config.system_prompt or None,
         train_on_prompt=config.train_on_prompt,
+        response_preserving_truncation=True,
     )
     dataloader = DataLoader(
         dataset,
         batch_size=config.batch_size,
         collate_fn=collate_fn,
         num_workers=get_num_workers(yaml_config),
+        drop_last=True,
     )
     data_iter = iter(dataloader)
     process = psutil.Process()

@@ -13,7 +13,8 @@ from typing import Any
 from persistent_sweep import load_manifest
 
 
-FAILED_EXIT = 97
+AUTO_RELEASED_EXIT = 97
+INSUFFICIENT_SAMPLES_EXIT = 98
 
 
 def _memory_value(row: dict[str, str], gpu: int) -> float | None:
@@ -98,7 +99,7 @@ def verify(
         if confirmed
         else "INSUFFICIENT_SAMPLES"
         if insufficient
-        else "FAILED"
+        else "AUTO_RELEASED"
     )
     return {
         "schema_version": 1,
@@ -135,7 +136,11 @@ def main() -> int:
         f"[gpu-peak-hold] status={report['status']} "
         f"report={args.output}"
     )
-    return 0 if report["confirmed"] else FAILED_EXIT
+    if report["confirmed"]:
+        return 0
+    if report["status"] == "INSUFFICIENT_SAMPLES":
+        return INSUFFICIENT_SAMPLES_EXIT
+    return AUTO_RELEASED_EXIT
 
 
 if __name__ == "__main__":

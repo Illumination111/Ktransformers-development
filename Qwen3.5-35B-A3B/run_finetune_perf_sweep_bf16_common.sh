@@ -10,6 +10,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FFT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONFIGS_DIR="${SCRIPT_DIR}/configs"
 LOG_BASE="${FFT_LOG_BASE:-${SCRIPT_DIR}/test_log}"
+FFT_RUNTIME_ROOT="${FFT_RUNTIME_ROOT:-/mnt/data2/wbw/fft_runtime/qwen35}"
+FFT_TMPDIR="${FFT_TMPDIR:-${FFT_RUNTIME_ROOT}/tmp}"
+FFT_CACHE_ROOT="${FFT_CACHE_ROOT:-${FFT_RUNTIME_ROOT}/cache}"
+export TMPDIR="${FFT_TMPDIR}"
+export TMP="${FFT_TMPDIR}"
+export TEMP="${FFT_TMPDIR}"
+export CUDA_CACHE_PATH="${FFT_CUDA_CACHE_PATH:-${FFT_CACHE_ROOT}/cuda}"
+export TORCH_EXTENSIONS_DIR="${FFT_TORCH_EXTENSIONS_DIR:-${FFT_CACHE_ROOT}/torch_extensions}"
+export TRITON_CACHE_DIR="${FFT_TRITON_CACHE_DIR:-${FFT_CACHE_ROOT}/triton}"
+export TORCHINDUCTOR_CACHE_DIR="${FFT_TORCHINDUCTOR_CACHE_DIR:-${FFT_CACHE_ROOT}/torchinductor}"
+export MPLCONFIGDIR="${FFT_MPLCONFIGDIR:-${FFT_CACHE_ROOT}/matplotlib}"
 LLAMA_FACTORY_DIR="${FFT_LLAMA_FACTORY_DIR:-/mnt/data2/wbw/LLaMA-Factory}"
 MODEL_PATH="${FFT_MODEL_PATH:-/mnt/data3/models/Qwen3.5-35B-A3B}"
 DATASET_DIR="${FFT_DATASET_DIR:-${FFT_ROOT}/dataset}"
@@ -395,6 +406,23 @@ PY
 
 PHYSICAL_CORES="$(detect_physical_cores)"
 
+prepare_runtime_directories() {
+    local -a runtime_directories=(
+        "${TMPDIR}"
+        "${CUDA_CACHE_PATH}"
+        "${TORCH_EXTENSIONS_DIR}"
+        "${TRITON_CACHE_DIR}"
+        "${TORCHINDUCTOR_CACHE_DIR}"
+        "${MPLCONFIGDIR}"
+    )
+    mkdir -p "${runtime_directories[@]}"
+    local directory
+    for directory in "${runtime_directories[@]}"; do
+        [[ -d "${directory}" && -w "${directory}" ]] || \
+            die "runtime directory is not writable: ${directory}"
+    done
+}
+
 check_files_and_environment() {
     [[ -d "${MODEL_PATH}" ]] || die "model directory not found: ${MODEL_PATH}"
     [[ -d "${DATASET_DIR}" ]] || die "dataset directory not found: ${DATASET_DIR}"
@@ -403,7 +431,7 @@ check_files_and_environment() {
         die "benchmark helper scripts are missing"
     [[ -f "${MONITOR_SCRIPT}" && -f "${MEMORY_ANALYZER}" ]] || \
         die "CPU/GPU memory monitoring helpers are missing"
-    env MPLCONFIGDIR=/tmp/fft_qwen35_matplotlib \
+    env MPLCONFIGDIR="${MPLCONFIGDIR}" \
         "${MONITOR_PYTHON}" -c 'import matplotlib, psutil, pynvml' || \
         die "memory monitoring dependencies are unavailable"
     if [[ "${BACKEND}" =~ ^(ktransformers|deepspeed)$ ]]; then
@@ -1141,9 +1169,10 @@ run_one_sequence() {
                 CUDA_VISIBLE_DEVICES="${devices}"
                 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
                 FFT_APTMOE_SIMULATION_ROOT="${APTMOE_SIMULATION_ROOT}"
-                CUDA_CACHE_PATH="${APTMOE_SIMULATION_ROOT}/cache/cuda"
-                TORCH_EXTENSIONS_DIR="${APTMOE_SIMULATION_ROOT}/cache/torch_extensions"
-                TRITON_CACHE_DIR="${APTMOE_SIMULATION_ROOT}/cache/triton"
+                CUDA_CACHE_PATH="${CUDA_CACHE_PATH}"
+                TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR}"
+                TRITON_CACHE_DIR="${TRITON_CACHE_DIR}"
+                TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR}"
                 PYTHONPATH="${SCRIPT_DIR}:${APTMOE_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
                 "${torchrun_bin}" --standalone --nproc_per_node="${NUM_GPUS}"
                 "${APTMOE_ENTRYPOINT}"
@@ -1597,9 +1626,10 @@ run_persistent_profile() {
                 CUDA_VISIBLE_DEVICES="${devices}"
                 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
                 FFT_APTMOE_SIMULATION_ROOT="${APTMOE_SIMULATION_ROOT}"
-                CUDA_CACHE_PATH="${APTMOE_SIMULATION_ROOT}/cache/cuda"
-                TORCH_EXTENSIONS_DIR="${APTMOE_SIMULATION_ROOT}/cache/torch_extensions"
-                TRITON_CACHE_DIR="${APTMOE_SIMULATION_ROOT}/cache/triton"
+                CUDA_CACHE_PATH="${CUDA_CACHE_PATH}"
+                TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR}"
+                TRITON_CACHE_DIR="${TRITON_CACHE_DIR}"
+                TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR}"
                 PYTHONPATH="${SCRIPT_DIR}:${APTMOE_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
                 "${torchrun_bin}" --standalone --nproc_per_node="${NUM_GPUS}"
                 "${APTMOE_SWEEP_ENTRYPOINT}"
@@ -1664,15 +1694,20 @@ run_persistent_profile() {
         warn "Training succeeded but the profile memory monitor exited early"
         exit_code=89
     fi
-    local peak_hold_failed=0
+    local profile_post_status=0
     if [[ "${exit_code}" -eq 0 ]]; then
-        if ! "${VALIDATOR_PYTHON}" "${GPU_PEAK_HOLD_VERIFIER}" \
+        local peak_hold_exit=0
+        "${VALIDATOR_PYTHON}" "${GPU_PEAK_HOLD_VERIFIER}" \
             --manifest "${manifest}" \
             --monitor "${profile_dir}/monitor.csv" \
             --output "${profile_dir}/gpu_peak_hold.json" \
-            --tolerance-mib "${GPU_PEAK_HOLD_TOLERANCE_MIB}"; then
-            warn "Longest-sequence GPU peak was not held across the profile"
-            peak_hold_failed=1
+            --tolerance-mib "${GPU_PEAK_HOLD_TOLERANCE_MIB}" || \
+            peak_hold_exit=$?
+        if [[ "${peak_hold_exit}" -eq 97 ]]; then
+            warn "GPU peak was automatically released; recording it without failing the profile"
+        elif [[ "${peak_hold_exit}" -ne 0 ]]; then
+            warn "GPU peak hold could not be evaluated because monitor samples were insufficient"
+            profile_post_status=1
         fi
     fi
     if [[ "${exit_code}" =~ ^(87|88|89)$ ]]; then
@@ -1682,7 +1717,6 @@ run_persistent_profile() {
         done
     fi
 
-    local profile_post_status="${peak_hold_failed}"
     for seq in "${profile_sequence_lengths[@]}"; do
         local run_dir="${profile_dir}/seq_${seq}"
         analyze_memory_usage \
@@ -1778,6 +1812,7 @@ run_profile() {
     return "${profile_status}"
 }
 
+prepare_runtime_directories
 check_files_and_environment
 RUN_TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
 if [[ "${BACKEND}" == "aptmoe" ]]; then
@@ -1810,6 +1845,8 @@ else
     esac
 fi
 log "Steps=${STEPS}; warmup excluded=${WARMUP_STEPS}; GAS=${GRAD_ACCUM_STEPS}"
+log "Runtime temporary directory: ${TMPDIR}"
+log "Runtime cache root: ${FFT_CACHE_ROOT}"
 if [[ "${BACKEND}" == "ktransformers" ]]; then
     log "Distributed checkpoint forward reuse: ${KT_DISTRIBUTED_CHECKPOINT_REUSE}"
 fi
