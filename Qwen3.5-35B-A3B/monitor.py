@@ -16,7 +16,7 @@
     pid:<root_pid>
 
 用法：
-  python monitor.py --out /path/to/monitor.csv [--fifo /tmp/monitor_events.fifo] \
+  python monitor.py --out /path/to/monitor.csv [--fifo /path/to/tmp/monitor_events.fifo] \
                     [--interval 2] [--disk-mount /mnt/data2] [--pid $$]
 """
 
@@ -28,6 +28,7 @@ import os
 import signal
 import stat
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -565,7 +566,7 @@ def main():
     parser.add_argument("--out", required=True, help="输出 CSV 文件路径")
     parser.add_argument(
         "--fifo",
-        default="/tmp/fft_monitor_events.fifo",
+        default=str(Path(tempfile.gettempdir()) / "fft_monitor_events.fifo"),
         help="命名管道路径（训练脚本向此写入事件）",
     )
     parser.add_argument("--interval", type=float, default=2.0, help="采样间隔（秒）")

@@ -163,12 +163,18 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
         )
         row["gpu_peak_hold_status"] = peak_hold.get("status")
         row["gpu_peak_hold_confirmed"] = peak_hold.get("confirmed")
-    peak_hold_broken = (
-        exit_code == "97"
-        or row["gpu_peak_hold_confirmed"] is False
+    peak_hold_samples_insufficient = (
+        row["gpu_peak_hold_status"] == "INSUFFICIENT_SAMPLES"
     )
-    if peak_hold_broken:
-        row["oom_classification"] = "NOT_OOM_PEAK_HOLD_BROKEN"
+    peak_hold_auto_released = (
+        exit_code == "97"
+        or (
+            row["gpu_peak_hold_status"] in {"AUTO_RELEASED", "FAILED"}
+            and row["gpu_peak_hold_confirmed"] is False
+        )
+    )
+    if peak_hold_auto_released:
+        row["oom_classification"] = "NOT_OOM_GPU_AUTO_RELEASED"
     if exit_code == "DRY_RUN":
         row["status"] = "DRY_RUN"
         return row
@@ -332,8 +338,8 @@ def aggregate_run(config_path: Path) -> dict[str, Any]:
         row["status"] = "TIMING_FIELDS_MISSING"
     elif int(row["stable_steps"] or 0) != expected_stable:
         row["status"] = "INCOMPLETE_STABLE_WINDOW"
-    elif peak_hold_broken:
-        row["status"] = "GPU_PEAK_HOLD_BROKEN_NOT_OOM"
+    elif peak_hold_samples_insufficient:
+        row["status"] = "GPU_PEAK_HOLD_SAMPLES_MISSING"
     else:
         row["status"] = (
             "SMOKE_ONLY"
@@ -593,8 +599,8 @@ def write_markdown(
     }
     if persistence_modes == {True}:
         lifecycle_lines = [
-            "- 每个 profile 只启动一次持久训练进程/worker 集合；从最长 sequence 开始，CUDA allocator 峰值必须保持到最短 sequence 完成，随后才统一释放。",
-            "- GPU_BUSY_NOT_OOM、GPU_PEAK_HOLD_BROKEN_NOT_OOM 和 GPU_RELEASE_UNCONFIRMED_NOT_OOM 是资源隔离状态，不按训练 OOM 记录。",
+            "- 每个 profile 只启动一次持久训练进程/worker 集合；从最长 sequence 开始观测 CUDA allocator 峰值是否保持到最短 sequence 完成，训练进程在 profile 结束后统一退出。",
+            "- 显存峰值被 allocator 自动清理时仅记录 Peak held=no 和 NOT_OOM_GPU_AUTO_RELEASED，不覆盖正常训练状态；GPU_BUSY_NOT_OOM 和 GPU_RELEASE_UNCONFIRMED_NOT_OOM 仍是资源隔离错误。",
         ]
     elif persistence_modes == {False}:
         lifecycle_lines = [

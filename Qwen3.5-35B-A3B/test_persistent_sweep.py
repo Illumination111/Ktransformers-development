@@ -88,7 +88,7 @@ class PersistentSweepTest(unittest.TestCase):
             script.index("usage()"),
         )
 
-    def test_peak_hold_failure_does_not_overwrite_training_exit(self) -> None:
+    def test_peak_hold_auto_release_is_observational(self) -> None:
         script = (
             SCRIPT_DIR / "run_finetune_perf_sweep_bf16_common.sh"
         ).read_text(encoding="utf-8")
@@ -96,7 +96,15 @@ class PersistentSweepTest(unittest.TestCase):
             "run_persistent_profile() {", 1
         )[1].split("run_profile() {", 1)[0]
 
-        self.assertIn("peak_hold_failed=1", persistent_profile)
+        self.assertIn('peak_hold_exit}" -eq 97', persistent_profile)
+        self.assertIn(
+            "recording it without failing the profile",
+            persistent_profile,
+        )
+        self.assertNotIn(
+            'profile_post_status="${peak_hold_exit}"',
+            persistent_profile,
+        )
         self.assertNotIn("exit_code=97", persistent_profile)
 
     def test_legacy_peak_hold_exit_still_aggregates_tps(self) -> None:
@@ -159,8 +167,79 @@ class PersistentSweepTest(unittest.TestCase):
             self.assertEqual(row["stable_tps"], 1024.0)
             self.assertEqual(
                 row["status"],
-                "GPU_PEAK_HOLD_BROKEN_NOT_OOM",
+                "OK",
             )
+            self.assertEqual(
+                row["oom_classification"],
+                "NOT_OOM_GPU_AUTO_RELEASED",
+            )
+
+    def test_insufficient_peak_hold_samples_are_not_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            profile_dir = Path(temp) / "consumer_2gpu_batch2"
+            run_dir = profile_dir / "seq_2048"
+            timing_dir = run_dir / "step_timing"
+            timing_dir.mkdir(parents=True)
+            (run_dir / "run_config.json").write_text(
+                json.dumps(
+                    {
+                        "backend": "ktransformers",
+                        "profile": "consumer",
+                        "benchmark_class": "exact_model_full_finetune",
+                        "precision": "bf16",
+                        "modality": "text_only",
+                        "model_load_architecture": "Qwen3_5MoeForCausalLM",
+                        "weight_source": "pretrained_checkpoint",
+                        "checkpoint_compatible": True,
+                        "llamafactory_backend": True,
+                        "finetuning_type": "full",
+                        "sequence_length": 2048,
+                        "steps": 15,
+                        "warmup_steps": 5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "exit_code.txt").write_text("0\n", encoding="utf-8")
+            (profile_dir / "gpu_peak_hold.json").write_text(
+                json.dumps(
+                    {
+                        "status": "INSUFFICIENT_SAMPLES",
+                        "confirmed": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (timing_dir / "step_timing.json").write_text(
+                json.dumps(
+                    {
+                        "timing_mode": "coarse_host_wall_no_cuda_sync",
+                        "num_stable_steps": 10,
+                        "instrumentation": {
+                            "forced_cuda_synchronize": False,
+                            "backend_internal_probes": False,
+                            "system_resource_monitor": False,
+                            "per_step_file_io": False,
+                        },
+                        "aggregate_stable": {
+                            "step_total_sec": {"mean_sec": 4.0},
+                            "forward_sec": {"mean_sec": 1.0},
+                            "backward_sec": {"mean_sec": 2.0},
+                            "optimizer_sec": {"mean_sec": 1.0},
+                        },
+                        "tps_attribution": {"stable_tps": 1024.0},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            row = aggregate_run(run_dir / "run_config.json")
+
+            self.assertEqual(
+                row["status"],
+                "GPU_PEAK_HOLD_SAMPLES_MISSING",
+            )
+            self.assertIsNone(row["oom_classification"])
 
     def test_generated_training_yaml_is_loaded_as_argument_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -281,7 +360,7 @@ class PersistentSweepTest(unittest.TestCase):
                 )
             report = verify(manifest, monitor, tolerance_mib=512)
             self.assertFalse(report["confirmed"])
-            self.assertEqual(report["status"], "FAILED")
+            self.assertEqual(report["status"], "AUTO_RELEASED")
 
 
 if __name__ == "__main__":

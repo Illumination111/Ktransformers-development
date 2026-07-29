@@ -52,17 +52,19 @@ RSS、整机 RAM、训练进程 GPU 显存、整卡显存和 GPU 利用率。采
 
 每个 profile 只启动一次 rank/worker 集合，在同一批持久进程中从最长 sequence
 切换到最短 sequence。最长项完成时激活 CUDA cache hold：释放 Python 模型对象时不
-调用 `torch.cuda.empty_cache()`，同一进程的 caching allocator/最长 buffer 会继续
-占据已经达到的峰值，直至该 profile 的最后一个长度完成，随后进程退出才统一释放。
+调用 `torch.cuda.empty_cache()`，并持续观测同一进程的 caching allocator/最长
+buffer 是否保持已经达到的峰值；allocator 仍可能根据运行时需要自动清理未使用显存。
+该 profile 的最后一个长度完成后，进程统一退出。
 KTransformers、DeepSpeed 和 APTMoE 的 NCCL process group，以及 MegaTrain 的 GPU
 worker，也都跨 sequence 保留到 profile 结束。这不是另起一个显存占坑进程，因此
 不会与下一长度的训练 allocator 竞争。
 
 profile 级 `monitor.csv` 按 `seq_<长度>` phase 记录全程曲线；
 `gpu_peak_hold.json` 会逐卡检查后续每个长度的最小任务显存没有跌破最长项峰值
-（默认允许 512 MiB 采样误差）。不满足时标记
-`GPU_PEAK_HOLD_BROKEN_NOT_OOM` 并使该 profile 失败。所选 GPU 启动前已有 compute
-process 时标记 `GPU_BUSY_NOT_OOM`；全部长度结束后的统一释放无法确认时标记
+（默认允许 512 MiB 采样误差）。显存被 allocator 自动清理时保留
+`status=AUTO_RELEASED`、`confirmed=false` 作为观测结果，并在聚合结果中记录
+`NOT_OOM_GPU_AUTO_RELEASED`，但不覆盖正常训练状态，也不使 profile 失败。所选 GPU
+启动前已有 compute process 时标记 `GPU_BUSY_NOT_OOM`；全部长度结束后的统一释放无法确认时标记
 `GPU_RELEASE_UNCONFIRMED_NOT_OOM`。这些资源隔离错误都不会当成训练 OOM，也不会
 清理同机其他任务。
 

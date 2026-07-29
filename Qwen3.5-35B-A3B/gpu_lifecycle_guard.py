@@ -16,6 +16,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -232,8 +233,8 @@ def acquire_gpu_locks(devices: list[int]) -> list[Any]:
     for device in devices:
         handle: Any | None = None
         try:
-            path = Path(
-                f"/tmp/fft-qwen35-uid{os.getuid()}-gpu-{device}.lock"
+            path = Path(tempfile.gettempdir()) / (
+                f"fft-qwen35-uid{os.getuid()}-gpu-{device}.lock"
             )
             handle = path.open("a+", encoding="utf-8")
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

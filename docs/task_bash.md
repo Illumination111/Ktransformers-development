@@ -226,17 +226,20 @@ memory_summary.md/json -> MANUAL_REVIEW_REQUIRED
 `MemoryMax`、不关闭 swap，也不会在内存峰值超过 1 TiB 时自动按 OOM 归类。
 
 每个 profile 只启动一次 rank/worker 集合。consumer 会在同一批持久进程中依次运行
-`2048 → 1024 → … → 16`；2048 完成后不调用 `torch.cuda.empty_cache()`，其 CUDA
-caching allocator/最长 buffer 达到的峰值一直保留到 16 完成，之后进程退出才统一
-释放。KTransformers、DeepSpeed 和 APTMoE 的 NCCL process group，以及 MegaTrain
-的 GPU worker，也都只在 profile 结束后清理。server 同理保留 4096 的峰值直到 32
-完成。
+`2048 → 1024 → … → 16`；2048 完成后不调用 `torch.cuda.empty_cache()`，并观测其
+CUDA caching allocator/最长 buffer 达到的峰值是否保留到 16 完成。allocator 仍可能
+根据运行时需要自动清理未使用显存，之后进程退出并统一释放剩余资源。
+KTransformers、DeepSpeed 和 APTMoE 的 NCCL process group，以及 MegaTrain
+的 GPU worker，也都只在 profile 结束后清理。server 同理观测 4096 的峰值是否保持
+到 32 完成。
 
 profile 级 `gpu_peak_hold.json` 会用 `monitor.csv` 的 phase 分段逐卡验证后续长度的
-最小任务显存没有跌破最长项峰值（默认容差 512 MiB）。验证失败标记
-`GPU_PEAK_HOLD_BROKEN_NOT_OOM`；测试前 GPU 已忙标记 `GPU_BUSY_NOT_OOM`；最后统一
-释放未确认标记 `GPU_RELEASE_UNCONFIRMED_NOT_OOM`。这些资源隔离状态都不会误报为
-训练 OOM，也不会结束同机其他任务。
+最小任务显存没有跌破最长项峰值（默认容差 512 MiB）。如果 allocator 自动清理了
+峰值显存，则记录 `status=AUTO_RELEASED`、`confirmed=false` 和
+`NOT_OOM_GPU_AUTO_RELEASED`，但训练过程正常时状态仍为 OK；测试前 GPU 已忙标记
+`GPU_BUSY_NOT_OOM`；最后统一释放未确认标记
+`GPU_RELEASE_UNCONFIRMED_NOT_OOM`。这些资源隔离状态都不会误报为训练 OOM，也不会
+结束同机其他任务。
 
 ## 3. 公共参数
 
