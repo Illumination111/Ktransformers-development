@@ -3,7 +3,9 @@ compute_environment: LOCAL_MACHINE
 distributed_type: FSDP
 fsdp_config:
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
-  fsdp_cpu_ram_efficient_loading: true
+  # Accelerate FSDP2 low-RAM loading leaves GLM's persistent
+  # e_score_correction_bias buffers on meta for non-owner ranks.
+  fsdp_cpu_ram_efficient_loading: false
   fsdp_offload_params: false
   fsdp_reshard_after_forward: true
   fsdp_state_dict_type: FULL_STATE_DICT

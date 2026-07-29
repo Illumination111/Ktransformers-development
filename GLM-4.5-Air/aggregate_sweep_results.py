@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate GLM-4.5-Air KTransformers server/consumer sweep results."""
+"""Aggregate GLM-4.5-Air server/consumer sweep results."""
 
 from __future__ import annotations
 
@@ -135,15 +135,23 @@ def write_summary(root: Path, rows: list[dict[str, Any]]) -> None:
     success = sum(row["status"] == "SUCCESS" for row in rows)
     failed = sum(row["status"] == "FAILED" for row in rows)
     dry_run = sum(row["status"] == "DRY_RUN" for row in rows)
+    backends = sorted(
+        {
+            str(row["backend"])
+            for row in rows
+            if row.get("backend") is not None
+        }
+    )
     lines = [
-        "# GLM-4.5-Air BF16 KTransformers Sweep",
+        "# GLM-4.5-Air BF16 Full-Finetuning Sweep",
         "",
         "- Profiles: `server` (8 GPUs, global batch 8) and/or "
         "`consumer` (2 GPUs, global batch 2).",
-        "- Backend: KTransformers AMXBF16",
+        f"- Backend: `{', '.join(backends)}`",
         "- Each sequence length runs in an independent process.",
         "- TPS excludes configured warm-up optimizer steps.",
-        "- Timing mode: coarse host wall time, without forced CUDA synchronization.",
+        "- DeepSpeed/KTransformers use coarse host-wall timing without forced "
+        "CUDA synchronization; MegaTrain retains backend-required synchronization.",
         "- CPU/GPU resource sampling runs outside the measured phase path.",
         "",
         f"Cases: {len(rows)}; success: {success}; failed: {failed}; dry-run: {dry_run}.",
