@@ -80,9 +80,15 @@ def load_monitor_csv(csv_path: Path, phase: str | None = None) -> dict:
         "cpu_util": [],
         "ram_used_gb": [],
         "proc_ram_gb": [],
+        "cgroup_memory_gb": [],
+        "cgroup_swap_gb": [],
+        "cgroup_anon_gb": [],
+        "cgroup_file_gb": [],
+        "cgroup_shmem_gb": [],
         "ram_plot_gb": [],
         "ram_total_gb": 0.0,
         "has_proc_metrics": False,
+        "has_cgroup_memory": False,
         "disk_read_mbps": [],
         "disk_write_mbps": [],
         "gpus": {},
@@ -98,7 +104,11 @@ def load_monitor_csv(csv_path: Path, phase: str | None = None) -> dict:
         return data
 
     has_proc_ram = "proc_ram_gb" in (rows[0] or {})
+    has_cgroup_memory = any(
+        str(row.get("cgroup_memory_gb", "")).strip() for row in rows
+    )
     data["has_proc_metrics"] = has_proc_ram
+    data["has_cgroup_memory"] = has_cgroup_memory
 
     for r in rows:
         def _f(k, default=0.0):
@@ -113,9 +123,18 @@ def load_monitor_csv(csv_path: Path, phase: str | None = None) -> dict:
         data["cpu_util"].append(_f("cpu_util_pct"))
         host_ram = _f("ram_used_gb")
         data["ram_used_gb"].append(host_ram)
+        if has_cgroup_memory:
+            data["cgroup_memory_gb"].append(_f("cgroup_memory_gb"))
+            data["cgroup_swap_gb"].append(_f("cgroup_swap_gb"))
+            data["cgroup_anon_gb"].append(_f("cgroup_anon_gb"))
+            data["cgroup_file_gb"].append(_f("cgroup_file_gb"))
+            data["cgroup_shmem_gb"].append(_f("cgroup_shmem_gb"))
         if has_proc_ram:
             process_ram = _f("proc_ram_gb")
             data["proc_ram_gb"].append(process_ram)
+        if has_cgroup_memory:
+            data["ram_plot_gb"].append(_f("cgroup_memory_gb"))
+        elif has_proc_ram:
             data["ram_plot_gb"].append(process_ram)
         else:
             data["ram_plot_gb"].append(host_ram)
@@ -364,6 +383,7 @@ def plot_cpu_ram(monitor: dict, plots_dir: Path):
     fig, axes = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
 
     ax = axes[0]
+    use_cgroup = bool(monitor.get("has_cgroup_memory"))
     use_process = bool(monitor.get("has_proc_metrics"))
     ram_series = monitor.get("ram_plot_gb") or monitor["ram_used_gb"]
     ax.plot(
@@ -371,9 +391,25 @@ def plot_cpu_ram(monitor: dict, plots_dir: Path):
         ram_series,
         color="#e74c3c",
         linewidth=1.2,
-        label="Training process-tree RSS" if use_process else "Host used RAM",
+        label=(
+            "Dedicated cgroup memory.current"
+            if use_cgroup
+            else "Training process-tree RSS"
+            if use_process
+            else "Host used RAM"
+        ),
     )
-    if use_process:
+    if use_cgroup and monitor.get("proc_ram_gb"):
+        ax.plot(
+            elapsed,
+            monitor["proc_ram_gb"],
+            color="#f39c12",
+            linewidth=0.7,
+            alpha=0.45,
+            linestyle="--",
+            label="Process-tree RSS sum (diagnostic)",
+        )
+    if use_process or use_cgroup:
         ax.plot(
             elapsed,
             monitor["ram_used_gb"],

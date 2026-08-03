@@ -6,6 +6,7 @@
   - 每张 GPU 的已用显存、总显存、SM 利用率、显存利用率（整机）
   - 系统 RAM（总量、已用、可用）
   - 可选：按 --pid 进程树过滤的 proc_ram_gb / proc_gpu*_mem_mb
+  - 可选：按 resource_contract.json 采集独立 cgroup 的真实内存计费
   - 磁盘 I/O 速率（读写 MB/s），优先采 /mnt/data2 所在设备
   - CPU 利用率（总体 + 每 NUMA 节点估算）
 
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import signal
 import stat
@@ -116,6 +118,11 @@ BASE_COLUMNS = [
     "proc_count",
     "proc_ram_gb",
     "proc_cpu_pct",
+    "cgroup_memory_gb",
+    "cgroup_swap_gb",
+    "cgroup_anon_gb",
+    "cgroup_file_gb",
+    "cgroup_shmem_gb",
     "disk_read_mbps",
     "disk_write_mbps",
     "disk_read_iops",
@@ -342,6 +349,43 @@ def _collect_process_tree(root_pid: int | None) -> tuple[set[int], float, float]
     return pid_set, rss / 1e9, cpu
 
 
+def _read_int(path: Path) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _read_memory_stat(path: Path) -> dict[str, int]:
+    values: dict[str, int] = {}
+    try:
+        for line in path.read_text().splitlines():
+            key, raw = line.split()
+            values[key] = int(raw)
+    except (OSError, ValueError):
+        return {}
+    return values
+
+
+def _sample_cgroup_memory(cgroup: Path | None) -> dict[str, float | None]:
+    if cgroup is None:
+        return {}
+    current = _read_int(cgroup / "memory.current")
+    swap = _read_int(cgroup / "memory.swap.current")
+    stat_values = _read_memory_stat(cgroup / "memory.stat")
+
+    def decimal_gb(value: int | None) -> float | None:
+        return None if value is None else value / 1e9
+
+    return {
+        "memory_gb": decimal_gb(current),
+        "swap_gb": decimal_gb(swap),
+        "anon_gb": decimal_gb(stat_values.get("anon")),
+        "file_gb": decimal_gb(stat_values.get("file")),
+        "shmem_gb": decimal_gb(stat_values.get("shmem")),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # 主监控循环
 # --------------------------------------------------------------------------- #
@@ -353,6 +397,7 @@ class Monitor:
         interval: float,
         disk_mount: str,
         root_pid: int | None = None,
+        resource_contract: str | None = None,
     ):
         self.out_path = out_path
         self.fifo_path = fifo_path
@@ -360,6 +405,10 @@ class Monitor:
         self.disk_mount = disk_mount
         self.disk_device = _resolve_disk_device(disk_mount)
         self.root_pid = root_pid
+        self.resource_contract = (
+            Path(resource_contract) if resource_contract else None
+        )
+        self.cgroup_path: Path | None = None
         self._running = True
         self._phase = "init"
         self._event = ""
@@ -373,6 +422,10 @@ class Monitor:
         print(f"[monitor] GPU 数量: {_GPU_COUNT}", flush=True)
         print(f"[monitor] FIFO 路径: {fifo_path}", flush=True)
         print(f"[monitor] 进程树根 PID: {root_pid}", flush=True)
+        print(
+            f"[monitor] 资源合同: {self.resource_contract or '(disabled)'}",
+            flush=True,
+        )
 
         # 打开 CSV 写入
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -459,6 +512,25 @@ class Monitor:
                 if self._running:
                     time.sleep(0.5)
 
+    def _resolve_cgroup_path(self) -> Path | None:
+        if self.cgroup_path is not None:
+            return self.cgroup_path
+        if self.resource_contract is None or not self.resource_contract.is_file():
+            return None
+        try:
+            contract = json.loads(self.resource_contract.read_text())
+            candidate = Path(str(contract["cgroup"]))
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not str(candidate).startswith("/sys/fs/cgroup/"):
+            print(f"[monitor] 忽略非法 cgroup 路径: {candidate}", flush=True)
+            return None
+        if not (candidate / "memory.current").is_file():
+            return None
+        self.cgroup_path = candidate
+        print(f"[monitor] cgroup 内存路径: {candidate}", flush=True)
+        return candidate
+
     def _sample_once(self, prev_disk: dict, dt: float) -> dict:
         now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         elapsed = time.time() - self._start_time
@@ -475,6 +547,7 @@ class Monitor:
             self.root_pid
         )
         proc_gpu = _sample_gpu_proc_mem(pid_set)
+        cgroup_memory = _sample_cgroup_memory(self._resolve_cgroup_path())
 
         # Disk
         curr_disk = _get_disk_io(self.disk_device)
@@ -496,6 +569,21 @@ class Monitor:
             "proc_count": len(pid_set),
             "proc_ram_gb": f"{proc_ram_gb:.2f}",
             "proc_cpu_pct": f"{proc_cpu_pct:.1f}",
+            "cgroup_memory_gb": self._format_optional(
+                cgroup_memory.get("memory_gb")
+            ),
+            "cgroup_swap_gb": self._format_optional(
+                cgroup_memory.get("swap_gb")
+            ),
+            "cgroup_anon_gb": self._format_optional(
+                cgroup_memory.get("anon_gb")
+            ),
+            "cgroup_file_gb": self._format_optional(
+                cgroup_memory.get("file_gb")
+            ),
+            "cgroup_shmem_gb": self._format_optional(
+                cgroup_memory.get("shmem_gb")
+            ),
             "disk_read_mbps": f"{read_mbps:.1f}",
             "disk_write_mbps": f"{write_mbps:.1f}",
             "disk_read_iops": f"{read_iops:.0f}",
@@ -515,6 +603,10 @@ class Monitor:
         # 重置事件（单次触发）
         self._event = ""
         return row, curr_disk
+
+    @staticmethod
+    def _format_optional(value: float | None) -> str:
+        return "" if value is None else f"{value:.6f}"
 
     def run(self) -> None:
         # 初始化 CPU percent（第一次调用返回 0）
@@ -581,6 +673,10 @@ def main():
         default=None,
         help="训练启动脚本 PID；监控该进程树的 CPU/GPU 内存",
     )
+    parser.add_argument(
+        "--resource-contract",
+        help="resource_contract.json used to resolve the dedicated cgroup",
+    )
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, _sig_handler)
@@ -592,6 +688,7 @@ def main():
         interval=args.interval,
         disk_mount=args.disk_mount,
         root_pid=args.pid,
+        resource_contract=args.resource_contract,
     )
     _monitor_instance.run()
 

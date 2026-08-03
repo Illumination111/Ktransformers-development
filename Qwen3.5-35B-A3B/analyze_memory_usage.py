@@ -24,6 +24,11 @@ def main() -> None:
     parser.add_argument("--log-dir", type=Path, required=True)
     parser.add_argument("--monitor-csv", type=Path)
     parser.add_argument("--phase")
+    parser.add_argument(
+        "--require-cgroup-memory",
+        action="store_true",
+        help="Fail instead of falling back to RSS when cgroup samples are absent",
+    )
     args = parser.parse_args()
     log_dir = args.log_dir.resolve()
     monitor_csv = (
@@ -39,9 +44,22 @@ def main() -> None:
     plot_cpu_ram(monitor, plots_dir)
 
     proc_peak_gb = _peak(monitor.get("proc_ram_gb", []))
+    cgroup_peak_gb = _peak(monitor.get("cgroup_memory_gb", []))
+    cgroup_swap_peak_gb = _peak(monitor.get("cgroup_swap_gb", []))
     host_peak_gb = _peak(monitor.get("ram_used_gb", []))
+    cgroup_metrics_valid = bool(monitor.get("has_cgroup_memory"))
     process_metrics_valid = proc_peak_gb is not None and proc_peak_gb > 0
-    observed_peak_gb = proc_peak_gb if process_metrics_valid else host_peak_gb
+    if args.require_cgroup_memory and not cgroup_metrics_valid:
+        raise RuntimeError(
+            "dedicated cgroup memory samples are required but absent from monitor.csv"
+        )
+    observed_peak_gb = (
+        cgroup_peak_gb
+        if cgroup_metrics_valid
+        else proc_peak_gb
+        if process_metrics_valid
+        else host_peak_gb
+    )
     observed_peak_bytes = (
         int(observed_peak_gb * 1_000_000_000)
         if observed_peak_gb is not None
@@ -67,10 +85,15 @@ def main() -> None:
         "monitor_phase": args.phase,
         "monitor_samples": len(monitor.get("elapsed", [])),
         "cpu_memory_scope": (
-            "training_process_tree_rss_sum"
+            "dedicated_cgroup_v2_memory_current"
+            if cgroup_metrics_valid
+            else "training_process_tree_rss_sum"
             if process_metrics_valid
             else "host_used_memory_fallback"
         ),
+        "cpu_memory_peak_gb_decimal": observed_peak_gb,
+        "cgroup_memory_peak_gb_decimal": cgroup_peak_gb,
+        "cgroup_swap_peak_gb_decimal": cgroup_swap_peak_gb,
         "process_tree_peak_gb_decimal": proc_peak_gb,
         "host_used_peak_gb_decimal": host_peak_gb,
         "one_tib_threshold_bytes": ONE_TIB_BYTES,
@@ -115,8 +138,8 @@ def main() -> None:
         "- GPU 显存：`plots/01_gpu_memory.png`",
         "- CPU 内存：`plots/02_cpu_ram.png`",
         "",
-        "进程树 CPU 数值为各进程 RSS 之和，含共享页重复计数的可能；"
-        "整机曲线会受到同机其他任务影响。人工结论应同时参考两者。",
+        "CPU 主指标优先使用独立 cgroup 的 memory.current，共享页在 cgroup 内只计费一次。"
+        "进程树 RSS 之和仍保留为诊断数据，不用于后端内存排名。",
         "",
     ]
     (log_dir / "memory_summary.md").write_text(

@@ -86,6 +86,10 @@ def main() -> None:
     parser.add_argument("--profile", choices=("server", "consumer"), required=True)
     parser.add_argument("--numa-nodes", default="0,1")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--expected-cgroup-suffix",
+        help="Require the resolved cgroup path to end with this dedicated scope name",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -109,12 +113,27 @@ def main() -> None:
         "numa_policy": policy,
         "memory_policy": "observed_only_no_benchmark_cgroup_limit",
         "validation": "one_shot_before_exec",
+        "cpu_memory_accounting": "cgroup_v2_memory_current",
+        "memory_current_path": str(cgroup / "memory.current"),
+        "memory_stat_path": str(cgroup / "memory.stat"),
+        "memory_current_supported": (cgroup / "memory.current").is_file(),
+        "dedicated_case_cgroup": (
+            args.expected_cgroup_suffix is not None
+            and str(cgroup).endswith(args.expected_cgroup_suffix)
+        ),
         "status": "OK",
     }
     errors: list[str] = []
     if args.profile == "consumer":
         if policy not in {"interleave", "weighted interleave"}:
             errors.append(f"NUMA policy is {policy!r}, expected interleave")
+    if not contract["memory_current_supported"]:
+        errors.append(f"cgroup v2 memory.current is unavailable under {cgroup}")
+    if args.expected_cgroup_suffix and not contract["dedicated_case_cgroup"]:
+        errors.append(
+            f"cgroup is {cgroup}, expected a dedicated scope ending in "
+            f"{args.expected_cgroup_suffix!r}"
+        )
     if errors:
         contract["status"] = "FAILED"
         contract["errors"] = errors
