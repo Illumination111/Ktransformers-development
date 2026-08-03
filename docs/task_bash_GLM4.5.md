@@ -1,9 +1,14 @@
 # GLM-4.5-Air BF16 全量微调测试
 
+> Qwen3.5-122B-A10B 的 text-only KTransformers 测试已独立放在
+> [`task_bash_Qwen3.5-122B-A10B.md`](task_bash_Qwen3.5-122B-A10B.md)，
+> 默认模型路径为 `/mnt/data2/models/Qwen3.5-122B-A10B`。本文其余内容仍只描述
+> GLM-4.5-Air。
+
 本目录提供三个后端的 server/consumer sequence sweep：
 
 - KTransformers
-- DeepSpeed ZeRO-3 CPU offload
+- DeepSpeed ZeRO-3 optimizer CPU offload
 - MegaTrain CPU master / layer streaming
 
 三套测试固定使用原生 BF16 和 Full-FT，不支持在这些 canonical 脚本中切换
@@ -56,11 +61,11 @@ bash /mnt/data2/wbw/FFTtest/GLM-4.5-Air/run_finetune_perf_test_bf16_deepspeed.sh
 ```
 
 DeepSpeed 使用
-[`configs/deepspeed_zero3_offload_bf16.json`](configs/deepspeed_zero3_offload_bf16.json)：
+[`configs/deepspeed_zero3_offload_bf16.json`](../GLM-4.5-Air/configs/deepspeed_zero3_offload_bf16.json)：
 
 ```text
 ZeRO stage 3
-parameter offload: CPU
+parameter offload: disabled
 optimizer offload: CPU
 weights / gradients / optimizer states: BF16
 ```
@@ -122,7 +127,24 @@ numactl --interleave=0,1
 
 内存曲线和峰值会写入结果目录，OOM 状态保留人工审阅。
 
-## 3. 单 Profile 与最小诊断
+## 3. 单 Profile、单 Server sequence 与最小诊断
+
+KTransformers 可以通过 `--server-seq-length` 只运行一个 Server sequence。
+例如只测试 sequence length 4096：
+
+```bash
+bash /mnt/data2/wbw/FFTtest/GLM-4.5-Air/run_finetune_perf_test_bf16_ktransformers.sh \
+  --profile server \
+  --server-seq-length 4096 \
+  --devices 0,1,2,3,4,5,6,7 \
+  --steps 15 \
+  --warmup-steps 5
+```
+
+`--server-seq-length` 仅适用于 KTransformers 的 `server` profile，可选值为
+`32`、`64`、`128`、`256`、`512`、`1024`、`2048`、`4096`。它与
+`--seq-lengths` 互斥；启用后只创建并运行对应的一个 `seq_<N>` 目录，其他
+Server sequence 不会执行。
 
 下面用 DeepSpeed 演示；把脚本名换为另外两个后端即可。
 
@@ -199,6 +221,7 @@ KTransformers 额外参数：
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
+| `--server-seq-length` | 未设置 | 只运行一个 Server sequence；与 `--seq-lengths` 互斥 |
 | `--kt-distributed-checkpoint-reuse` | `on` | 复用 checkpoint 重算的 CPU MoE forward |
 | `--kt-owner-threads` | 自动 | global rank 0 的 CPU MoE/optimizer 线程 |
 
@@ -283,11 +306,11 @@ bash /mnt/data2/wbw/FFTtest/GLM-4.5-Air/run_finetune_perf_test_bf16_megatrain.sh
 
 主要入口：
 
-- [`run_finetune_perf_test_bf16_ktransformers.sh`](run_finetune_perf_test_bf16_ktransformers.sh)
-- [`run_finetune_perf_test_bf16_deepspeed.sh`](run_finetune_perf_test_bf16_deepspeed.sh)
-- [`run_finetune_perf_test_bf16_megatrain.sh`](run_finetune_perf_test_bf16_megatrain.sh)
-- [`finetune_train_with_timing.py`](finetune_train_with_timing.py)
-- [`megatrain_glm45_air_train.py`](megatrain_glm45_air_train.py)
+- [`run_finetune_perf_test_bf16_ktransformers.sh`](../GLM-4.5-Air/run_finetune_perf_test_bf16_ktransformers.sh)
+- [`run_finetune_perf_test_bf16_deepspeed.sh`](../GLM-4.5-Air/run_finetune_perf_test_bf16_deepspeed.sh)
+- [`run_finetune_perf_test_bf16_megatrain.sh`](../GLM-4.5-Air/run_finetune_perf_test_bf16_megatrain.sh)
+- [`finetune_train_with_timing.py`](../GLM-4.5-Air/finetune_train_with_timing.py)
+- [`megatrain_glm45_air_train.py`](../GLM-4.5-Air/megatrain_glm45_air_train.py)
 
 结果目录分别为：
 

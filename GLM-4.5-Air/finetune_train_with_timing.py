@@ -330,6 +330,49 @@ def _install_timing() -> None:
     )
 
 
+def _install_cuda_memory_workaround() -> None:
+    """Release FSDP2 preparation cache before the first consumer step."""
+    enabled = os.environ.get(
+        "FFT_CUDA_EMPTY_CACHE_AFTER_PREPARE",
+        "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if _training_backend() != "kt" or not enabled:
+        return
+
+    from transformers import Trainer
+
+    original_prepare_for_training = Trainer._prepare_for_training
+
+    def prepare_for_training_with_empty_cache(
+        self,
+        *args,
+        **kwargs,
+    ):  # type: ignore[no-untyped-def]
+        result = original_prepare_for_training(self, *args, **kwargs)
+
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            allocated_bytes = torch.cuda.memory_allocated()
+            reserved_bytes = torch.cuda.memory_reserved()
+            rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+            gib = 1024**3
+            print(
+                "[glm45_cuda_memory] "
+                f"rank={rank} event=post_fsdp_prepare_empty_cache "
+                f"allocated_gib={allocated_bytes / gib:.3f} "
+                f"reserved_gib={reserved_bytes / gib:.3f} "
+                f"free_gib={free_bytes / gib:.3f} "
+                f"total_gib={total_bytes / gib:.3f}",
+                flush=True,
+            )
+        return result
+
+    Trainer._prepare_for_training = prepare_for_training_with_empty_cache
+
+
 def _disable_benchmark_saves() -> None:
     if os.environ.get("FFT_SKIP_FINAL_SAVE", "1").strip().lower() not in {
         "1",
@@ -356,6 +399,7 @@ def _disable_benchmark_saves() -> None:
 def main() -> None:
     _configure_rank_threads()
     _disable_benchmark_saves()
+    _install_cuda_memory_workaround()
     _install_model_contract()
     _install_timing()
     if sys.argv[1:2] == ["train"]:

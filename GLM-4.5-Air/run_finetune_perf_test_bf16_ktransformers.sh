@@ -32,6 +32,8 @@ readonly -a CONSUMER_SEQUENCE_LENGTHS=(16 32 64 128 256 512 1024 2048)
 PROFILE="server"
 SEQUENCE_LENGTHS_CSV=""
 SEQUENCE_LENGTHS_OVERRIDE_SET=0
+SERVER_SEQUENCE_LENGTH=""
+SERVER_SEQUENCE_LENGTH_SET=0
 STEPS=15
 WARMUP_STEPS=5
 GRAD_ACCUM_STEPS=1
@@ -67,6 +69,7 @@ Fixed benchmark contract:
 Options:
   --profile MODE          server, consumer or both (default: server)
   --seq-lengths LIST      Comma-separated sequence lengths; order is preserved
+  --server-seq-length N   Run exactly one canonical server sequence length
   --steps N               Optimizer steps per sequence (default: 15)
   --warmup-steps N        Steps excluded from stable TPS (default: 5)
   --gas N                 Gradient accumulation steps (default: 1)
@@ -110,6 +113,11 @@ while [[ $# -gt 0 ]]; do
         --seq-lengths)
             need_value "$1" "$#"; SEQUENCE_LENGTHS_CSV="$2"
             SEQUENCE_LENGTHS_OVERRIDE_SET=1
+            shift
+            ;;
+        --server-seq-length)
+            need_value "$1" "$#"; SERVER_SEQUENCE_LENGTH="$2"
+            SERVER_SEQUENCE_LENGTH_SET=1
             shift
             ;;
         --steps) need_value "$1" "$#"; STEPS="$2"; shift ;;
@@ -176,6 +184,25 @@ if [[ -n "${CPU_THREADS_OVERRIDE}" ]]; then
 fi
 if [[ -n "${KT_OWNER_THREADS_OVERRIDE}" ]]; then
     require_positive_int "--kt-owner-threads" "${KT_OWNER_THREADS_OVERRIDE}"
+fi
+
+if [[ "${SERVER_SEQUENCE_LENGTH_SET}" -eq 1 ]]; then
+    [[ "${SEQUENCE_LENGTHS_OVERRIDE_SET}" -eq 0 ]] || \
+        die "--server-seq-length and --seq-lengths are mutually exclusive"
+    [[ "${PROFILE}" == "server" ]] || \
+        die "--server-seq-length requires --profile server"
+    require_positive_int "--server-seq-length" "${SERVER_SEQUENCE_LENGTH}"
+    server_sequence_allowed=0
+    for seq in "${SERVER_SEQUENCE_LENGTHS[@]}"; do
+        if [[ "${seq}" == "${SERVER_SEQUENCE_LENGTH}" ]]; then
+            server_sequence_allowed=1
+            break
+        fi
+    done
+    [[ "${server_sequence_allowed}" -eq 1 ]] || \
+        die "--server-seq-length must be one of: ${SERVER_SEQUENCE_LENGTHS[*]}"
+    SEQUENCE_LENGTHS_CSV="${SERVER_SEQUENCE_LENGTH}"
+    SEQUENCE_LENGTHS_OVERRIDE_SET=1
 fi
 
 declare -a SEQUENCE_LENGTHS_OVERRIDE=()
@@ -609,6 +636,10 @@ run_one_sequence() {
     local timing_dir="${run_dir}/step_timing"
     local train_log="${run_dir}/train.log"
     local tokens_per_step=$((NUM_GPUS * PER_DEVICE_BATCH_SIZE * seq * GRAD_ACCUM_STEPS))
+    local empty_cache_after_prepare=0
+    if [[ "${profile_name}" == "consumer" ]]; then
+        empty_cache_after_prepare=1
+    fi
     mkdir -p "${run_dir}"
 
     local train_config accel_config
@@ -638,6 +669,7 @@ run_one_sequence() {
         FFT_STEP_TIMING_WARMUP_STEPS="${WARMUP_STEPS}"
         FFT_STEP_TIMING_TOKENS_PER_STEP="${tokens_per_step}"
         FFT_DISABLE_PERF_PROBES=1
+        FFT_CUDA_EMPTY_CACHE_AFTER_PREPARE="${empty_cache_after_prepare}"
         FFT_CPU_THREADS="${CPU_THREADS_PER_RANK}"
         FFT_KT_OWNER_THREADS="${KT_OWNER_THREADS}"
         FFT_KT_NON_OWNER_THREADS="${CPU_THREADS_PER_RANK}"
@@ -658,6 +690,7 @@ run_one_sequence() {
         TOKENIZERS_PARALLELISM=false
         HF_DATASETS_OFFLINE=1
         TRANSFORMERS_OFFLINE=1
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
         CUDA_VISIBLE_DEVICES="${devices}"
         PYTHONPATH="${SCRIPT_DIR}:${SHARED_FLOW_DIR}:${LLAMA_FACTORY_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
         "${accelerate_bin}" launch

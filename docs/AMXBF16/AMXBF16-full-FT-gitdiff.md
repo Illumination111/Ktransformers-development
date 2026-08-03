@@ -1,60 +1,100 @@
-# PR #2086、本地代码树与 AMX Full-FT Git Diff
+# PR #2094、本地代码树与 AMX Full-FT Git Diff
 
-更新时间：2026-07-21
+更新时间：2026-08-03
 
 ## 1. 当前结论
 
-本地仓库已经同步到 GitHub 当日最新 PR head，tracked 代码树保持一致：
+GitHub PR [kvcache-ai/ktransformers#2094](https://github.com/kvcache-ai/ktransformers/pull/2094) 已合并；
+final head 为 `1a05de4e7d36c66a39c8a413618176539b94b5d6`，包含 29 个 commit、35 个变更文件。
+本地最终状态是“PR final 内容 + 原有本地 checkpoint 增强”，不是 clean tree：
 
 ```text
 仓库          /mnt/data2/wbw/ktransformers
 分支          fullft-development
-本地 HEAD     1e95053b15b32e6db8193fd852d62d051c6e7ef5
-fork tracking origin/fullft-development = 1e95053
-官方 PR ref   upstream/pr-2086           = 1e95053
-working tree  clean
+本地 HEAD     a6e94d970008247c3d4b8d3522322270dc5ba7cc（PR 中 gated shared-expert commit）
+PR final      1a05de4e7d36c66a39c8a413618176539b94b5d6
+sglang gitlink 1e098a77ba395dc1a5f2dcbdf57bdb188e84bcee
+working tree  6 modified + 1 untracked
 ```
 
-GitHub PR 为 [kvcache-ai/ktransformers#2086](https://github.com/kvcache-ai/ktransformers/pull/2086)。2026-07-17 刷新时状态为 open、非 draft、mergeable；head 没有 commit status。`mergeable=true` 只说明 GitHub 可以生成合并结果，不代表新 head 已完成 CI、扩展构建或 Full-FT 训练验收。
-
-同步前的 6 个 tracked 修改和 2 个 untracked timing 文件没有混入当前工作树，已完整保存在：
+本机 Git smart-protocol fetch 未能取得 final head，因此先 fast-forward 到本地已有的 `a6e94d9`，再使用 GitHub
+codeload final-head archive 覆盖最后三个提交。重新合入本地增强之前，对 archive 内所有普通文件逐一校验为
+`archive_file_mismatches=0`。重新合入后，`rsync -rcn` 相对 final archive 只报告以下 4 个有意差异：
 
 ```text
-stash@{0}: pre-1e95053 KT_BACKWARD_TIMING integration 2026-07-17
+kt-kernel/python/sft/autograd.py
+kt-kernel/python/sft/layer.py
+kt-kernel/python/sft/wrapper.py
+kt-kernel/test/per_commit/test_sft_checkpoint_reuse.py
 ```
 
-该 stash 是恢复副本，不属于 `1e95053`，也不能计入 PR diff。不要在未重新设计 profiler 接口前直接 `stash pop`。
+其余 PR2094 普通文件内容与 final archive 一致。当前额外 dirty 路径中，
+`.github/workflows/release-pypi.yml`、`test_sft_full_checkpoint.py` 和新文件 `test_sft_router_grad.py`
+是 final head 最后三个提交的内容；上述 4 个路径是 PR final 之上的本地增强。没有把这些内容伪装成已取得的
+Git commit，也没有创建会吞并用户现场的新提交。
+
+同步前确认存在 5 个未提交路径：
+
+```text
+kt-kernel/python/sft/arch.py
+kt-kernel/python/sft/autograd.py
+kt-kernel/python/sft/layer.py
+kt-kernel/python/sft/wrapper.py
+kt-kernel/test/per_commit/test_sft_checkpoint_reuse.py
+```
+
+它们已完整保存在 `stash@{0}: pre-pr2094-final local shared-expert and distributed checkpoint reuse 2026-08-03`。
+其中 `arch.py` 的 singular/plural gated shared-expert 处理已被 PR2094 上游实现覆盖，其余分布式 checkpoint
+复用行为经兼容合并后保留。stash 仍作为恢复副本存在；旧 timing 现场顺延为 `stash@{1}`。
 
 ## 2. 本轮同步阶段
 
-### 阶段 A：刷新与核对
+### 阶段 A：GitHub 刷新与本地现场核对
 
-- 通过 GitHub PR 元数据确认 head 仍为 `1e95053`；
-- 重新 fetch `origin/fullft-development` 与 `refs/pull/2086/head`；
-- 确认旧本地 HEAD `f209878` 是新 head 的祖先，可 fast-forward，落后 8 个 commit，没有分叉；
-- 确认原工作树仍是记录中的 6 个修改和 2 个新文件。
+- 通过 GitHub 元数据确认 PR2094 已合并、final head 为 `1a05de4`；
+- 确认本地已有提交可前进到 `a6e94d9`，并识别 final head 仍有 4 个路径变化；
+- 在修改前记录 5 个 dirty 路径，并用包含 untracked 的 stash 保存恢复副本；
+- Git fetch 失败后改用 final-head codeload archive，不以旧 remote ref 代替 GitHub final 状态。
 
 ### 阶段 B：保存本地现场
 
-使用包含 untracked 文件的 stash 保存原 timing 实验：
+先保存原 dirty diff，再同步 PR 内容；archive 覆盖后完成一次零差异校验，最后按语义重新合入仍有价值的
+distributed checkpoint reuse。合并过程中补充了两处兼容性：`KTMoELayerWrapper` 的直接构造仍可从 wrapper
+读取 reuse 默认值；checkpoint output 清理改为 backend capability check，以兼容 PR 自带 legacy/fake backend。
+
+### 阶段 C：Release 构建与安装
+
+使用 `CPUINFER_BUILD_TYPE=Release` 和 `CPUINFER_FORCE_REBUILD=1` 完整编译 kt-kernel；构建检测到
+AMX、AVX512-BF16 和 CUDA 13.0。最终 wheel 安装到 FFTtest 三个 KT 脚本默认使用的 `Kllama`：
 
 ```text
-6 tracked files: 247 insertions, 2 deletions
-2 untracked files: 373 lines
-合计 8 files: 620 insertions, 2 deletions
+kt_kernel wheel  /mnt/data2/wbw/.kt-pr2094-wheel/kt_kernel-0.6.3.post1-cp312-cp312-linux_x86_64.whl
+ktransformers    /mnt/data2/wbw/.kt-pr2094-wheel/ktransformers-0.6.3.post1-py3-none-any.whl
+extension SHA256 07611ac84077f9d69274f059291018d7de391aa144ab7b8d7ea24ba3562f70cd
 ```
 
-原实现单独维护 `KT_BACKWARD_TIMING` C++ struct、pybind API 和 Python recorder。GitHub 新增的 `KT_SFT_PROFILE` 已覆盖并细化大部分 C++ 阶段，两套实现不能直接叠加。
+安装位置是 `/mnt/data2/wbw/conda/envs/Kllama/lib/python3.12/site-packages`；安装 `.so` 与本地 Release
+build `.so` 哈希完全一致，两个 dist-info 的 `direct_url.json` 均指向上述本地 wheel。
 
-### 阶段 C：fast-forward 并保持一致
+### 阶段 D：测试与 FFTtest 后端核验
 
-本地分支从 `f209878` fast-forward 到 `1e95053`。按本轮最终要求，没有继续合并 stash，也没有在 `ktransformers` 中保留新的未提交代码；因此当前 tracked 工作树与 fork/PR head 一致。
+router、shared expert、full checkpoint、checkpoint reuse、authoritative gradient 与 distributed normalization
+共 47 项聚焦测试全部通过。由于 PR 的两项 fork 测试与其他 autograd 测试同进程运行会触发 PyTorch
+Autograd-and-Fork 限制，验收按进程模型拆成 `44 + 2 + 1` 三组；每组退出码均为 0。
 
-### 阶段 D：阶段性文档迁移
+三个脚本均通过 `bash -n`，并默认使用 `FFT_CONDA_ENV` 未覆盖时的 `Kllama`：
 
-本轮只更新 `FFTtest` 下的分析文档，明确新旧 commit、历史性能证据和未完成验证。没有修改已经同步干净的 `ktransformers` 代码树，也没有按用户最新要求继续运行测试。
+- `Qwen3.5-35B-A3B/run_finetune_perf_test_bf16_ktransformers.sh` 经 common runner 解析；
+- `Qwen3.5-122B-A10B/run_finetune_perf_test_bf16_ktransformers.sh`；
+- `GLM-4.5-Air/run_finetune_perf_test_bf16_ktransformers.sh`。
 
-## 3. 三种 Git 比较口径
+三者解析到同一个 `/mnt/data2/wbw/conda/envs/Kllama/bin/python3`，其运行时 `kt_kernel` extension 就是上述
+本地 wheel 安装的 `.so`。未启动三个模型的昂贵端到端训练，因此这里只证明后端来源、构建和聚焦正确性，
+不产生新的 TPS 结论。
+
+## 3. PR2086 历史比较口径（2026-07-21 快照）
+
+以下第 3 至第 9 节保留 PR2086/`1e95053` 的历史 diff 与性能归属，不能再解释为当前 PR2094 working tree。
 
 ### 3.1 PR 相对官方 base
 
@@ -93,7 +133,7 @@ f209878..1e95053
 | 三个聚焦测试 | 387 | 0 | profiler、raw repack、dWeight reference/benchmark |
 | 其他 binding/CMake/export | 12 | 2 | API 暴露与构建接入 |
 
-### 3.3 当前 working tree
+### 3.3 当时的 working tree
 
 当前 `git status --short --branch` 仅显示：
 
@@ -164,7 +204,7 @@ LoRA-only backward 同期只变化 -2.74%，支持收益集中在 Full-only dW �
 
 `20260716_175359...` 的内部 timing 也来自旧的本地 `KT_BACKWARD_TIMING` 实现。它可以继续作为历史热点证据，但字段不能与新 `SFTProfiler` 输出逐列混用。
 
-## 7. 验证状态
+## 7. PR2086 当时的验证状态
 
 本轮目标是同步代码树与迁移文档，按用户最新要求没有继续运行测试。当前可以确认的是 Git 与代码树状态，不是运行时正确性：
 
@@ -185,7 +225,7 @@ LoRA-only backward 同期只变化 -2.74%，支持收益集中在 Full-only dW �
 4. 另建分支或 worktree，完成冲突整合后再测试；
 5. 测试完成前保持 `full/hybrid/lora`、checkpoint on/off 与 direct reload 的验证缺口为“未验证”。
 
-## 9. 只读核对命令
+## 9. PR2086 历史只读核对命令
 
 ```bash
 cd /mnt/data2/wbw/ktransformers
@@ -202,7 +242,7 @@ git stash show --stat --include-untracked stash@{0}
 
 这些命令分别核对当前同步状态、今日 8 个 commit、完整 PR 三点 diff 和本地恢复副本，四种对象不能混为一谈。
 
-## 10. FFTtest working-tree 变更
+## 10. FFTtest working-tree 变更（2026-07 历史记录）
 
 以下变更发生在独立仓库 `/mnt/data2/wbw/FFTtest`，不改变 `/mnt/data2/wbw/ktransformers@1e95053`；因此不能混入 PR #2086 的 25-file 三点 diff。
 

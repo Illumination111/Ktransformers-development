@@ -1,20 +1,33 @@
 # AMX Full-FT Backward：当前实现、历史计时与后续分析边界
 
-更新时间：2026-07-21
+更新时间：2026-08-03
 
 ## 1. 文档范围与当前代码基线
 
 本文分析 Qwen3-30B-A3B Full Fine-Tuning 中由 KTransformers CPU/AMX MoE experts 执行的 backward，覆盖 activation gradient、base-weight gradient、TP/NUMA merge、backward BufferB repack 和 staged profiling。
 
-当前代码基线已经从历史的 `f209878` 更新为：
+当前代码内容基线已经从历史的 PR #2086 更新为：
 
 ```text
 ktransformers/fullft-development
-HEAD = 1e95053b15b32e6db8193fd852d62d051c6e7ef5
-PR   = kvcache-ai/ktransformers#2086
+PR final head = 1a05de4e7d36c66a39c8a413618176539b94b5d6
+PR            = kvcache-ai/ktransformers#2094（已合并）
+本地 HEAD      = a6e94d9（PR 倒数第 4 个提交）
 ```
 
-本地 tracked 工作树与 GitHub PR head 一致。2026-07-16 的性能日志产生于 `f209878` 或其本地 timing 工作树，仍可作为历史热点证据，但不能替代 `1e95053` 的重新构建和训练验收。
+由于 Git smart-protocol fetch 在本机不可用，PR 最后三个提交通过 GitHub final-head archive
+逐文件覆盖到 working tree；覆盖完成、重新合入原有本地增强之前，archive 中所有普通文件与本地文件校验为零差异。
+重新合入后，相对 final archive 只剩 4 个有意保留的本地差异：`autograd.py`、`layer.py`、`wrapper.py` 和
+`test_sft_checkpoint_reuse.py`，分别用于分布式 checkpoint-forward 复用、缓存释放兼容和对应回归测试。
+`third_party/sglang` 也已更新到 PR gitlink `1e098a77ba395dc1a5f2dcbdf57bdb188e84bcee`。
+
+当前源码已构建为 `kt_kernel-0.6.3.post1-cp312-cp312-linux_x86_64.whl`，并与顶层
+`ktransformers-0.6.3.post1` 一起安装到 `Kllama`。安装后的 extension 与本地 Release 构建产物 SHA-256
+同为 `07611ac84077f9d69274f059291018d7de391aa144ab7b8d7ea24ba3562f70cd`。PR2094 关键测试按进程模型拆分执行，
+合计 47/47 通过；尚未执行三个大模型的端到端训练性能测试。
+
+2026-07-16 至 2026-07-20 的性能日志产生于 `f209878` 或其本地 timing 工作树，仍可作为历史热点证据，
+但不能替代 PR2094 的端到端训练验收。
 
 2026-07-20 新增了一次完整 Full-FT 内部打点运行，但运行时版本核验表明它仍不是 `1e95053`：`Kllama` 环境中的 `backward_timing.py` 和 `autograd.py` 与 `stash@{0}` 对应文件的 SHA-256 完全一致，C++ extension 也是 2026-07-16 构建。因此该运行是更新、更稳定的 **`f209878 + KT_BACKWARD_TIMING` 历史证据**，而不是 current head 验收。
 
@@ -133,6 +146,18 @@ KT 第一次 CPU expert forward 直接使用 `save_for_backward=true` 并保存 
 - 当前 benchmark 每层每个 step 只有一份未消费 cache，可把 `kt_max_cache_depth` 从 2 降为 1 来减半 cache
   内存；必须用 cache stack 平衡检查及短训验证该假设。
 
+PR2094 在此生命周期上增加了两类行为：
+
+- LoRA 支持 checkpoint-forward output 复用，避免 non-reentrant recompute 再次执行 CPU expert forward；
+  `a3d1f15` 还在重算前等待异步 backward BufferB repack，避免共享 buffer 生命周期竞争。
+- Full-FT optimizer gradient 由 CPU backend 作为权威值发布并持久化；分布式 rank 0 聚合所有 rank 的
+  `grad_output`，在 dWeight 生产处乘以 `1/world_size`，使 gradient clipping、GAS 和 optimizer 看到 DDP 平均语义。
+
+本地额外保留 `KT_REUSE_CHECKPOINT_FORWARD_DISTRIBUTED` opt-in：所有 rank 显式采用相同复用决策，rank 0
+广播 cache-ready 状态，变长 `qlen` 的 gather/scatter collective 保持对称；backward 后仅在 backend 提供
+`clear_checkpoint_output()` 时清理缓存。这一能力检测兼容 PR2094 自带的 legacy/fake backend，同时仍释放真实
+KT wrapper 的 checkpoint output。默认未设置该变量时不会扩大 PR2094 的分布式复用范围。
+
 ### 4.2 Down、activation、Gate/Up dX
 
 - Down：`dZ=dY·Wdown`，并保存稍后计算 `dWdown` 所需的 route-weighted `dY`；
@@ -178,7 +203,7 @@ Forward 使用 `X·Wᵀ`，dX 使用 `dY·W`，因此需要不同的 BufferB 布
 
 历史 Full/LoRA A/B 证明该方向有效，但该函数内手写实现不再是新 head 的完整描述。
 
-### 5.2 `1e95053` 的 current driver
+### 5.2 PR2094 继续继承的 `1e95053` driver
 
 今日 GitHub head 把 BF16 dW 抽为 `BF16DWeightKernel`，并复用 inference 的 `GemmKernel224BF16` driver：
 
@@ -222,7 +247,7 @@ Direct pack 没有消除完整 BufferB pack，也不能在新训练结果出现�
 
 ## 7. 当前 profiler 口径
 
-`1e95053` 已提交的唯一 C++ timing 源是 `SFTProfiler`：
+PR2094 继续使用 `1e95053` 引入的唯一 C++ timing 源 `SFTProfiler`：
 
 - `KT_SFT_PROFILE=1` 必须在 MoE 对象创建前设置；
 - C++ 使用 `steady_clock` 和原子累计计数；
@@ -374,21 +399,23 @@ KT backward + clip + optimizer + post-optim + base reload    15.6101 s
 | `f209878` A/B | strip/panel/C-residency 方向有效 | `1e95053` 的 TPS |
 | 旧 timing runs（含 2026-07-20） | 安装环境中 `f209878 + KT_BACKWARD_TIMING` 的 checkpoint/dW/clear/repack 热点与 3× 预算 | 新 staged profiler 的字段值或 `1e95053` 性能 |
 | `1e95053` 源码 | 新 driver、profiler、direct reload 已进入 GitHub 树 | 构建、正确性或端到端性能已通过 |
+| PR2094 final head + 当前 Kllama 安装 | authoritative full gradients、checkpoint persistence/reuse、distributed normalization、router/shared-expert 修正已构建，47 项聚焦测试通过 | 三个大模型端到端训练性能或显存/TPS |
 | GitHub mergeable | PR 可生成合并结果 | CI 或 Full-FT 训练通过 |
 
 ## 10. 当前验证缺口
 
-2026-07-20 虽完成了一次旧安装环境的短训和内部打点，但没有重新构建当前源码；因此新 head 仍需在后续独立验收：
+2026-08-03 已完成 Release extension 构建、wheel 安装、运行时路径/哈希核对，以及 router、shared expert、
+full checkpoint、checkpoint reuse、authoritative gradient 和分布式归一化相关的 47 项聚焦测试。测试需要不同
+进程启动模型：44 项一组、2 项 fork/Gloo gradient normalization、1 项 spawn/Gloo checkpoint reuse，三组均通过。
 
-1. Release extension 构建；
-2. staged profiler Python 测试；
-3. raw BF16 repack、dWeight reference 与 benchmark；
-4. Full/Hybrid/LoRA；
-5. checkpoint on/off 与 shared backward BB；
-6. TP/NUMA slice、inactive expert 和多 microbatch；
-7. Qwen3 Full-FT 短训与稳定 TPS。
+仍需后续独立验收：
 
-在这些验证完成前，文档只把 `1e95053` 标为“代码已同步”，不标为“运行时已验收”。
+1. raw BF16 repack、dWeight benchmark 的完整硬件性能门槛；
+2. 三个 FFTtest 模型的 Full/Hybrid/LoRA 端到端短训；
+3. checkpoint on/off、shared backward BB、TP/NUMA slice、inactive expert 和多 microbatch 的组合矩阵；
+4. 稳定 TPS、GPU peak allocated/reserved 与主存峰值。
+
+因此当前可写成“PR2094 代码内容已同步、Release 构建和聚焦正确性测试已通过”，不能写成“端到端性能已验收”。
 
 ## 11. 后续分析顺序
 
@@ -404,11 +431,11 @@ KT backward + clip + optimizer + post-optim + base reload    15.6101 s
 
 ## 12. 总体结论
 
-1. 本地 backward 代码已同步到 GitHub `1e95053`，当前工作树不再包含重复的旧 timing 实现。
-2. 今日 head 将 `f209878` 的有效原型演进为通用 `BF16DWeightKernel`，并加入更细粒度 staged profiling。
+1. 本地 backward 已包含 GitHub PR2094 final head `1a05de4` 的全部普通文件内容，并保留 4 个明确列出的本地分布式 checkpoint 增强差异。
+2. PR2094 继承通用 `BF16DWeightKernel` 和 staged profiling，并加入 authoritative full gradients、checkpoint persistence/reuse、分布式归一化、router 与 gated shared-expert 修正。
 3. 最新旧环境实测为 6.671 s backward / 1.408 s forward，即 4.74×；达到 3× 需要减少至少 2.445 s（36.66%）。
 4. 关闭 checkpointing 单独只能推导到约 3.32×；结合清零缩减以及至少约 0.119 s 的 repack/dW/重叠收益，才有达标可能。
 5. 若必须保留完整 checkpointing，3× 仍属高风险多阶段优化目标，而不是单一 dW kernel 可保证的结果。
 6. 新 direct reload 减少中间分片和 memcpy，不等于取消 BufferB pack，也不能用移动阶段计时来替代 step 改善。
-7. 当前最重要的版本边界是：源码已同步到 `1e95053`；最新打点来自旧安装环境，current head 的构建、测试和 Qwen3 端到端结果仍未执行。
+7. 当前版本边界是：Kllama 已安装本地 `0.6.3.post1` wheel，extension 哈希与 Release 构建一致，47 项聚焦测试通过；最新性能打点仍来自旧安装环境，三个模型的端到端结果尚未执行。
 8. DeepSpeed 的历史 23.933 s `accelerator.backward` 同时包含 `engine.backward()` 和 `engine.step()`；其显式 optimizer=0 是旧探针边界造成的未捕获，不能与 KT 2.257 s AdamW 直接比较。新四层探针已实现但尚未产生 Full-FT 实测。
