@@ -24,3 +24,6 @@ _hf_size_*.txt
 .env.*
 *.pem
 *.key
+
+# Local serve/client run logs
+**/test_log/

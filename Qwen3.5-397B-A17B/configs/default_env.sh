@@ -1,4 +1,4 @@
-# Shared defaults for Qwen3.5-397B-A17B multi-LoRA serving (M1) tests.
+# Shared defaults for Qwen3.5-397B-A17B multi-LoRA serving (M1/M2) tests.
 # Sourced by run_*.sh; override via CLI flags or environment variables.
 
 MLS_ROOT="${MLS_ROOT:-/mnt/data2/wbw/MLStest}"
@@ -34,16 +34,23 @@ KT_NUMA_NODES="${KT_NUMA_NODES:-0 1}"
 KT_NUM_GPU_EXPERTS="${KT_NUM_GPU_EXPERTS:-0}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
-MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-2}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-4}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-8192}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-8192}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flashinfer}"
 
-# M1 LoRA contract
+# LoRA contract (M1 default = single; set KT_LORA_DISPATCH=grouped for M2)
 LORA_BACKEND="${LORA_BACKEND:-triton}"
 MAX_LORA_RANK="${MAX_LORA_RANK:-8}"
-MAX_LOADED_LORAS="${MAX_LOADED_LORAS:-2}"
-MAX_LORAS_PER_BATCH="${MAX_LORAS_PER_BATCH:-1}"
+MAX_LOADED_LORAS="${MAX_LOADED_LORAS:-4}"
+KT_LORA_DISPATCH="${KT_LORA_DISPATCH:-single}"
+if [[ "${KT_LORA_DISPATCH}" == "grouped" ]]; then
+  MAX_LORAS_PER_BATCH="${MAX_LORAS_PER_BATCH:-4}"
+  KT_MAX_LORAS_PER_BATCH="${KT_MAX_LORAS_PER_BATCH:-4}"
+else
+  MAX_LORAS_PER_BATCH="${MAX_LORAS_PER_BATCH:-1}"
+  KT_MAX_LORAS_PER_BATCH="${KT_MAX_LORAS_PER_BATCH:-1}"
+fi
 KT_MAX_LOADED_LORAS="${KT_MAX_LOADED_LORAS:-${MAX_LOADED_LORAS}}"
 
 # Adapter dirs: merged KT composite adapters (each with adapter_model.safetensors).

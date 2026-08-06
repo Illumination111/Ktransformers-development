@@ -20,7 +20,8 @@ Usage: bash $(basename "$0") [options]
 
 Launch Qwen3.5-397B-A17B multi-LoRA serving under the M1 contract:
   - multiple merged KT composite adapters via --lora-paths
-  - --max-loras-per-batch 1 (same-batch mixed adapters require M2)
+  - M1 (default): --kt-lora-dispatch single, --max-loras-per-batch 1
+  - M2: --kt-lora-dispatch grouped, --kt-max-loras-per-batch N (N concurrent adapters/batch)
   - --kt-num-gpu-experts 0, --disable-cuda-graph
   - dense LoRA backend: triton (397B correctness baseline)
 
@@ -83,6 +84,9 @@ while [[ $# -gt 0 ]]; do
         --served-model-name) need_value "$1" "$#"; SERVED_MODEL_NAME="$2"; shift ;;
         --max-loaded-loras) need_value "$1" "$#"; MAX_LOADED_LORAS="$2"; KT_MAX_LOADED_LORAS="${KT_MAX_LOADED_LORAS:-$2}"; shift ;;
         --kt-max-loaded-loras) need_value "$1" "$#"; KT_MAX_LOADED_LORAS="$2"; shift ;;
+        --kt-lora-dispatch) need_value "$1" "$#"; KT_LORA_DISPATCH="$2"; shift ;;
+        --kt-max-loras-per-batch) need_value "$1" "$#"; KT_MAX_LORAS_PER_BATCH="$2"; shift ;;
+        --max-loras-per-batch) need_value "$1" "$#"; MAX_LORAS_PER_BATCH="$2"; shift ;;
         --max-lora-rank) need_value "$1" "$#"; MAX_LORA_RANK="$2"; shift ;;
         --chunked-prefill-size) need_value "$1" "$#"; CHUNKED_PREFILL_SIZE="$2"; shift ;;
         --max-running-requests) need_value "$1" "$#"; MAX_RUNNING_REQUESTS="$2"; shift ;;
@@ -107,6 +111,21 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+
+# Reconcile M1/M2 batch limits after CLI overrides.
+KT_LORA_DISPATCH="${KT_LORA_DISPATCH:-single}"
+if [[ "${KT_LORA_DISPATCH}" == "grouped" ]]; then
+    MAX_LORAS_PER_BATCH="${MAX_LORAS_PER_BATCH:-4}"
+    KT_MAX_LORAS_PER_BATCH="${KT_MAX_LORAS_PER_BATCH:-${MAX_LORAS_PER_BATCH}}"
+    if (( MAX_LORAS_PER_BATCH < KT_MAX_LORAS_PER_BATCH )); then
+        printf 'ERROR: --max-loras-per-batch (%s) < --kt-max-loras-per-batch (%s)\n' \
+            "${MAX_LORAS_PER_BATCH}" "${KT_MAX_LORAS_PER_BATCH}" >&2
+        exit 2
+    fi
+else
+    MAX_LORAS_PER_BATCH=1
+    KT_MAX_LORAS_PER_BATCH=1
+fi
 
 if [[ -z "${KT_WEIGHT_PATH}" ]]; then
     printf 'ERROR: --kt-weight-path is required (verified KT expert pack for 397B).\n' >&2
@@ -246,6 +265,8 @@ CMD=(
     --max-loaded-loras "${MAX_LOADED_LORAS}"
     --max-loras-per-batch "${MAX_LORAS_PER_BATCH}"
     --kt-max-loaded-loras "${KT_MAX_LOADED_LORAS}"
+    --kt-max-loras-per-batch "${KT_MAX_LORAS_PER_BATCH}"
+    --kt-lora-dispatch "${KT_LORA_DISPATCH}"
     --lora-paths "${LORA_ARGS[@]}"
     --log-level info
 )
@@ -256,7 +277,7 @@ fi
 cat > "${RUN_DIR}/run_config.json" <<EOF
 {
   "run_id": "${RUN_ID}",
-  "milestone": "M1",
+  "milestone": "${KT_LORA_DISPATCH}",
   "model_path": "${MODEL_PATH}",
   "kt_weight_path": "${KT_WEIGHT_PATH}",
   "kt_method": "${KT_METHOD}",
@@ -265,6 +286,8 @@ cat > "${RUN_DIR}/run_config.json" <<EOF
   "max_loaded_loras": ${MAX_LOADED_LORAS},
   "max_loras_per_batch": ${MAX_LORAS_PER_BATCH},
   "kt_max_loaded_loras": ${KT_MAX_LOADED_LORAS},
+  "kt_max_loras_per_batch": ${KT_MAX_LORAS_PER_BATCH},
+  "kt_lora_dispatch": "${KT_LORA_DISPATCH}",
   "tp_size": ${TP_SIZE},
   "devices": "${CUDA_VISIBLE_DEVICES}",
   "host": "${HOST}",

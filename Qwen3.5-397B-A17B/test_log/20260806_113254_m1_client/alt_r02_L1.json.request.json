@@ -1,1 +1,0 @@
-{"model": "Qwen3.5-397B-A17B:L1", "messages": [{"role": "user", "content": "用一句话解释什么是 LoRA。"}], "temperature": 0.0, "max_tokens": 64}

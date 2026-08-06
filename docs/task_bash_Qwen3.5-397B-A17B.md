@@ -6,13 +6,14 @@
 /mnt/data2/wbw/MLStest/Qwen3.5-397B-A17B
 ```
 
-当前只覆盖 **sglang-kt Multi-LoRA Serving M1**（同进程多块 composite LoRA，同批仅 1 种 adapter）。  
-Conda 环境固定为 **`kt-kernel`**。M2（同批 mixed-token）不在本套脚本范围内。
+当前覆盖 **sglang-kt Multi-LoRA Serving M1**（同批 1 种 adapter）与可选 **M2**（`--kt-lora-dispatch grouped`，同批最多 N 种 adapter，支撑 N 路并发 sub-agent）。  
+Conda 环境固定为 **`kt-kernel`**。
 
 | 脚本 | 作用 |
 |---|---|
-| `run_multi_lora_m1_serve.sh` | 启动 multi-LoRA server |
+| `run_multi_lora_m1_serve.sh` | 启动 multi-LoRA server（可用 `--kt-lora-dispatch grouped` 开 M2） |
 | `run_multi_lora_m1_client.sh` | 对已启动服务做 base / 各 adapter / 交替请求 smoke |
+| `run_multi_lora_m2_client_concurrent.sh` | N 路不同 adapter **并发**请求 smoke（不合并输出） |
 | `run_multi_lora_m1_e2e.sh` | 起服 → 就绪探测 → client → 停服 |
 | `configs/default_env.sh` | 默认路径与参数 |
 
