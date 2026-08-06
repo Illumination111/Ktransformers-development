@@ -1,0 +1,21 @@
+{
+  "run_id": "20260806_113254_m1_serve_tp8_n2",
+  "milestone": "M1",
+  "model_path": "/mnt/data2/models/Qwen3.5-397B-A17B-TEXTONLY",
+  "kt_weight_path": "/path/to/verified-qwen35-397b-kt-weights",
+  "kt_method": "AMXBF16",
+  "lora_paths": "L0=/path/to/L0,L1=/path/to/L1",
+  "adapter_count": 2,
+  "max_loaded_loras": 2,
+  "max_loras_per_batch": 1,
+  "kt_max_loaded_loras": 2,
+  "tp_size": 8,
+  "devices": "0,1,2,3,4,5,6,7",
+  "host": "127.0.0.1",
+  "port": 31006,
+  "served_model_name": "Qwen3.5-397B-A17B",
+  "chunked_prefill_size": 2048,
+  "conda_env": "kt-kernel",
+  "python": "/mnt/data2/wbw/conda/envs/kt-kernel/bin/python",
+  "pythonpath": "/mnt/data2/wbw/ktransformers/kt-kernel/python:/mnt/data2/wbw/ktransformers/third_party/sglang/python"
+}

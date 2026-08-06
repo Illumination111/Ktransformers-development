@@ -1,0 +1,48 @@
+### model
+model_name_or_path: /mnt/data2/models/Qwen3.5-397B-A17B
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_target: all
+
+### dataset
+dataset_dir: /mnt/data2/wbw/MLStest/Qwen3.5-397B-A17B/train/data
+dataset: nemotron_swe
+template: qwen3_5
+cutoff_len: 2048
+# Cap for first full pass; override via CLI max_samples=...
+max_samples: 50000
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+
+### output
+output_dir: /mnt/data2/wbw/MLStest/Qwen3.5-397B-A17B/train/runs/nemotron_swe
+logging_steps: 10
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false
+report_to: none
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 1.0e-4
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+bf16: true
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+
+### ktransformers
+use_kt: true
+# Pair with configs/accelerate_fsdp2_kt_bf16_8gpu.yaml for original BF16 experts.
+# For pre-converted INT8 experts, set kt_weight_path and use accelerate_fsdp2_kt_int8_8gpu.yaml.
+# kt_weight_path: /path/to/Qwen3.5-397B-A17B-AMXINT8

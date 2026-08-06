@@ -1,0 +1,26 @@
+# Large / regeneratable datasets
+dataset/
+**/train/data/*.jsonl
+**/train/data/*.parquet
+**/train/data/*.arrow
+
+# Caches and temp
+**/cache/
+**/.cache/
+**/tmp/
+*.pyc
+__pycache__/
+
+# Local probes / download noise
+_hf_size_*.txt
+**/download.log
+**/nohup.out
+
+# Training logs (keep scripts/configs)
+**/train/logs/
+
+# Secrets / local env overrides
+.env
+.env.*
+*.pem
+*.key
