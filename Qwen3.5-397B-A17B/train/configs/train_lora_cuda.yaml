@@ -1,6 +1,9 @@
 ### model
 model_name_or_path: /mnt/data2/models/Qwen3.5-397B-A17B
 trust_remote_code: true
+# Text-only (FFTtest-style): run_train_lora.sh sets MLS_TEXT_ONLY=1 and loads
+# Qwen3_5MoeForCausalLM from text_config — visual/MTP never constructed.
+# freeze_vision_tower alone is insufficient (frozen Conv3d still trips torch 2.9).
 
 ### method
 stage: sft
@@ -13,6 +16,7 @@ lora_target: all
 ### dataset
 dataset_dir: /mnt/data2/wbw/MLStest/Qwen3.5-397B-A17B/train/data
 dataset: nemotron_cuda
+# Keep qwen3_5 tool format; text-only entry strips the vision mm_plugin.
 template: qwen3_5
 cutoff_len: 2048
 # CUDA-v1 is small (~2k); keep all by default

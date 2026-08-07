@@ -26,6 +26,10 @@
 
 set -euo pipefail
 
+# Log / filename timestamps use China local time (script-only; host TZ unchanged).
+export MLS_TIMEZONE="${MLS_TIMEZONE:-Asia/Shanghai}"
+export TZ="${MLS_TIMEZONE}"
+
 TRAIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${TRAIN_DIR}/configs/default_env.sh"
@@ -168,27 +172,57 @@ train_one() {
   fi
   overrides+=("${EXTRA_OVERRIDES[@]}")
 
+  # Text-only: load Qwen3_5MoeForCausalLM from text_config (no visual / Conv3d).
+  # Same contract as FFTtest/Qwen3.5-35B-A3B/qwen35_text_only.py.
+  local train_entry="${TRAIN_DIR}/scripts/train_lora_text_only.py"
+  if [[ ! -f "${train_entry}" ]]; then
+    echo "[error] missing text-only train entry: ${train_entry}" >&2
+    return 1
+  fi
+
   echo "[train] task=${task}"
   echo "[train] yaml=${yaml}"
+  echo "[train] entry=${train_entry} (MLS_TEXT_ONLY=1)"
   echo "[train] accelerate=${ACCELERATE_CONFIG}"
   echo "[train] devices=${DEVICES}"
   echo "[train] output=${run_dir}"
+  echo "[train] TMPDIR=${MLS_TMPDIR}"
+  echo "[train] TRITON_CACHE_DIR=${TRITON_CACHE_DIR}"
   echo "[train] log=${log_file}"
 
-  mkdir -p "${run_dir}"
+  mkdir -p "${run_dir}" \
+    "${MLS_TMPDIR}" \
+    "${TRITON_CACHE_DIR}/autotune" \
+    "${CUDA_CACHE_PATH}" \
+    "${TORCH_EXTENSIONS_DIR}" \
+    "${TORCHINDUCTOR_CACHE_DIR}" \
+    "${MPLCONFIGDIR}"
   (
     cd "${LLAMA_FACTORY_DIR}"
+    export TZ="${TZ:-Asia/Shanghai}"
+    export MLS_TIMEZONE="${MLS_TIMEZONE:-Asia/Shanghai}"
+    export MLS_TEXT_ONLY=1
     export USE_KT=1
     export ACCELERATE_USE_KT=true
     export TOKENIZERS_PARALLELISM=false
     export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
     export CUDA_VISIBLE_DEVICES="${DEVICES}"
-    export PYTHONPATH="${LLAMA_FACTORY_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+    # Keep all JIT/compile caches off the full root filesystem (FFTtest pattern).
+    export TMPDIR="${MLS_TMPDIR}"
+    export TMP="${MLS_TMPDIR}"
+    export TEMP="${MLS_TMPDIR}"
+    export TRITON_CACHE_DIR="${TRITON_CACHE_DIR}"
+    export CUDA_CACHE_PATH="${CUDA_CACHE_PATH}"
+    export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR}"
+    export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR}"
+    export MPLCONFIGDIR="${MPLCONFIGDIR}"
+    # scripts/ first so qwen35_text_only is importable; then LLaMA-Factory src.
+    export PYTHONPATH="${TRAIN_DIR}/scripts:${LLAMA_FACTORY_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
     set -x
     "${ACCELERATE_BIN}" launch \
       --config_file "${ACCELERATE_CONFIG}" \
-      src/train.py \
+      "${train_entry}" \
       "${yaml}" \
       "${overrides[@]}"
   ) 2>&1 | tee "${log_file}"

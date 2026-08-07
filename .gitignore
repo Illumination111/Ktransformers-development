@@ -1,8 +1,37 @@
-# Large / regeneratable datasets
-dataset/
+# ---------------------------------------------------------------------------
+# Datasets: keep directory layout / scripts / HF metadata in git.
+# Do NOT commit raw parquet/jsonl weights or Hugging Face download caches.
+# ---------------------------------------------------------------------------
+dataset/**/data/*
+!dataset/**/data/.gitkeep
+dataset/**/.cache/
+dataset/**/*.parquet
+dataset/**/*.jsonl
+dataset/**/*.arrow
+dataset/**/*.zst
+dataset/**/*.gz
+
+# Prepared LLaMA-Factory jsonl (regenerate via run_prepare_data.sh)
 **/train/data/*.jsonl
 **/train/data/*.parquet
 **/train/data/*.arrow
+
+# Training checkpoints / fused expert LoRA (local only)
+**/train/runs/
+**/train/logs/
+
+# Serving composite adapters: keep path stubs, ignore weights
+lora-adapter/**/*.safetensors
+lora-adapter/**/*.bin
+lora-adapter/**/*.pt
+lora-adapter/**/*.pth
+lora-adapter/**/checkpoint-*/
+lora-adapter/**/tokenizer.json
+
+# Generic weight blobs anywhere under the repo
+*.safetensors
+*.gguf
+*.onnx
 
 # Caches and temp
 **/cache/
@@ -10,14 +39,15 @@ dataset/
 **/tmp/
 *.pyc
 __pycache__/
+.DS_Store
 
 # Local probes / download noise
 _hf_size_*.txt
 **/download.log
 **/nohup.out
-
-# Training logs (keep scripts/configs)
-**/train/logs/
+**/competitive_*.log
+**/competitive_nohup.out
+**/competitive_*.out
 
 # Secrets / local env overrides
 .env

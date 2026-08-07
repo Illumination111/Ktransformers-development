@@ -33,6 +33,57 @@ def _normalize_tools(tools: Any) -> str | None:
     return json.dumps(tools, ensure_ascii=False)
 
 
+def _normalize_arguments(arguments: Any) -> str:
+    """Store tool arguments as a JSON *string* of an object.
+
+    - HuggingFace ``datasets`` cannot Arrow-cast varying ``arguments`` dict schemas
+      across rows (keys differ per tool); a string column is stable.
+    - LLaMA-Factory ``FunctionFormatter`` (patched) accepts string or dict and
+      feeds Qwen3.5 tool_utils a JSON object string for ``.items()``.
+    """
+    parsed: Any
+    if isinstance(arguments, dict):
+        parsed = arguments
+    elif isinstance(arguments, str):
+        text = arguments.strip()
+        if not text:
+            parsed = {}
+        else:
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = {"input": arguments}
+    elif arguments is None:
+        parsed = {}
+    else:
+        parsed = arguments
+
+    if not isinstance(parsed, dict):
+        parsed = {"value": parsed}
+    return json.dumps(parsed, ensure_ascii=False)
+
+
+def _normalize_tool_calls(tool_calls: Any) -> list[dict[str, Any]] | None:
+    if tool_calls is None:
+        return None
+    if not isinstance(tool_calls, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        item = dict(tc)
+        fn = item.get("function")
+        if isinstance(fn, dict):
+            fn = dict(fn)
+            fn["arguments"] = _normalize_arguments(fn.get("arguments"))
+            if "name" in fn and fn["name"] is not None:
+                fn["name"] = str(fn["name"])
+            item["function"] = fn
+        out.append(item)
+    return out
+
+
 def _normalize_messages(messages: Any) -> list[dict[str, Any]] | None:
     if not isinstance(messages, list) or not messages:
         return None
@@ -50,6 +101,16 @@ def _normalize_messages(messages: Any) -> list[dict[str, Any]] | None:
             item["content"] = ""
         elif not isinstance(item["content"], str):
             item["content"] = json.dumps(item["content"], ensure_ascii=False)
+        if "tool_calls" in item:
+            normalized_calls = _normalize_tool_calls(item.get("tool_calls"))
+            if normalized_calls is not None:
+                item["tool_calls"] = normalized_calls
+            else:
+                item.pop("tool_calls", None)
+        # Drop null-only noise fields that confuse converters.
+        for key in ("reasoning_content", "name", "tool_call_id"):
+            if key in item and item[key] is None:
+                item.pop(key)
         out.append(item)
     return out
 

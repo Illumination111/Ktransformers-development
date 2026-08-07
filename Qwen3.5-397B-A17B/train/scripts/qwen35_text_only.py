@@ -1,0 +1,272 @@
+"""Force Qwen3.5-MoE multimodal checkpoints into a text-only CausalLM.
+
+Adapted from FFTtest/Qwen3.5-35B-A3B/qwen35_text_only.py.
+
+The local Qwen3.5-397B-A17B checkpoint is packaged as
+``Qwen3_5MoeForConditionalGeneration``.  For text LoRA SFT we load only its
+``text_config`` as ``Qwen3_5MoeForCausalLM``.  Transformers remaps
+``model.language_model.*`` checkpoint keys to ``model.*`` and ignores visual
+and MTP weights — so the vision tower (and its Conv3d) is never constructed.
+
+``freeze_vision_tower: true`` alone is insufficient: a frozen tower still
+contains Conv3d and trips torch 2.9.x guards.
+"""
+
+from __future__ import annotations
+
+import copy
+import os
+from typing import TYPE_CHECKING, Any
+
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel
+
+
+SOURCE_MODEL_TYPE = "qwen3_5_moe"
+SOURCE_ARCHITECTURE = "Qwen3_5MoeForConditionalGeneration"
+TEXT_MODEL_TYPE = "qwen3_5_moe_text"
+TEXT_ARCHITECTURE = "Qwen3_5MoeForCausalLM"
+TEXT_FSDP_LAYER_CLASS = "Qwen3_5MoeDecoderLayer"
+_INSTALLED = False
+
+
+def _enabled(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _text_only_enabled() -> bool:
+    return _enabled(os.environ.get("MLS_TEXT_ONLY")) or _enabled(os.environ.get("FFT_TEXT_ONLY"))
+
+
+def _rank0_print(message: str) -> None:
+    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+        print(message, flush=True)
+
+
+def _extract_text_config(source_config: Any) -> Any:
+    source_type = getattr(source_config, "model_type", None)
+    source_architectures = list(getattr(source_config, "architectures", None) or [])
+    if source_type != SOURCE_MODEL_TYPE or SOURCE_ARCHITECTURE not in source_architectures:
+        raise RuntimeError(
+            "Text-only loading requires a Qwen3.5-MoE multimodal source checkpoint; "
+            f"got model_type={source_type!r}, architectures={source_architectures!r}."
+        )
+
+    source_text_config = getattr(source_config, "text_config", None)
+    if source_text_config is None or getattr(source_text_config, "model_type", None) != TEXT_MODEL_TYPE:
+        raise RuntimeError("The source checkpoint does not expose a Qwen3.5-MoE text_config.")
+
+    text_config = copy.deepcopy(source_text_config)
+    text_config.architectures = [TEXT_ARCHITECTURE]
+    text_config._name_or_path = getattr(source_config, "_name_or_path", "")
+    text_config.tie_word_embeddings = bool(getattr(source_config, "tie_word_embeddings", False))
+    return text_config
+
+
+def assert_text_only_model(model: "PreTrainedModel", finetuning_type: str) -> None:
+    """Fail before optimizer construction if any multimodal component survived."""
+    import torch
+
+    if finetuning_type not in {"full", "lora"}:
+        raise RuntimeError(
+            "Text-only loading supports only full or LoRA fine-tuning, "
+            f"got {finetuning_type!r}."
+        )
+
+    get_base_model = getattr(model, "get_base_model", None)
+    base_model = get_base_model() if callable(get_base_model) else model
+    is_adapter_wrapped = base_model is not model
+    if finetuning_type == "full" and is_adapter_wrapped:
+        raise RuntimeError(
+            "Full fine-tuning unexpectedly constructed an adapter-wrapped model: "
+            f"{type(model).__name__}."
+        )
+    if finetuning_type == "lora" and not is_adapter_wrapped:
+        raise RuntimeError(
+            "LoRA fine-tuning did not construct an adapter-wrapped model; "
+            f"got {type(model).__name__}."
+        )
+
+    model_type = getattr(base_model.config, "model_type", None)
+    architectures = list(getattr(base_model.config, "architectures", None) or [])
+    if model_type != TEXT_MODEL_TYPE or architectures != [TEXT_ARCHITECTURE]:
+        raise RuntimeError(
+            "Text-only model contract failed: "
+            f"model_type={model_type!r}, architectures={architectures!r}."
+        )
+    if type(base_model).__name__ != TEXT_ARCHITECTURE:
+        raise RuntimeError(
+            f"Expected {TEXT_ARCHITECTURE}, but Transformers constructed "
+            f"{type(base_model).__name__} inside {type(model).__name__}."
+        )
+
+    conv3d_modules = [name for name, module in model.named_modules() if isinstance(module, torch.nn.Conv3d)]
+    if conv3d_modules:
+        raise RuntimeError(f"Text-only model unexpectedly contains Conv3d modules: {conv3d_modules[:5]}")
+
+    multimodal_markers = (
+        "visual",
+        "vision_tower",
+        "multi_modal_projector",
+        "image_tower",
+        "video_tower",
+    )
+    multimodal_parameters = [
+        name for name, _ in model.named_parameters() if any(marker in name.lower() for marker in multimodal_markers)
+    ]
+    if multimodal_parameters:
+        raise RuntimeError(
+            "Text-only model unexpectedly contains multimodal parameters: "
+            f"{multimodal_parameters[:5]}"
+        )
+
+    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    total = sum(parameter.numel() for parameter in model.parameters())
+    _rank0_print(
+        "[qwen35_text_only] contract=OK "
+        f"class={type(model).__name__} base_class={type(base_model).__name__} "
+        f"finetuning_type={finetuning_type} model_type={model_type} "
+        f"conv3d=0 multimodal_params=0 trainable={trainable} total={total}"
+    )
+
+
+def _normalize_text_only_distributed_metadata(model: "PreTrainedModel") -> None:
+    """Remove the absent vision block from Transformers' inherited FSDP metadata."""
+    decoder_layer_count = sum(
+        module.__class__.__name__ == TEXT_FSDP_LAYER_CLASS for module in model.modules()
+    )
+    if decoder_layer_count == 0:
+        raise RuntimeError(
+            f"Text-only model does not contain the FSDP wrap class {TEXT_FSDP_LAYER_CLASS}."
+        )
+
+    get_base_model = getattr(model, "get_base_model", None)
+    base_model = get_base_model() if callable(get_base_model) else model
+    metadata_owners = [
+        model,
+        base_model,
+        getattr(base_model, "model", None),
+    ]
+    for owner in metadata_owners:
+        if owner is not None:
+            owner._no_split_modules = [TEXT_FSDP_LAYER_CLASS]
+
+    _rank0_print(
+        "[qwen35_text_only] fsdp_wrap="
+        f"{TEXT_FSDP_LAYER_CLASS} decoder_layers={decoder_layer_count}; vision block excluded"
+    )
+
+
+def _install_deepspeed_leaf_support() -> None:
+    """Teach LLaMA-Factory about the text config's MoE leaf (DeepSpeed Z3)."""
+    from llamafactory.model import patcher
+    from llamafactory.model.model_utils import moe as moe_utils
+
+    original_add_z3_leaf_module = patcher.add_z3_leaf_module
+
+    def add_z3_leaf_module(model: "PreTrainedModel") -> None:
+        if getattr(model.config, "model_type", None) != TEXT_MODEL_TYPE:
+            original_add_z3_leaf_module(model)
+            return
+
+        from transformers.integrations import is_deepspeed_zero3_enabled
+
+        if not is_deepspeed_zero3_enabled():
+            return
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeSparseMoeBlock
+
+        moe_utils._set_z3_leaf_modules(model, [Qwen3_5MoeSparseMoeBlock])
+
+    patcher.add_z3_leaf_module = add_z3_leaf_module
+
+
+def _strip_qwen35_mm_plugin() -> None:
+    """Keep qwen3_5 tool formatting but drop the vision mm_plugin (needs processor)."""
+    from llamafactory.data.mm_plugin import get_mm_plugin
+    from llamafactory.data.template import TEMPLATES
+
+    base_plugin = get_mm_plugin(name="base")
+    for name in ("qwen3_5", "qwen3_5_nothink"):
+        template = TEMPLATES.get(name)
+        if template is None:
+            continue
+        template.mm_plugin = base_plugin
+        _rank0_print(f"[qwen35_text_only] template={name} mm_plugin=base (vision disabled)")
+
+
+def install_text_only_loading() -> None:
+    """Install the strict text-only loader before LLaMA-Factory builds the model."""
+    global _INSTALLED
+    if _INSTALLED:
+        return
+    if not _text_only_enabled():
+        raise RuntimeError("MLS_TEXT_ONLY=1 (or FFT_TEXT_ONLY=1) is required for text-only Qwen3.5 loading.")
+
+    import llamafactory.model as model_api
+    from llamafactory.model import loader
+    from transformers import AutoConfig, AutoTokenizer
+
+    original_load_model = loader.load_model
+
+    def load_text_config(model_args: Any) -> Any:
+        init_kwargs = loader._get_init_kwargs(model_args)
+        source_config = AutoConfig.from_pretrained(model_args.model_name_or_path, **init_kwargs)
+        text_config = _extract_text_config(source_config)
+        _rank0_print(
+            "[qwen35_text_only] source="
+            f"{SOURCE_ARCHITECTURE} -> load={TEXT_ARCHITECTURE}; visual and MTP weights excluded"
+        )
+        return text_config
+
+    def load_text_tokenizer(model_args: Any) -> dict[str, Any]:
+        init_kwargs = loader._get_init_kwargs(model_args)
+        attempts = [model_args.use_fast_tokenizer, not model_args.use_fast_tokenizer]
+        tokenizer = None
+        last_error: Exception | None = None
+        for use_fast in dict.fromkeys(attempts):
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_args.model_name_or_path,
+                    use_fast=use_fast,
+                    split_special_tokens=model_args.split_special_tokens,
+                    padding_side="right",
+                    **init_kwargs,
+                )
+                break
+            except Exception as error:
+                last_error = error
+        if tokenizer is None:
+            raise OSError("Failed to load the text tokenizer.") from last_error
+
+        loader.patch_tokenizer(tokenizer, model_args)
+        _rank0_print("[qwen35_text_only] tokenizer loaded; AutoProcessor disabled")
+        return {"tokenizer": tokenizer, "processor": None}
+
+    def load_text_model(
+        tokenizer: Any,
+        model_args: Any,
+        finetuning_args: Any,
+        is_trainable: bool = False,
+        add_valuehead: bool = False,
+    ) -> "PreTrainedModel":
+        model = original_load_model(
+            tokenizer,
+            model_args,
+            finetuning_args,
+            is_trainable=is_trainable,
+            add_valuehead=add_valuehead,
+        )
+        assert_text_only_model(model, str(finetuning_args.finetuning_type))
+        _normalize_text_only_distributed_metadata(model)
+        return model
+
+    loader.load_config = load_text_config
+    loader.load_tokenizer = load_text_tokenizer
+    loader.load_model = load_text_model
+    model_api.load_config = load_text_config
+    model_api.load_tokenizer = load_text_tokenizer
+    model_api.load_model = load_text_model
+    _install_deepspeed_leaf_support()
+    _strip_qwen35_mm_plugin()
+    _INSTALLED = True

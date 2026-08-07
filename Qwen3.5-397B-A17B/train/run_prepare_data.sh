@@ -9,6 +9,10 @@
 
 set -euo pipefail
 
+# Log / filename timestamps use China local time (script-only; host TZ unchanged).
+export MLS_TIMEZONE="${MLS_TIMEZONE:-Asia/Shanghai}"
+export TZ="${MLS_TIMEZONE}"
+
 TRAIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${TRAIN_DIR}/configs/default_env.sh"

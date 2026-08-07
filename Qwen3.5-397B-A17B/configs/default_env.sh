@@ -1,6 +1,10 @@
 # Shared defaults for Qwen3.5-397B-A17B multi-LoRA serving (M1/M2) tests.
 # Sourced by run_*.sh; override via CLI flags or environment variables.
 
+# Display / log timestamps in China local time (does NOT change host timezone).
+export MLS_TIMEZONE="${MLS_TIMEZONE:-Asia/Shanghai}"
+export TZ="${MLS_TIMEZONE}"
+
 MLS_ROOT="${MLS_ROOT:-/mnt/data2/wbw/MLStest}"
 MODEL_CASE_DIR="${MODEL_CASE_DIR:-${MLS_ROOT}/Qwen3.5-397B-A17B}"
 
