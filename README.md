@@ -1,6 +1,6 @@
 # Multi-LoRA Serving test for KT
 
-面向 **sglang-kt / KTransformers** 的 Multi-LoRA Serving（MLS）测试工程：在 **Qwen3.5-397B-A17B** 上覆盖同进程多 adapter 服务（M1 / M2），以及基于 Nemotron SFT 的 LoRA 训练与 KT composite 转换。
+面向 **sglang-kt / KTransformers** 的 Multi-LoRA Serving（MLS）测试工程：在 **Qwen3.5-397B-A17B** 与 **Qwen3.5-35B-A3B** 上覆盖同进程多 adapter 服务（M1 / M2），以及基于 Nemotron SFT 的 LoRA 训练与 KT composite 转换。两套 case 目录同构，仅模型路径 / 端口 / adapter 输出目录不同。
 
 仓库：<https://github.com/Illumination111/Multi-LoRA-Serving-test-for-KT>
 
@@ -15,7 +15,8 @@
 
 更细的协议与踩坑见：
 
-- [`docs/task_bash_Qwen3.5-397B-A17B.md`](docs/task_bash_Qwen3.5-397B-A17B.md) — 起服 / client / e2e
+- [`docs/task_bash_Qwen3.5-397B-A17B.md`](docs/task_bash_Qwen3.5-397B-A17B.md) — 397B 起服 / client / e2e
+- [`docs/task_bash_Qwen3.5-35B-A3B.md`](docs/task_bash_Qwen3.5-35B-A3B.md) — 35B 起服 / client / e2e / 训练
 - [`docs/progress-of-MLS.md`](docs/progress-of-MLS.md) — MLS 进度与结论
 
 ### 目录布局
@@ -23,14 +24,13 @@
 ```text
 MLStest/
   README.md
-  docs/                          # 任务说明与进度
-  dataset/                       # HF 原始数据目录（仅路径/脚本入库，权重不上传）
-    download.sh
-    Nemotron-SFT-CUDA-v1/
-    Nemotron-SFT-SWE-v3/
-    Nemotron-SFT-Competitive-Programming-v2/
-  lora-adapter/                  # 转换后的 serving composite（权重不上传）
-  Qwen3.5-397B-A17B/
+  docs/
+  dataset/                       # 两套模型共用 HF 原始数据
+  lora-adapter/
+    Qwen3.5-397B-A17B/{cuda,swe,cpp}/
+    Qwen3.5-35B-A3B/{cuda,swe,cpp}/
+  Qwen3.5-397B-A17B/             # 默认端口 31006
+  Qwen3.5-35B-A3B/               # 默认端口 31007；脚本与 397B 同构
     run_multi_lora_m1_serve.sh
     run_multi_lora_m1_client.sh
     run_multi_lora_m2_client_concurrent.sh
@@ -39,20 +39,22 @@ MLStest/
     train/
       run_prepare_data.sh
       run_train_lora.sh
-      configs/                    # accelerate + train yaml
-      data/dataset_info.json     # LLaMA-Factory 注册（jsonl 本地生成）
-      scripts/                   # prepare / text-only train / convert
+      configs/
+      data/dataset_info.json
+      scripts/
 ```
 
 ### 环境依赖（默认路径可覆盖）
 
-| 角色 | 默认 |
-|---|---|
-| Serving conda | `kt-kernel`（`MLS_CONDA_ENV`） |
-| Train conda | `Kllama`（含 LLaMA-Factory） |
-| Base 模型 | `/mnt/data2/models/Qwen3.5-397B-A17B`（`MODEL_PATH`） |
-| KT 权重包 | `KT_WEIGHT_PATH`（必须显式指定已验证包） |
-| KTransformers | `/mnt/data2/wbw/ktransformers`（`KTRANSFORMERS_ROOT`） |
+| 角色 | 397B 默认 | 35B 默认 |
+|---|---|---|
+| Serving conda | `kt-kernel` | 同左 |
+| Train conda | `Kllama` | 同左 |
+| Base 模型 | `/mnt/data2/models/Qwen3.5-397B-A17B` | `/mnt/data3/models/Qwen3.5-35B-A3B` |
+| 默认端口 | `31006` | `31007` |
+| Adapter 输出 | `lora-adapter/Qwen3.5-397B-A17B/` | `lora-adapter/Qwen3.5-35B-A3B/` |
+| KT 权重包 | `KT_WEIGHT_PATH`（必须显式指定） | 同左（**各自**已验证的 35B/397B 包） |
+| KTransformers | `/mnt/data2/wbw/ktransformers` | 同左 |
 
 所有脚本均可通过环境变量覆盖本机路径，见各 `configs/default_env.sh`。
 
@@ -83,26 +85,24 @@ bash dataset/download.sh cuda     # 单个任务
 
 ## 数据集转换
 
-将 HF 原始数据转为 LLaMA-Factory **openai** 格式 jsonl，并写入 `train/data/dataset_info.json`。
+将 HF 原始数据转为 LLaMA-Factory **openai** 格式 jsonl，并写入各 case 的 `train/data/dataset_info.json`。原始数据目录 `dataset/` **两套模型共用**；prepared jsonl 按 case 分目录（35B 可对已有 397B jsonl 做软链复用）。
 
 ```bash
+# 任选一个 case（命令相同）
 cd Qwen3.5-397B-A17B/train
+# 或
+cd Qwen3.5-35B-A3B/train
 
-# 三个任务全部转换
-bash run_prepare_data.sh
-
-# 单个 / 多个
+bash run_prepare_data.sh              # cuda + swe + cpp
 bash run_prepare_data.sh cuda
 bash run_prepare_data.sh swe cpp
-
-# 限制条数（调试）
 MAX_SAMPLES=1000 bash run_prepare_data.sh cuda
 ```
 
 输出（默认，可被 `DATASET_DIR` 覆盖）：
 
 ```text
-Qwen3.5-397B-A17B/train/data/
+<case>/train/data/
   dataset_info.json          # 已入库
   nemotron_cuda.jsonl        # 本地生成，gitignore
   nemotron_swe.jsonl
@@ -124,25 +124,22 @@ Qwen3.5-397B-A17B/train/data/
 1. （可选）调用 `run_prepare_data.sh` 生成 jsonl  
 2. 以 **text-only** 方式加载 `Qwen3_5MoeForCausalLM`（`text_config`，不建 visual/Conv3d）  
 3. 8 卡 FSDP2 + KT LoRA SFT  
-4. （可选）将 run 目录转为 sglang-kt composite → `lora-adapter/Qwen3.5-397B-A17B/<task>/`
+4. （可选）将 run 目录转为 sglang-kt composite → `lora-adapter/<model>/<task>/`
+
+**35B 必须重新训练**（不可复用 397B 的 adapter 权重）；YAML / 三数据集配置与 397B 一致，仅 `model_name_or_path` 与输出路径不同。
 
 ```bash
+# 397B
 cd Qwen3.5-397B-A17B/train
+# 35B（模型在 /mnt/data3/models/Qwen3.5-35B-A3B）
+cd Qwen3.5-35B-A3B/train
 
-# 准备数据后训练某一任务
 bash run_prepare_data.sh cuda
 bash run_train_lora.sh cuda
 
-# 数据已就绪时跳过 prepare
 SKIP_PREPARE=1 bash run_train_lora.sh swe
-
-# 顺序训练全部（缺 jsonl 的任务会失败并跳过逻辑以脚本为准）
 bash run_train_lora.sh all
-
-# 冒烟：少样本 + 少步
 bash run_train_lora.sh cuda max_samples=64 max_steps=20
-
-# 跳过转换 / 强制重做 prepare
 SKIP_CONVERT=1 bash run_train_lora.sh cuda
 FORCE_PREPARE=1 bash run_train_lora.sh cuda
 ```
@@ -179,28 +176,29 @@ bash scripts/convert_kt_adapter.sh \
 ## Serving 快速上手
 
 ```bash
+# 397B（默认端口 31006）
 cd Qwen3.5-397B-A17B
+# 35B（默认端口 31007）
+cd Qwen3.5-35B-A3B
 
-# Dry-run（不加载模型）
 bash run_multi_lora_m1_serve.sh \
-  --kt-weight-path /path/to/verified-kt-weights \
+  --kt-weight-path /path/to/verified-kt-weights-for-this-base \
   --lora-paths L0=/path/to/cuda,L1=/path/to/swe \
-  --devices 0,1,2,3,4,5,6,7 --tp-size 8 --port 31006 --dry-run
+  --devices 0,1,2,3,4,5,6,7 --tp-size 8 --dry-run
 
-# E2E：起服 → smoke → 停服
 bash run_multi_lora_m1_e2e.sh \
-  --kt-weight-path /path/to/verified-kt-weights \
+  --kt-weight-path /path/to/verified-kt-weights-for-this-base \
   --lora-paths cuda=/path/to/cuda,swe=/path/to/swe \
-  --devices 0,1,2,3,4,5,6,7 --tp-size 8 --port 31006
+  --devices 0,1,2,3,4,5,6,7 --tp-size 8
 ```
 
-M2 并发 client：
+M2 并发 client（对已起服实例）：
 
 ```bash
-bash run_multi_lora_m2_client_concurrent.sh --base-url http://127.0.0.1:31006
+bash run_multi_lora_m2_client_concurrent.sh --host 127.0.0.1 --port 31007 --adapters cuda,swe,cpp
 ```
 
-完整参数与硬约束见 [`docs/task_bash_Qwen3.5-397B-A17B.md`](docs/task_bash_Qwen3.5-397B-A17B.md)。
+完整参数见对应 `docs/task_bash_Qwen3.5-*.md`。
 
 ---
 

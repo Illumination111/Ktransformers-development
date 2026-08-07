@@ -57,3 +57,6 @@ _hf_size_*.txt
 
 # Local serve/client run logs
 **/test_log/
+
+# Backup copies made while hand-patching adapters (can be multi-GB)
+*.bak

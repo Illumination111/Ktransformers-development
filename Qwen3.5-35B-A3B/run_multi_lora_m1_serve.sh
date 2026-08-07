@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch sglang-kt multi-LoRA serving (M1) for Qwen3.5-397B-A17B.
+# Launch sglang-kt multi-LoRA serving (M1) for Qwen3.5-35B-A3B.
 # M1 contract: multiple composite adapters resident; max_loras_per_batch=1.
 
 set -Eeuo pipefail
@@ -18,15 +18,15 @@ usage() {
     cat <<EOF
 Usage: bash $(basename "$0") [options]
 
-Launch Qwen3.5-397B-A17B multi-LoRA serving under the M1 contract:
+Launch Qwen3.5-35B-A3B multi-LoRA serving under the M1 contract:
   - multiple merged KT composite adapters via --lora-paths
   - M1 (default): --kt-lora-dispatch single, --max-loras-per-batch 1
   - M2: --kt-lora-dispatch grouped, --kt-max-loras-per-batch N (N concurrent adapters/batch)
   - --kt-num-gpu-experts 0, --disable-cuda-graph
-  - dense LoRA backend: triton (397B correctness baseline)
+  - dense LoRA backend: triton (35B correctness baseline)
 
 Required:
-  --kt-weight-path PATH     Verified KT CPU expert weight pack for 397B
+  --kt-weight-path PATH     Verified KT CPU expert weight pack for 35B
   --lora-paths LIST         Comma-separated name=path pairs
                             Example: L0=/data/L0,L1=/data/L1
 
@@ -58,7 +58,7 @@ Options:
   -h, --help                Show this help
 
 Environment overrides: MODEL_PATH, KT_WEIGHT_PATH, LORA_PATHS, PORT, etc.
-See: ${MLS_ROOT}/docs/task_bash_Qwen3.5-397B-A17B.md
+See: ${MLS_ROOT}/docs/task_bash_Qwen3.5-35B-A3B.md
 EOF
 }
 
@@ -128,7 +128,7 @@ else
 fi
 
 if [[ -z "${KT_WEIGHT_PATH}" ]]; then
-    printf 'ERROR: --kt-weight-path is required (verified KT expert pack for 397B).\n' >&2
+    printf 'ERROR: --kt-weight-path is required (verified KT expert pack for 35B).\n' >&2
     exit 2
 fi
 if [[ -z "${LORA_PATHS}" ]]; then

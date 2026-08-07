@@ -4,8 +4,9 @@
 
 ```text
 lora-adapter/Qwen3.5-397B-A17B/<cuda|swe|cpp>/
+lora-adapter/Qwen3.5-35B-A3B/<cuda|swe|cpp>/
   adapter_config.json
   adapter_model.safetensors
 ```
 
-仓库只保留目录占位，**不上传** `.safetensors` 权重。
+各 base 必须用**自己**训练出的 composite；仓库只保留目录占位，**不上传** `.safetensors` 权重。
