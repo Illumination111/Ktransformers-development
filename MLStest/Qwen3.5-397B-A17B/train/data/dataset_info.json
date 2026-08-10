@@ -1,0 +1,53 @@
+{
+  "nemotron_cuda": {
+    "file_name": "nemotron_cuda.jsonl",
+    "formatting": "openai",
+    "columns": {
+      "messages": "messages",
+      "tools": "tools"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant",
+      "observation_tag": "tool",
+      "function_tag": "function",
+      "system_tag": "system"
+    }
+  },
+  "nemotron_swe": {
+    "file_name": "nemotron_swe.jsonl",
+    "formatting": "openai",
+    "columns": {
+      "messages": "messages",
+      "tools": "tools"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant",
+      "observation_tag": "tool",
+      "function_tag": "function",
+      "system_tag": "system"
+    }
+  },
+  "nemotron_cpp": {
+    "file_name": "nemotron_cpp.jsonl",
+    "formatting": "openai",
+    "columns": {
+      "messages": "messages",
+      "tools": "tools"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant",
+      "observation_tag": "tool",
+      "function_tag": "function",
+      "system_tag": "system"
+    }
+  }
+}

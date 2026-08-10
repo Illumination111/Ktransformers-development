@@ -1,0 +1,52 @@
+### model
+model_name_or_path: /mnt/data3/models/Qwen3.5-35B-A3B
+trust_remote_code: true
+# Text-only (FFTtest-style): run_train_lora.sh sets MLS_TEXT_ONLY=1 and loads
+# Qwen3_5MoeForCausalLM from text_config — visual/MTP never constructed.
+# freeze_vision_tower alone is insufficient (frozen Conv3d still trips torch 2.9).
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,in_proj_qkv,in_proj_z,in_proj_b,in_proj_a,out_proj
+
+### dataset
+dataset_dir: /mnt/data2/wbw/MLStest/Qwen3.5-35B-A3B/train/data
+dataset: nemotron_cuda
+# Keep qwen3_5 tool format; text-only entry strips the vision mm_plugin.
+template: qwen3_5
+cutoff_len: 2048
+# CUDA-v1 is small (~2k); keep all by default
+max_samples: 100000
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+
+### output
+output_dir: /mnt/data2/wbw/MLStest/Qwen3.5-35B-A3B/train/runs/nemotron_cuda
+logging_steps: 10
+save_steps: 200
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false
+report_to: none
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 1.0e-4
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+bf16: true
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+
+### ktransformers
+use_kt: true
+# Pair with configs/accelerate_fsdp2_kt_bf16_8gpu.yaml for original BF16 experts.
+# For pre-converted INT8 experts, set kt_weight_path and use accelerate_fsdp2_kt_int8_8gpu.yaml.
+# kt_weight_path: /path/to/Qwen3.5-35B-A3B-AMXINT8
