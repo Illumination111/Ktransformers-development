@@ -7,6 +7,25 @@ import os
 from collections import deque
 from typing import Any
 
+from transformers import TrainerCallback
+
+from load_conv3d_compat import load_conv3d_compat
+
+
+def to_local_tensor(tensor: Any) -> Any:
+    """Return a regular tensor or the current-rank shard of an FSDP2 DTensor."""
+    try:
+        from torch.distributed.tensor import DTensor
+    except ImportError:
+        pass
+    else:
+        if isinstance(tensor, DTensor):
+            tensor = tensor.to_local()
+    wait = getattr(tensor, "wait", None)
+    if callable(wait):
+        tensor = wait()
+    return tensor
+
 
 def iter_modules(root: Any):
     queue = deque([root])
@@ -23,45 +42,224 @@ def iter_modules(root: Any):
                 queue.append(child)
 
 
-def assert_vlm_contract(model: Any) -> None:
+def assert_vlm_contract(model: Any) -> Any:
     import torch
 
     if os.getenv("FFT_TEXT_ONLY"):
         raise RuntimeError("FFT_TEXT_ONLY must not be set for the VLM test")
     nodes = list(iter_modules(model))
     conditional = next(
-        (node for node in nodes if type(node).__name__ == "Qwen3_5MoeForConditionalGeneration"), None
+        (
+            node
+            for node in nodes
+            if type(node).__name__ == "Qwen3_5MoeForConditionalGeneration"
+        ),
+        None,
     )
     if conditional is None:
-        raise RuntimeError("full Qwen3_5MoeForConditionalGeneration was not constructed")
+        raise RuntimeError(
+            "full Qwen3_5MoeForConditionalGeneration was not constructed"
+        )
     if getattr(conditional.config, "model_type", None) != "qwen3_5_moe":
-        raise RuntimeError(f"unexpected model type: {getattr(conditional.config, 'model_type', None)!r}")
+        raise RuntimeError(
+            f"unexpected model type: {getattr(conditional.config, 'model_type', None)!r}"
+        )
     visual = getattr(getattr(conditional, "model", None), "visual", None)
     language = getattr(getattr(conditional, "model", None), "language_model", None)
     if visual is None or language is None:
-        raise RuntimeError("full VLM must retain both model.visual and model.language_model")
-    conv3d = [name for name, module in visual.named_modules() if isinstance(module, torch.nn.Conv3d)]
+        raise RuntimeError(
+            "full VLM must retain both model.visual and model.language_model"
+        )
+    conv3d = [
+        name
+        for name, module in visual.named_modules()
+        if isinstance(module, torch.nn.Conv3d)
+    ]
     if conv3d != ["patch_embed.proj"]:
         raise RuntimeError(f"unexpected vision Conv3D modules: {conv3d}")
-    visual_trainable = [name for name, param in visual.named_parameters() if param.requires_grad]
+    compatibility = load_conv3d_compat().enable_swift_conv3d_patch()
+    if (
+        compatibility.required
+        and not load_conv3d_compat().is_swift_conv3d_patch_active()
+    ):
+        raise RuntimeError(
+            "the ms-swift Conv3D patch is not active in this training rank"
+        )
+    visual_trainable = [
+        name for name, param in visual.named_parameters() if param.requires_grad
+    ]
     if visual_trainable:
         raise RuntimeError(f"vision tower is not frozen: {visual_trainable[:5]}")
-    lora_params = [name for name, param in model.named_parameters() if "lora_" in name and param.requires_grad]
+    lora_params = [
+        name
+        for name, param in model.named_parameters()
+        if "lora_" in name and param.requires_grad
+    ]
     if not lora_params:
         raise RuntimeError("no trainable LoRA parameters were created")
-    bad_lora = [name for name in lora_params if ".visual." in name or name.startswith("visual.")]
+    bad_lora = [
+        name for name in lora_params if ".visual." in name or name.startswith("visual.")
+    ]
     if bad_lora:
         raise RuntimeError(f"LoRA leaked into the frozen vision tower: {bad_lora[:5]}")
     wrapper_owners = [node for node in nodes if getattr(node, "_kt_wrappers", None)]
     wrapper_count = max((len(node._kt_wrappers) for node in wrapper_owners), default=0)
     if wrapper_count != 48:
         raise RuntimeError(f"expected 48 KT-wrapped MoE layers, got {wrapper_count}")
+    conditional._qwen35_vlm_vision_forward_count = 0
+
+    def record_vision_forward(_module, _inputs, _output):
+        conditional._qwen35_vlm_vision_forward_count += 1
+
+    getattr(visual.patch_embed, "proj").register_forward_hook(record_vision_forward)
     print(
         "[qwen35_vlm_contract] OK "
         f"class={type(conditional).__name__} conv3d={conv3d} visual_trainable=0 "
-        f"trainable_lora={len(lora_params)} kt_wrappers={wrapper_count}",
+        f"trainable_lora={len(lora_params)} kt_wrappers={wrapper_count} "
+        f"swift_conv3d_patch={'active' if compatibility.required else 'not_required'}",
         flush=True,
     )
+    return conditional
+
+
+class VLMFunctionalCallback(TrainerCallback):
+    """Fail unless a real image batch drives LoRA gradient and optimizer paths."""
+
+    def __init__(self) -> None:
+        self.gradient_checked = False
+        self.optimizer_steps = 0
+        self.last_vision_forward_count = 0
+        self.parameter_snapshot: tuple[str, Any] | None = None
+
+    @staticmethod
+    def _named_parameters(model: Any) -> dict[str, Any]:
+        return dict(model.named_parameters())
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        import torch
+
+        model = kwargs["model"]
+        nodes = list(iter_modules(model))
+        conditional = next(
+            (
+                node
+                for node in nodes
+                if type(node).__name__ == "Qwen3_5MoeForConditionalGeneration"
+            ),
+            None,
+        )
+        if conditional is None:
+            raise RuntimeError(
+                "functional callback cannot find the Qwen3.5 conditional-generation model"
+            )
+        vision_forward_count = getattr(
+            conditional, "_qwen35_vlm_vision_forward_count", 0
+        )
+        if vision_forward_count <= self.last_vision_forward_count:
+            raise RuntimeError(
+                "this optimizer step received no new image batch at "
+                "model.visual.patch_embed.proj"
+            )
+        self.last_vision_forward_count = vision_forward_count
+
+        params = self._named_parameters(model)
+        sampled_lora = None
+        inspected_lora_grads = 0
+        for name, parameter in params.items():
+            if (
+                "lora_" not in name
+                or not parameter.requires_grad
+                or parameter.grad is None
+            ):
+                continue
+            inspected_lora_grads += 1
+            local_grad = to_local_tensor(parameter.grad).detach()
+            if local_grad.numel() == 0:
+                continue
+            if not torch.isfinite(local_grad).all().item():
+                raise RuntimeError(f"non-finite LoRA gradient: {name}")
+            if local_grad.ne(0).any().item():
+                sampled_lora = (name, parameter)
+                break
+        if sampled_lora is None:
+            raise RuntimeError(
+                "no trainable LoRA parameter received a non-zero gradient"
+            )
+
+        visual = conditional.model.visual
+        visual_grads = [
+            name
+            for name, parameter in visual.named_parameters()
+            if parameter.grad is not None
+        ]
+        if visual_grads:
+            raise RuntimeError(
+                f"frozen vision tower unexpectedly received gradients: {visual_grads[:5]}"
+            )
+
+        snapshot_name, snapshot_parameter = sampled_lora
+        self.parameter_snapshot = (
+            snapshot_name,
+            to_local_tensor(snapshot_parameter).detach().float().cpu().clone(),
+        )
+        self.gradient_checked = True
+        print(
+            "[qwen35_vlm_functional] GRADIENT_OK "
+            f"vision_forwards={vision_forward_count} "
+            f"inspected_lora_grads={inspected_lora_grads} sample={snapshot_name}",
+            flush=True,
+        )
+
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        import torch
+
+        self.optimizer_steps += 1
+        if self.parameter_snapshot is None:
+            raise RuntimeError(
+                "optimizer step occurred before the LoRA gradient contract was checked"
+            )
+        name, before = self.parameter_snapshot
+        current = self._named_parameters(kwargs["model"]).get(name)
+        if current is None:
+            raise RuntimeError(
+                f"sampled LoRA parameter disappeared before optimizer step: {name}"
+            )
+        after = to_local_tensor(current).detach().float().cpu()
+        if after.shape != before.shape:
+            raise RuntimeError(
+                f"LoRA local shard changed shape for {name}: "
+                f"before={tuple(before.shape)}, after={tuple(after.shape)}"
+            )
+        if after.numel() == 0:
+            raise RuntimeError(
+                f"sampled LoRA parameter has an empty local shard: {name}"
+            )
+        delta = float((after - before).abs().max().item())
+        if not torch.isfinite(torch.tensor(delta)) or delta == 0.0:
+            raise RuntimeError(
+                f"LoRA optimizer step did not update {name}: max_abs_delta={delta}"
+            )
+        print(
+            f"[qwen35_vlm_functional] OPTIMIZER_OK parameter={name} max_abs_delta={delta:.6e}",
+            flush=True,
+        )
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if (
+            not self.gradient_checked
+            or self.optimizer_steps < 1
+            or state.global_step < 1
+        ):
+            raise RuntimeError(
+                "incomplete VLM functional validation: "
+                f"gradient_checked={self.gradient_checked}, optimizer_steps={self.optimizer_steps}, "
+                f"global_step={state.global_step}"
+            )
+        print(
+            "[qwen35_vlm_functional] PASS "
+            f"optimizer_steps={self.optimizer_steps} global_step={state.global_step}",
+            flush=True,
+        )
 
 
 def install_contract() -> None:
@@ -80,10 +278,12 @@ def install_contract() -> None:
 
 
 def main() -> None:
+    compatibility = load_conv3d_compat().enable_swift_conv3d_patch()
+    print(f"[qwen35_vlm_conv3d] {compatibility.to_dict()}", flush=True)
     install_contract()
     from llamafactory.train.tuner import run_exp
 
-    run_exp()
+    run_exp(callbacks=[VLMFunctionalCallback()])
 
 
 if __name__ == "__main__":
