@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LLaMA-Factory entrypoint that asserts the VLM/KT/frozen-tower contract."""
+"""LLaMA-Factory entrypoint that asserts the scoped VLM LoRA/KT contract."""
 
 from __future__ import annotations
 
@@ -10,6 +10,26 @@ from typing import Any
 from transformers import TrainerCallback
 
 from load_conv3d_compat import load_conv3d_compat
+
+
+VALID_LORA_SCOPES = ("text", "vision", "all")
+
+
+def get_lora_scope() -> str:
+    scope = os.getenv("VLM_LORA_SCOPE", "text").lower()
+    if scope not in VALID_LORA_SCOPES:
+        raise RuntimeError(
+            f"VLM_LORA_SCOPE must be one of {VALID_LORA_SCOPES}, got {scope!r}"
+        )
+    return scope
+
+
+def is_visual_lora(name: str) -> bool:
+    return ".visual." in name or name.startswith("visual.")
+
+
+def required_lora_groups(scope: str) -> tuple[str, ...]:
+    return ("text", "vision") if scope == "all" else (scope,)
 
 
 def to_local_tensor(tensor: Any) -> Any:
@@ -45,6 +65,7 @@ def iter_modules(root: Any):
 def assert_vlm_contract(model: Any) -> Any:
     import torch
 
+    scope = get_lora_scope()
     if os.getenv("FFT_TEXT_ONLY"):
         raise RuntimeError("FFT_TEXT_ONLY must not be set for the VLM test")
     nodes = list(iter_modules(model))
@@ -77,19 +98,27 @@ def assert_vlm_contract(model: Any) -> Any:
     ]
     if conv3d != ["patch_embed.proj"]:
         raise RuntimeError(f"unexpected vision Conv3D modules: {conv3d}")
-    compatibility = load_conv3d_compat().enable_swift_conv3d_patch()
-    if (
-        compatibility.required
-        and not load_conv3d_compat().is_swift_conv3d_patch_active()
-    ):
+    compatibility_api = load_conv3d_compat()
+    torch_version = torch.__version__
+    torch_base_version = tuple(
+        int(part) for part in torch_version.split("+", 1)[0].split(".")[:2]
+    )
+    compatibility_required = torch_base_version == (2, 9)
+    compatibility_active = compatibility_api.is_swift_conv3d_patch_active()
+    compatibility_api.validate_swift_conv3d_modules(visual)
+    if compatibility_required and not compatibility_active:
         raise RuntimeError(
-            "the ms-swift Conv3D patch is not active in this training rank"
+            "LLaMA-Factory did not automatically activate the KT/ms-swift "
+            "Conv3D compatibility layer in this training rank"
         )
     visual_trainable = [
         name for name, param in visual.named_parameters() if param.requires_grad
     ]
-    if visual_trainable:
-        raise RuntimeError(f"vision tower is not frozen: {visual_trainable[:5]}")
+    visual_base_trainable = [name for name in visual_trainable if "lora_" not in name]
+    if visual_base_trainable:
+        raise RuntimeError(
+            f"visual base parameters are trainable: {visual_base_trainable[:5]}"
+        )
     lora_params = [
         name
         for name, param in model.named_parameters()
@@ -97,11 +126,20 @@ def assert_vlm_contract(model: Any) -> Any:
     ]
     if not lora_params:
         raise RuntimeError("no trainable LoRA parameters were created")
-    bad_lora = [
-        name for name in lora_params if ".visual." in name or name.startswith("visual.")
-    ]
-    if bad_lora:
-        raise RuntimeError(f"LoRA leaked into the frozen vision tower: {bad_lora[:5]}")
+    visual_lora = [name for name in lora_params if is_visual_lora(name)]
+    text_lora = [name for name in lora_params if not is_visual_lora(name)]
+    if scope == "text" and (not text_lora or visual_lora):
+        raise RuntimeError(
+            f"text scope mismatch: text_lora={len(text_lora)}, visual_lora={len(visual_lora)}"
+        )
+    if scope == "vision" and (not visual_lora or text_lora):
+        raise RuntimeError(
+            f"vision scope mismatch: text_lora={len(text_lora)}, visual_lora={len(visual_lora)}"
+        )
+    if scope == "all" and (not text_lora or not visual_lora):
+        raise RuntimeError(
+            f"all scope requires both modalities: text={len(text_lora)}, vision={len(visual_lora)}"
+        )
     wrapper_owners = [node for node in nodes if getattr(node, "_kt_wrappers", None)]
     wrapper_count = max((len(node._kt_wrappers) for node in wrapper_owners), default=0)
     if wrapper_count != 48:
@@ -114,9 +152,16 @@ def assert_vlm_contract(model: Any) -> Any:
     getattr(visual.patch_embed, "proj").register_forward_hook(record_vision_forward)
     print(
         "[qwen35_vlm_contract] OK "
-        f"class={type(conditional).__name__} conv3d={conv3d} visual_trainable=0 "
-        f"trainable_lora={len(lora_params)} kt_wrappers={wrapper_count} "
-        f"swift_conv3d_patch={'active' if compatibility.required else 'not_required'}",
+        f"class={type(conditional).__name__} scope={scope} conv3d={conv3d} "
+        f"text_lora={len(text_lora)} visual_lora={len(visual_lora)} "
+        f"visual_base_trainable=0 kt_wrappers={wrapper_count} "
+        f"swift_conv3d_patch={'active' if compatibility_required else 'not_required'}",
+        flush=True,
+    )
+    print(
+        "[qwen35_vlm_conv3d] "
+        f"required={compatibility_required} active={compatibility_active} "
+        f"torch={torch_version}",
         flush=True,
     )
     return conditional
@@ -126,10 +171,11 @@ class VLMFunctionalCallback(TrainerCallback):
     """Fail unless a real image batch drives LoRA gradient and optimizer paths."""
 
     def __init__(self) -> None:
+        self.lora_scope = get_lora_scope()
         self.gradient_checked = False
         self.optimizer_steps = 0
         self.last_vision_forward_count = 0
-        self.parameter_snapshot: tuple[str, Any] | None = None
+        self.parameter_snapshots: dict[str, tuple[str, Any]] = {}
 
     @staticmethod
     def _named_parameters(model: Any) -> dict[str, Any]:
@@ -163,7 +209,7 @@ class VLMFunctionalCallback(TrainerCallback):
         self.last_vision_forward_count = vision_forward_count
 
         params = self._named_parameters(model)
-        sampled_lora = None
+        sampled_lora: dict[str, tuple[str, Any]] = {}
         inspected_lora_grads = 0
         for name, parameter in params.items():
             if (
@@ -179,34 +225,43 @@ class VLMFunctionalCallback(TrainerCallback):
             if not torch.isfinite(local_grad).all().item():
                 raise RuntimeError(f"non-finite LoRA gradient: {name}")
             if local_grad.ne(0).any().item():
-                sampled_lora = (name, parameter)
-                break
-        if sampled_lora is None:
+                group = "vision" if is_visual_lora(name) else "text"
+                sampled_lora.setdefault(group, (name, parameter))
+        missing_groups = [
+            group
+            for group in required_lora_groups(self.lora_scope)
+            if group not in sampled_lora
+        ]
+        if missing_groups:
             raise RuntimeError(
-                "no trainable LoRA parameter received a non-zero gradient"
+                f"LoRA groups received no non-zero gradient: {missing_groups}"
             )
 
         visual = conditional.model.visual
-        visual_grads = [
+        visual_base_grads = [
             name
             for name, parameter in visual.named_parameters()
-            if parameter.grad is not None
+            if "lora_" not in name and parameter.grad is not None
         ]
-        if visual_grads:
+        if visual_base_grads:
             raise RuntimeError(
-                f"frozen vision tower unexpectedly received gradients: {visual_grads[:5]}"
+                f"visual base parameters received gradients: {visual_base_grads[:5]}"
             )
 
-        snapshot_name, snapshot_parameter = sampled_lora
-        self.parameter_snapshot = (
-            snapshot_name,
-            to_local_tensor(snapshot_parameter).detach().float().cpu().clone(),
-        )
+        self.parameter_snapshots = {
+            group: (name, to_local_tensor(parameter).detach().float().cpu().clone())
+            for group, (name, parameter) in sampled_lora.items()
+            if group in required_lora_groups(self.lora_scope)
+        }
         self.gradient_checked = True
+        samples = ",".join(
+            f"{group}:{name}" for group, (name, _) in self.parameter_snapshots.items()
+        )
         print(
             "[qwen35_vlm_functional] GRADIENT_OK "
+            f"scope={self.lora_scope} "
             f"vision_forwards={vision_forward_count} "
-            f"inspected_lora_grads={inspected_lora_grads} sample={snapshot_name}",
+            f"inspected_lora_grads={inspected_lora_grads} samples={samples}",
             flush=True,
         )
 
@@ -214,33 +269,36 @@ class VLMFunctionalCallback(TrainerCallback):
         import torch
 
         self.optimizer_steps += 1
-        if self.parameter_snapshot is None:
+        if not self.parameter_snapshots:
             raise RuntimeError(
                 "optimizer step occurred before the LoRA gradient contract was checked"
             )
-        name, before = self.parameter_snapshot
-        current = self._named_parameters(kwargs["model"]).get(name)
-        if current is None:
-            raise RuntimeError(
-                f"sampled LoRA parameter disappeared before optimizer step: {name}"
-            )
-        after = to_local_tensor(current).detach().float().cpu()
-        if after.shape != before.shape:
-            raise RuntimeError(
-                f"LoRA local shard changed shape for {name}: "
-                f"before={tuple(before.shape)}, after={tuple(after.shape)}"
-            )
-        if after.numel() == 0:
-            raise RuntimeError(
-                f"sampled LoRA parameter has an empty local shard: {name}"
-            )
-        delta = float((after - before).abs().max().item())
-        if not torch.isfinite(torch.tensor(delta)) or delta == 0.0:
-            raise RuntimeError(
-                f"LoRA optimizer step did not update {name}: max_abs_delta={delta}"
-            )
+        parameters = self._named_parameters(kwargs["model"])
+        deltas = []
+        for group, (name, before) in self.parameter_snapshots.items():
+            current = parameters.get(name)
+            if current is None:
+                raise RuntimeError(
+                    f"sampled {group} LoRA parameter disappeared before optimizer step: {name}"
+                )
+            after = to_local_tensor(current).detach().float().cpu()
+            if after.shape != before.shape:
+                raise RuntimeError(
+                    f"LoRA local shard changed shape for {name}: "
+                    f"before={tuple(before.shape)}, after={tuple(after.shape)}"
+                )
+            if after.numel() == 0:
+                raise RuntimeError(
+                    f"sampled LoRA parameter has an empty local shard: {name}"
+                )
+            delta = float((after - before).abs().max().item())
+            if not torch.isfinite(torch.tensor(delta)) or delta == 0.0:
+                raise RuntimeError(
+                    f"LoRA optimizer step did not update {name}: max_abs_delta={delta}"
+                )
+            deltas.append(f"{group}:{name}:{delta:.6e}")
         print(
-            f"[qwen35_vlm_functional] OPTIMIZER_OK parameter={name} max_abs_delta={delta:.6e}",
+            f"[qwen35_vlm_functional] OPTIMIZER_OK scope={self.lora_scope} updates={','.join(deltas)}",
             flush=True,
         )
 
@@ -278,8 +336,10 @@ def install_contract() -> None:
 
 
 def main() -> None:
-    compatibility = load_conv3d_compat().enable_swift_conv3d_patch()
-    print(f"[qwen35_vlm_conv3d] {compatibility.to_dict()}", flush=True)
+    # Development shim only: make the new additive KT API visible while the
+    # environment keeps its released kt-kernel binary. LLaMA-Factory remains
+    # responsible for detecting torch/VLM/Conv3D and activating ms-swift.
+    load_conv3d_compat(register_as_kt_module=True)
     install_contract()
     from llamafactory.train.tuner import run_exp
 

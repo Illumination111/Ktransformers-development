@@ -267,7 +267,7 @@ def main() -> int:
         "torch": torch.__version__,
         "transformers": transformers.__version__,
         "cuda_visible": torch.cuda.is_available(),
-        "dataset_functional_scope": "image processor + frozen vision forward + language LoRA gradient/optimizer smoke",
+        "dataset_functional_scope": "image processor + scoped text/vision LoRA gradient/optimizer smoke",
         "conv3d_compatibility": conv3d_summary,
         **processor_summary,
     }

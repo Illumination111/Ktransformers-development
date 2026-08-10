@@ -15,10 +15,8 @@ lora_rank: 8
 lora_alpha: 16
 lora_dropout: 0.05
 lora_target: all
-# Freeze parameters, but keep the visual forward path for every image sample.
-freeze_vision_tower: true
-freeze_multi_modal_projector: true
-freeze_language_model: false
+# text: language LoRA; vision: vision tower + projector LoRA; all: both.
+vlm_lora_scope: __LORA_SCOPE__
 
 ### dataset
 dataset: __DATASET_NAME__

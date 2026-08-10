@@ -15,6 +15,7 @@ LOG_BASE="${VLM_LOG_BASE:-${SCRIPT_DIR}/test_log}"
 DEVICES="${VLM_DEVICES:-0,1,2,3,4,5,6,7}"
 MAX_STEPS=1
 CUTOFF_LEN=512
+LORA_SCOPE="${VLM_LORA_SCOPE:-text}"
 PREFLIGHT_ONLY=0
 DRY_RUN=0
 
@@ -29,6 +30,7 @@ Usage: bash $(basename "$0") [options]
   --devices LIST          exactly eight comma-separated GPU ids
   --max-steps N           default: 1
   --cutoff-len N          default: 512
+  --lora-scope SCOPE      text, vision or all; default: ${LORA_SCOPE}
   --log-base PATH         default: ${LOG_BASE}
   --preflight-only        validate config, checkpoint index, data and Processor
   --dry-run               preflight, render files and print the launch command
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --devices) need_value "$@"; DEVICES="$2"; shift ;;
         --max-steps) need_value "$@"; MAX_STEPS="$2"; shift ;;
         --cutoff-len) need_value "$@"; CUTOFF_LEN="$2"; shift ;;
+        --lora-scope) need_value "$@"; LORA_SCOPE="$2"; shift ;;
         --log-base) need_value "$@"; LOG_BASE="$2"; shift ;;
         --preflight-only) PREFLIGHT_ONLY=1 ;;
         --dry-run) DRY_RUN=1 ;;
@@ -61,9 +64,12 @@ done
 
 [[ "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]] || die "--max-steps must be a positive integer"
 [[ "${CUTOFF_LEN}" =~ ^[1-9][0-9]*$ ]] || die "--cutoff-len must be a positive integer"
+[[ "${LORA_SCOPE}" =~ ^(text|vision|all)$ ]] || die "--lora-scope must be text, vision or all"
 IFS=',' read -r -a DEVICE_IDS <<< "${DEVICES}"
 [[ ${#DEVICE_IDS[@]} -eq 8 ]] || die "this server profile requires exactly eight GPU ids"
 [[ -d "${LLAMA_FACTORY_DIR}" ]] || die "LLaMA-Factory not found: ${LLAMA_FACTORY_DIR}"
+[[ -f "${LLAMA_FACTORY_DIR}/src/llamafactory/model/model_utils/vlm_lora.py" ]] ||
+    die "LLaMA-Factory lacks scoped VLM LoRA support: ${LLAMA_FACTORY_DIR}"
 [[ -f "${KT_SOURCE_DIR}/python/sft/conv3d_compat.py" ]] || die "KT source not found: ${KT_SOURCE_DIR}"
 
 PYTHON="${VLM_PYTHON:-/mnt/data2/wbw/conda/envs/Kllama/bin/python}"
@@ -74,6 +80,7 @@ ACCELERATE="$(dirname "${PYTHON}")/accelerate"
 # Apply the requested device contract to preflight as well as launch.
 export CUDA_VISIBLE_DEVICES="${DEVICES}"
 export VLM_KT_CONV3D_COMPAT="${KT_SOURCE_DIR}/python/sft/conv3d_compat.py"
+export VLM_LORA_SCOPE="${LORA_SCOPE}"
 export PYTHONPATH="${SCRIPT_DIR}:${LLAMA_FACTORY_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 preflight=(
@@ -88,6 +95,11 @@ fi
 "${preflight[@]}"
 [[ "${PREFLIGHT_ONLY}" -eq 0 ]] || exit 0
 
+if [[ "${LORA_SCOPE}" == "vision" && "${DRY_RUN}" -eq 0 ]]; then
+    "${PYTHON}" -c 'from kt_kernel.sft.config import KTConfig; raise SystemExit(0 if "kt_freeze_experts" in KTConfig.__dataclass_fields__ else 1)' ||
+        die "vision scope requires an installed kt-kernel with kt_freeze_experts support"
+fi
+
 RUN_ID="$(date -u '+%Y%m%dT%H%M%SZ')"
 RUN_DIR="${LOG_BASE}/${RUN_ID}"
 mkdir -p "${RUN_DIR}/model_output"
@@ -100,7 +112,8 @@ TRAIN_CONFIG="${RUN_DIR}/train.yaml"
     --dataset-name "${DATASET_NAME}" \
     --model-output "${RUN_DIR}/model_output" \
     --max-steps "${MAX_STEPS}" \
-    --cutoff-len "${CUTOFF_LEN}"
+    --cutoff-len "${CUTOFF_LEN}" \
+    --lora-scope "${LORA_SCOPE}"
 
 launch=(
     "${ACCELERATE}" launch
@@ -117,4 +130,5 @@ printf '\n'
 cd "${LLAMA_FACTORY_DIR}"
 "${launch[@]}" 2>&1 | tee "${RUN_DIR}/train.log"
 "${PYTHON}" "${SCRIPT_DIR}/validate_adapter_output.py" --output-dir "${RUN_DIR}/model_output" \
+    --lora-scope "${LORA_SCOPE}" \
     2>&1 | tee "${RUN_DIR}/adapter_validation.log"

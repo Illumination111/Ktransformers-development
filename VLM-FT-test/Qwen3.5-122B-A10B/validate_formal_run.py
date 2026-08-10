@@ -12,6 +12,9 @@ from typing import Any
 from validate_adapter_output import validate_adapter
 
 
+VALID_LORA_SCOPES = ("text", "vision", "all")
+
+
 def load_json(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise RuntimeError(f"missing formal-test result: {path}")
@@ -35,6 +38,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--expected-steps", type=int, required=True)
+    parser.add_argument("--lora-scope", choices=VALID_LORA_SCOPES, default="text")
     args = parser.parse_args()
     if args.expected_steps < 10:
         parser.error("formal validation requires at least 10 optimizer steps")
@@ -71,6 +75,10 @@ def main() -> None:
     if not log_path.is_file():
         raise RuntimeError(f"missing training log: {log_path}")
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    if f"scope={args.lora_scope}" not in log_text:
+        raise RuntimeError(
+            f"training log does not confirm requested LoRA scope: {args.lora_scope}"
+        )
     conv3d_checks = log_text.count("[qwen35_vlm_conv3d]")
     vlm_contract_checks = log_text.count("[qwen35_vlm_contract] OK")
     gradient_checks = log_text.count("[qwen35_vlm_functional] GRADIENT_OK")
@@ -89,10 +97,11 @@ def main() -> None:
     if contract_passes < 1:
         raise RuntimeError("training log has no final VLM functional PASS marker")
 
-    adapter = validate_adapter(output_dir)
+    adapter = validate_adapter(output_dir, args.lora_scope)
     summary = {
         "status": "passed",
         "run_dir": str(run_dir),
+        "lora_scope": args.lora_scope,
         "global_step": global_step,
         "logged_losses": len(losses),
         "first_loss": losses[0],
@@ -114,7 +123,7 @@ def main() -> None:
     )
     print(
         "[qwen35_vlm_formal] PASS "
-        f"steps={global_step} losses={len(losses)} train_loss={train_loss:.6f} "
+        f"scope={args.lora_scope} steps={global_step} losses={len(losses)} train_loss={train_loss:.6f} "
         f"eval_loss={eval_loss:.6f} adapter_lora_tensors={adapter['lora_tensors']}"
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
