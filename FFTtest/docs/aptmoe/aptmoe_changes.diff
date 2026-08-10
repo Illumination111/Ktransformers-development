@@ -1,0 +1,513 @@
+diff -ruN -x . a/Runtime/OffloadRuntime/R_solver.py b/Runtime/OffloadRuntime/R_solver.py
+--- a/Runtime/OffloadRuntime/R_solver.py	2026-07-26 18:23:44
++++ b/Runtime/OffloadRuntime/R_solver.py	2026-04-01 22:17:49
+@@ -2,6 +2,7 @@
+     LookupTable_S, LookupTable_M, LookupTable_L,
+     LookupTable_DSV2, LookupTable_DSV3, LookupTable_KIMI,
+     LookupTable_QWEN3_235B, LookupTable_QWEN3_30B,
++    LookupTable_QWEN35_397B,
+ )
+ 
+ class R_solver():
+@@ -22,6 +23,8 @@
+             self.lookup_table = LookupTable_QWEN3_235B
+         elif model_config == 'QWEN3_30B':
+             self.lookup_table = LookupTable_QWEN3_30B
++        elif model_config == 'QWEN35_397B':
++            self.lookup_table = LookupTable_QWEN35_397B
+ 
+         self.num_experts = num_experts
+         self.num_chunks = num_chunks
+@@ -54,10 +57,5 @@
+                 break
+ 
+         gpu_expert_ids = [i for i in sorted_list if i not in cpu_expert_ids]
+-
+-        # print(origin_list)
+-        # print(sorted_list)
+-        # print('cpu_expert_ids ' + str(cpu_expert_ids))
+-        # print('gpu_expert_ids ' + str(gpu_expert_ids))
+ 
+         return gpu_expert_ids
+diff -ruN -x . a/Runtime/OffloadRuntime/offload.py b/Runtime/OffloadRuntime/offload.py
+--- a/Runtime/OffloadRuntime/offload.py	2026-07-26 18:23:44
++++ b/Runtime/OffloadRuntime/offload.py	2026-04-01 23:59:16
+@@ -16,7 +16,7 @@
+     for i in range(len(lst)):
+         lst[i] = 0
+ 
+-prefetch_portion = 0.5
++prefetch_portion = 0.1
+ 
+ def random_stageload_list(num_experts, portion):
+     numbers = list(range(num_experts))
+diff -ruN -x . a/Static/lookup_table.py b/Static/lookup_table.py
+--- a/Static/lookup_table.py	2026-07-26 18:23:44
++++ b/Static/lookup_table.py	2026-03-18 19:48:08
+@@ -85,6 +85,22 @@
+     'comp_cpu': [0, 0.013992571830749511, 0.0006377100944519043, 0.00015518665313720703, 0.00016785860061645507, 0.0001879572868347168, 0.0002138376235961914, 0.00018110275268554688, 0.0001843571662902832, 0.00019598007202148438, 0.00021179914474487305, 0.00021872520446777343, 0.00022050142288208008, 0.00026974678039550783, 0.00033565759658813474, 0.0002620100975036621, 0.0005573868751525879, 0.0005790591239929199, 0.000574183464050293, 0.0005802035331726075, 0.0005890607833862304, 0.0006008744239807129, 0.0006783843040466308, 0.0006652235984802246, 0.0006667733192443848, 0.0009383678436279297, 0.000677800178527832, 0.0006788134574890137, 0.0006998300552368164, 0.0007655262947082519, 0.0007139801979064942, 0.0006903171539306641, 0.0007130622863769532, 0.0007160305976867676, 0.0007212638854980468, 0.0007723331451416016, 0.000768589973449707, 0.0007460474967956543, 0.0007413029670715332, 0.0007647156715393066, 0.0007788896560668946, 0.0008113861083984375, 0.0008606433868408204, 0.000842893123626709, 0.0007876992225646972, 0.0008050441741943359, 0.0007727384567260742, 0.0008347511291503906, 0.000831758975982666, 0.0008250117301940918, 0.0008134245872497559, 0.0008340120315551758, 0.0008831501007080078, 0.0008583307266235351, 0.000836789608001709, 0.0008447289466857911, 0.0008616328239440918, 0.0008726119995117188, 0.0009657979011535644, 0.0008796453475952148, 0.0008733272552490234, 0.0008925914764404297, 0.0012650012969970704, 0.000918722152709961, 0.0008998632431030274],
+ }
+ 
++# Qwen3.5-397B-A17B: 512 experts, moe_intermediate_size=1024 (vs 235B's 1536)
++# Expert load/comp scaled by 1024/1536 ≈ 0.667 from QWEN3_235B
++LookupTable_QWEN35_397B = {
++    'max_num_tokens' : 64,
++    'load_expert' : 0.005101,           # 0.00765 * (1024/1536)
++    'load_MHA' : 0.02649664878845215,   # same hidden_size=4096
++    'load_Gate_8_experts' : 6.866455078125e-05,
++    'load_Gate_16_experts' : 8.797645568847656e-05,
++    'load_Gate_64_experts' : 0.00018930435180664062,
++    'load_Gate_128_experts' : 0.0004105567932128906,
++    'load_Gate_256_experts' : 0.0005261898040771484,
++    'load_Gate_384_experts' : 0.0007171630859375,
++    'load_Gate_512_experts' : 0.0009,   # extrapolated from 384→512
++    'comp_cpu': [0, 0.009328, 0.000425, 0.000103, 0.000112, 0.000125, 0.000143, 0.000121, 0.000123, 0.000131, 0.000141, 0.000146, 0.000147, 0.000180, 0.000224, 0.000175, 0.000372, 0.000386, 0.000383, 0.000387, 0.000393, 0.000401, 0.000452, 0.000444, 0.000445, 0.000626, 0.000452, 0.000453, 0.000467, 0.000510, 0.000476, 0.000460, 0.000476, 0.000477, 0.000481, 0.000515, 0.000513, 0.000497, 0.000494, 0.000510, 0.000519, 0.000541, 0.000574, 0.000562, 0.000525, 0.000537, 0.000515, 0.000557, 0.000555, 0.000550, 0.000542, 0.000556, 0.000589, 0.000572, 0.000558, 0.000563, 0.000574, 0.000582, 0.000644, 0.000586, 0.000582, 0.000595, 0.000843, 0.000612, 0.000600],
++}
++
+ LookupTable_QWEN3_30B = {
+     'max_num_tokens' : 64,
+     'load_expert' : 0.0021276473999023438,
+diff -ruN -x . a/main.py b/main.py
+--- a/main.py	2026-07-26 18:23:44
++++ b/main.py	2026-03-19 01:18:43
+@@ -254,7 +254,7 @@
+     parser.add_argument('--num_heads', default=32, type=int, help='number of attention heads per layer')
+     parser.add_argument('--num_experts', default=8, type=int, help='num experts per layer')
+     parser.add_argument('--pipeline', default="GPipe", choices=["GPipe", "GPipeOffload", "Mobius","APTMoE"], type=str, help='pipeline parallelism approach')
+-    parser.add_argument('--model_config', default="S", choices=["S", "M", "L", "DSV2", "DSV3", "KIMI", "QWEN3_235B", "QWEN3_30B"], type=str, help='model configuration')
++    parser.add_argument('--model_config', default="S", choices=["S", "M", "L", "DSV2", "DSV3", "KIMI", "QWEN3_235B", "QWEN3_30B", "QWEN35_397B"], type=str, help='model configuration')
+     parser.add_argument('--is_moe', default=False, help='whether to use MoE models')
+     parser.add_argument('--fwd_only', action='store_true', help='Only perform forward pass (three loading phases)')
+     parser.add_argument('--inter_stage_only', action='store_true', help='Only perform inter-stage phase')
+@@ -270,6 +270,8 @@
+     parser.add_argument('--debug-cpu-memory', action='store_true', help='Enable CPU memory monitor (periodic background sampling + snapshots at key points)')
+     parser.add_argument('--mem-interval', default=10.0, type=float, help='Memory monitor sampling interval in seconds (default: 10)')
+     parser.add_argument('--weight-load-details', action='store_true', help='Show per-layer weight loading details (timing, expert counts)')
++    parser.add_argument('--grad_accum', default=1, type=int, help='Gradient accumulation steps (simulate larger batch without extra memory)')
++    parser.add_argument('--num_experts_per_tok', default=None, type=int, help='Override num_experts_per_tok from model_config')
+ 
+     args = parser.parse_args()
+ 
+@@ -319,6 +321,11 @@
+         print(f"Auto-detected model type: {detected}")
+ 
+     args = model_config(args, args.model_config, _user_specified)
++
++    # CLI override for num_experts_per_tok
++    if getattr(args, 'num_experts_per_tok', None) is None:
++        pass  # keep whatever model_config set (or absent)
++    # else: already set by CLI, takes priority
+ 
+     if 'inter_stage_only' not in _user_specified and not args.config:
+         args.inter_stage_only = True
+diff -ruN -x . a/model/lora.py b/model/lora.py
+--- a/model/lora.py	2026-07-26 18:23:44
++++ b/model/lora.py	2026-03-20 00:20:30
+@@ -227,12 +227,17 @@
+         )
+         layer.self_attn = lora_attn
+ 
+-        # Apply LoRA to expert FFN layers
++        # Apply LoRA to expert FFN layers (SwiGLU: gate_proj, up_proj, down_proj)
+         if target_expert_ffn and layer.is_moe:
+             for expert in layer.moe_layer.experts:
+                 inner = expert.inner_model
+-                inner.linear1 = LoRALinear(inner.linear1, rank=rank, alpha=alpha, dropout=dropout)
+-                inner.linear2 = LoRALinear(inner.linear2, rank=rank, alpha=alpha, dropout=dropout)
++                if hasattr(inner, 'gate_proj'):
++                    inner.gate_proj = LoRALinear(inner.gate_proj, rank=rank, alpha=alpha, dropout=dropout)
++                    inner.up_proj = LoRALinear(inner.up_proj, rank=rank, alpha=alpha, dropout=dropout)
++                    inner.down_proj = LoRALinear(inner.down_proj, rank=rank, alpha=alpha, dropout=dropout)
++                else:
++                    inner.linear1 = LoRALinear(inner.linear1, rank=rank, alpha=alpha, dropout=dropout)
++                    inner.linear2 = LoRALinear(inner.linear2, rank=rank, alpha=alpha, dropout=dropout)
+ 
+     # Freeze all non-LoRA parameters
+     for name, param in model.named_parameters():
+diff -ruN -x . a/model/moe_layer.py b/model/moe_layer.py
+--- a/model/moe_layer.py	2026-07-26 18:23:44
++++ b/model/moe_layer.py	2026-03-18 21:34:33
+@@ -77,27 +77,50 @@
+         self.historical_assigned_tokens_list = [0] * len(self.experts)
+         
+         
++    def _expand_for_topk(self, reshaped_input, gather_indices):
++        """Expand input tensor so each token appears k times, sorted by expert."""
++        idx = torch.tensor(gather_indices, dtype=torch.long, device=reshaped_input.device)
++        return reshaped_input[idx]  # (num_tokens * k, d_model)
++
++    def _reduce_from_topk(self, expert_output, gather_indices, num_tokens, d_model, topk, device):
++        """Scatter-add expert outputs back and average by k."""
++        output = torch.zeros(num_tokens, d_model, dtype=expert_output.dtype, device=device)
++        idx = torch.tensor(gather_indices, dtype=torch.long, device=device).unsqueeze(1).expand(-1, d_model)
++        output.scatter_add_(0, idx, expert_output.to(device))
++        output = output / topk
++        return output
++
+     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
+-        
++
+         assert len(input) == 1, "only single input Tensor supported"
+         assert len(input[0].shape) == 3, "input Tensor must have dimensions: (s)equence, (t)oken, (m)odel"
+-        assert input[0].shape[1] % len(self.experts) == 0, "num tokens must be order of number of local experts"
+ 
+-        d_model = input[0].shape[2] 
+-        reshaped_input = input[0].reshape(-1, d_model)  
+-        expert_outputs = []              
++        d_model = input[0].shape[2]
++        reshaped_input = input[0].reshape(-1, d_model)
++        num_tokens = reshaped_input.shape[0]
++        expert_outputs = []
+ 
++        # Detect top-k mode: gate returns tuple (counts, gather_indices) for k>1
++        topk = getattr(self.gate, 'num_experts_per_tok', 1)
++        use_topk = topk > 1
+ 
+         # GPipe GPipeOffload Mobius
+         if self.pipeline == 'GPipe' or self.pipeline == 'GPipeOffload' or self.pipeline == 'Mobius' or self.inter_stage_only:
+-            self.real_expert_selection = self.gate(reshaped_input)
+-    
+-            chunks = torch.split(reshaped_input, self.real_expert_selection, dim=0)
+-               
++            gate_result = self.gate(reshaped_input)
++
++            if use_topk:
++                self.real_expert_selection, gather_indices = gate_result
++                dispatch_input = self._expand_for_topk(reshaped_input, gather_indices)
++            else:
++                self.real_expert_selection = gate_result
++                dispatch_input = reshaped_input
++
++            chunks = torch.split(dispatch_input, self.real_expert_selection, dim=0)
++
+             for chunk, expert in zip(chunks, self.experts):
+                 if chunk.shape[0] != 0:
+                     expert_outputs += [expert(chunk)]
+-            
++
+             if self.inter_stage_only:
+                 for i in range(len(self.experts)):
+                     self.assigned_tokens_list[i] += self.real_expert_selection[i]
+@@ -105,62 +128,73 @@
+ 
+         elif self.pipeline == 'APTMoE':
+             self.comp_stream.wait_event(self.Gate_event)
+-            
+-            self.real_expert_selection = self.gate(reshaped_input)
+-            
++
++            gate_result = self.gate(reshaped_input)
++
++            if use_topk:
++                self.real_expert_selection, gather_indices = gate_result
++            else:
++                self.real_expert_selection = gate_result
++                gather_indices = None
++
+             # simulate the real expert selection as the predicted one
+             if len(self.predicted_expert_selection_list) != 0:
+                 self.real_expert_selection = generate_similiar_list(self.predicted_expert_selection_list[-1])
++                # gather_indices invalidated by generate_similiar_list, fall back to non-topk dispatch
++                if use_topk:
++                    gather_indices = None
+ 
+-            # assume the real expert selection as the predicted one
+-            # if len(self.predicted_expert_selection_list) != 0:
+-            #     self.real_expert_selection = self.predicted_expert_selection_list[-1]
+-            
+             for i in range(len(self.experts)):
+                 self.assigned_tokens_list[i] += self.real_expert_selection[i]
+-                
++
+             self.next_layer_expert_selection_prediction = self.next_gate(reshaped_input)
+ 
+-            # print(self.real_expert_selection)
+-            # print(sum(self.real_expert_selection))
+-        
+-            chunks = torch.split(reshaped_input, self.real_expert_selection, dim=0)
+-        
+-            # Level3 (Inter-Expert)：
+-            # accoirding to real-time popularity, add some experts to the highest priority queue
+-            
++            if use_topk and gather_indices is not None:
++                dispatch_input = self._expand_for_topk(reshaped_input, gather_indices)
++            else:
++                dispatch_input = reshaped_input
++
++            chunks = torch.split(dispatch_input, self.real_expert_selection, dim=0)
++
++            # Level3 (Inter-Expert)
+             gpu_expert_ids = self.R_solver.solve(self.assigned_tokens_list)
+-            
++
+             for expert_id in gpu_expert_ids:
+                 if self.experts[expert_id].on_GPU == False:
+                     self.CommScheduler.add_model_to_queue(self.experts[expert_id], self.expert_events[expert_id], 0)
+-            
++
+             self.CommScheduler.load_execute_with_priority()
+ 
+             gpu_execution_ids = []
+             cpu_execution_ids = []
+-            
+-            for num_tokens, expert in zip(self.real_expert_selection, self.experts):
++
++            for num_tok, expert in zip(self.real_expert_selection, self.experts):
+                 if expert.on_GPU == True:
+                     gpu_execution_ids.append(expert.expert_id)
+                 else:
+                     cpu_execution_ids.append(expert.expert_id)
+-    
++
+             # execute experts on GPU
+-            with torch.cuda.stream(self.comp_stream):        
++            with torch.cuda.stream(self.comp_stream):
+                 for id in gpu_execution_ids:
+                     if chunks[id].shape[0] != 0:
+                         self.comp_stream.wait_event(self.expert_events[id])
+                         expert_outputs += self.experts[id](chunks[id])
+-                        
++
+             # execute experts on CPU
+             for id in cpu_execution_ids:
+                 if chunks[id].shape[0] != 0:
+                     expert_outputs += self.experts[id](chunks[id])
+ 
+-        
++
+         expert_output = torch.cat(expert_outputs, dim=0)
+-        expert_output = expert_output.reshape(input[0].shape)
++
++        if use_topk and gather_indices is not None:
++            expert_output = self._reduce_from_topk(
++                expert_output, gather_indices, num_tokens, d_model, topk, input[0].device)
++            expert_output = expert_output.reshape(input[0].shape)
++        else:
++            expert_output = expert_output.reshape(input[0].shape)
+ 
+         return expert_output
+    
+\ No newline at end of file
+diff -ruN -x . a/model/top2gate.py b/model/top2gate.py
+--- a/model/top2gate.py	2026-07-26 18:23:44
++++ b/model/top2gate.py	2026-03-18 21:33:57
+@@ -130,29 +130,45 @@
+         return top2gating(logits, self.layer_id)
+ 
+ 
+-def random_gating(logits: torch.Tensor, layer_id: int) -> Tuple[Tensor, Tensor, Tensor]:
++def random_gating(logits: torch.Tensor, layer_id: int, topk: int = 1):
+     gates = F.softmax(logits, dim=1, dtype=torch.float)
+ 
+-    # gates has shape of SE
+     num_tokens = gates.shape[0]
+     num_experts = gates.shape[1]
+-    assert num_tokens % num_experts == 0
+ 
+-    indices1_s = torch.argmax(gates, dim=1)   
+-    mask1 = one_hot(indices1_s, num_classes=num_experts)
++    if topk == 1:
++        # Original top-1 path
++        assert num_tokens % num_experts == 0
++        indices1_s = torch.argmax(gates, dim=1)
++        mask1 = one_hot(indices1_s, num_classes=num_experts)
++        idx = torch.randperm(mask1.shape[1])
++        mask1 = mask1[:, idx].view(mask1.size())
++        expert_selection = torch.sum(mask1, dim=0)
++        expert_selection = [s.item() for s in expert_selection]
++        return expert_selection
++    else:
++        # Top-k path: each token dispatched to k experts
++        _, topk_indices = torch.topk(gates, k=topk, dim=1)  # (num_tokens, k)
++        # Randomize expert popularity (permute expert ids)
++        idx = torch.randperm(num_experts)
++        topk_indices = idx[topk_indices]
+ 
+-    # randomize the expert popularity
+-    idx = torch.randperm(mask1.shape[1])
+-    mask1 = mask1[:, idx].view(mask1.size())
+-    
+-    expert_selection = torch.sum(mask1, dim=0)
+-    # print('layer '+str(layer_id) + ' expert_selection = ' + str(expert_selection))
+-    
+-    expert_selection = [s.item() for s in expert_selection]
++        # Build per-expert token lists and counts
++        expert_token_lists = [[] for _ in range(num_experts)]
++        for token_idx in range(num_tokens):
++            for j in range(topk):
++                eid = topk_indices[token_idx, j].item()
++                expert_token_lists[eid].append(token_idx)
+ 
+-    return expert_selection
++        expert_selection = [len(lst) for lst in expert_token_lists]
++        # gather_indices: token indices sorted by expert assignment
++        gather_indices = []
++        for lst in expert_token_lists:
++            gather_indices.extend(lst)
+ 
++        return expert_selection, gather_indices
+ 
++
+ def random_list(original_selection):
+     selection = original_selection
+     
+@@ -213,37 +229,34 @@
+         num_experts: int,
+         layer_id: int,
+         gini: float = 0.6,
++        num_experts_per_tok: int = 1,
+     ) -> None:
+         super().__init__()
+         self.num_experts = num_experts
+         self.layer_id = layer_id
+         self.gini = gini
++        self.num_experts_per_tok = num_experts_per_tok
+         self.on_GPU = False
+ 
+ 
+     def power_law_logit(self, dim: int, num_experts: int):
+-        # seed = random.randint(1, 1000)
+-        # torch.manual_seed(seed)
+-        random_matrix = torch.rand(dim, num_experts) 
+-        
++        random_matrix = torch.rand(dim, num_experts)
++
+         exponent = generate_exponent(num_experts, self.gini)
+-        
++
+         exponents = torch.pow(torch.arange(1, num_experts+1, dtype=torch.float), -exponent)
+         power_law_distribution = exponents / torch.sum(exponents)
+ 
+-        # re-assign random matrix with given power law distribution
+         logits = torch.zeros(dim, num_experts)
+         for i in range(dim):
+             sampled_indices = torch.multinomial(power_law_distribution, num_samples=num_experts, replacement=True)
+             logits[i, sampled_indices] = torch.poisson(random_matrix[i, sampled_indices])
+-        
++
+         return logits
+ 
+     def forward(self, input: torch.Tensor):
+         logits = self.power_law_logit(input.shape[0], self.num_experts)
+-        gating_result = random_gating(logits, self.layer_id)
+-        # return random_list(gating_result)
+-        return gating_result
++        return random_gating(logits, self.layer_id, topk=self.num_experts_per_tok)
+ 
+ 
+ 
+diff -ruN -x . a/model/transformer_lm.py b/model/transformer_lm.py
+--- a/model/transformer_lm.py	2026-07-26 18:23:44
++++ b/model/transformer_lm.py	2026-03-19 11:58:50
+@@ -74,18 +74,15 @@
+ 
+ 
+ class InnerFeedForwardLayer(nn.Module):
+-    """FeedForward layer for a given Transformer model."""
++    """SwiGLU Expert FFN: gate_proj + up_proj → silu(gate)*up → down_proj"""
+     def __init__(self, d_model, dim_feedforward, activation, dropout) -> None:
+         super(InnerFeedForwardLayer, self).__init__()
+-        self.linear1 = nn.Linear(d_model, dim_feedforward)
+-        self.activation = activation
+-        self.dropout1 = nn.Dropout(dropout)
+-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+-        self.dropout2 = nn.Dropout(dropout)
++        self.gate_proj = nn.Linear(d_model, dim_feedforward, bias=False)
++        self.up_proj = nn.Linear(d_model, dim_feedforward, bias=False)
++        self.down_proj = nn.Linear(dim_feedforward, d_model, bias=False)
+ 
+     def forward(self, x):
+-        output = self.dropout2(self.linear2(self.dropout1(self.activation(self.linear1(x)))))
+-        return output
++        return self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
+ 
+ 
+ class Test(torch.autograd.Function):
+@@ -178,11 +175,12 @@
+         layer_id=0,
+         ndecoder=0,
+         pipeline = 'GPipe',
+-        comp_stream = None, 
+-        gini = None, 
++        comp_stream = None,
++        gini = None,
+         comm_scheduler = None,
+         R_solver = None,
+-        inter_stage_only = None
++        inter_stage_only = None,
++        num_experts_per_tok = 1,
+     ):
+         super(TransformerDecoderLayer, self).__init__()
+         self.self_attn = Attention(d_model, nhead, dropout=dropout, layer_id=layer_id)
+@@ -201,11 +199,11 @@
+         self.MHA_event = torch.cuda.Event()
+         self.Gate_event = torch.cuda.Event()
+         self.expert_events = [torch.cuda.Event() for _ in range(num_local_experts)]
+-    
++
+         self.is_moe = is_moe
+         if is_moe:
+-            self.gate = RandomGate(d_model, num_local_experts, self.layer_id, self.gini)
+-            self.next_gate = RandomGate(d_model, num_local_experts, self.layer_id, self.gini)
++            self.gate = RandomGate(d_model, num_local_experts, self.layer_id, self.gini, num_experts_per_tok=num_experts_per_tok)
++            self.next_gate = RandomGate(d_model, num_local_experts, self.layer_id, self.gini, num_experts_per_tok=num_experts_per_tok)
+             # self.gate = Top2Gate(d_model, num_local_experts, self.layer_id)
+             # self.next_gate = Top2Gate(d_model, num_local_experts, self.layer_id)
+             
+@@ -246,17 +244,19 @@
+ class TransformerLM(nn.Sequential):
+     """A GPT-2 based nn.Sequential language model."""
+ 
+-    def __init__(self, ninp, nhead, nhid, dropout, ndecoder, is_moe=True, num_local_experts=1, use_fp16=False, 
+-                 pipeline = 'GPipe', stage_id=-1, gini=None, comm_scheduler=None, R_solver=None, inter_stage_only=None):
++    def __init__(self, ninp, nhead, nhid, dropout, ndecoder, is_moe=True, num_local_experts=1, use_fp16=False,
++                 pipeline = 'GPipe', stage_id=-1, gini=None, comm_scheduler=None, R_solver=None, inter_stage_only=None,
++                 num_experts_per_tok=1):
+         self.comp_stream = torch.cuda.Stream()
+         self.comm_scheduler = comm_scheduler
+         self.R_solver = R_solver
+         self.stage_id = stage_id
+-        
++
+         layers = []
+-        
++
+         for layer_id in range(ndecoder):
+             layers.append(TransformerDecoderLayer(ninp, nhead, nhid, dropout, is_moe=is_moe, num_local_experts=num_local_experts, stage_id=stage_id, layer_id=layer_id+(stage_id*ndecoder),
+-                            ndecoder=ndecoder, pipeline = pipeline, comp_stream=self.comp_stream, gini=gini, comm_scheduler=self.comm_scheduler, R_solver=self.R_solver, inter_stage_only=inter_stage_only))
++                            ndecoder=ndecoder, pipeline = pipeline, comp_stream=self.comp_stream, gini=gini, comm_scheduler=self.comm_scheduler, R_solver=self.R_solver, inter_stage_only=inter_stage_only,
++                            num_experts_per_tok=num_experts_per_tok))
+         
+         super(TransformerLM, self).__init__(*layers)
+diff -ruN -x . a/utils.py b/utils.py
+--- a/utils.py	2026-07-26 18:23:44
++++ b/utils.py	2026-03-18 21:35:08
+@@ -243,6 +243,20 @@
+         _set('seq_length', 128)
+         _set('prefetch_portion', 0.6)
+ 
++    # Qwen3.5-397B-A17B (397B total, ~17B active, 512 experts)
++    elif model_conf == 'QWEN35_397B':
++        _set('embedding_dim', 4096)
++        _set('hidden_dim', 1024)       # moe_intermediate_size
++        _set('num_heads', 32)
++        _set('num_layers', 60)
++        _set('num_stages', 60)          # 1 layer per stage
++        _set('num_experts', 512)
++        _set('num_experts_per_tok', 10)
++        _set('batch_size', 1)
++        _set('num_chunks', 1)
++        _set('seq_length', 512)
++        _set('prefetch_portion', 0.6)
++
+     # Ensure batch_size >= num_chunks, otherwise micro-batch size would be 0
+     if args.batch_size < args.num_chunks:
+         old_chunks = args.num_chunks
+@@ -366,6 +380,7 @@
+             num_local_experts=args.num_experts, pipeline=pipeline,
+             stage_id=stage_rank, gini=args.gini, comm_scheduler=comm_scheduler,
+             R_solver=R_solver, inter_stage_only=inter_stage_only,
++            num_experts_per_tok=getattr(args, 'num_experts_per_tok', 1),
+         )
+         if use_bf16:
+             cur_stage = cur_stage.to(torch.bfloat16)

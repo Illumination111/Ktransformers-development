@@ -1,0 +1,874 @@
+#!/usr/bin/env bash
+# Shared Qwen3.5-122B-A10B text-only BF16 full-finetuning sweep for DeepSpeed/MegaTrain.
+
+set -Eeuo pipefail
+
+export TZ="${FFT_TIMEZONE:-Asia/Shanghai}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FFT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CONFIGS_DIR="${SCRIPT_DIR}/configs"
+SHARED_FLOW_DIR="${FFT_SHARED_FLOW_DIR:-${FFT_ROOT}/Qwen3.5-35B-A3B}"
+LOG_BASE="${FFT_LOG_BASE:-${SCRIPT_DIR}/test_log}"
+LLAMA_FACTORY_DIR="${FFT_LLAMA_FACTORY_DIR:-/mnt/data2/wbw/LLaMA-Factory}"
+MEGATRAIN_ROOT="${FFT_MEGATRAIN_ROOT:-/mnt/data2/wbw/MegaTrain}"
+MODEL_PATH="${FFT_MODEL_PATH:-/mnt/data2/models/Qwen3.5-122B-A10B}"
+DATASET_DIR="${FFT_DATASET_DIR:-${FFT_ROOT}/dataset}"
+DATASET_NAME="${FFT_DATASET_NAME:-fft_real_100}"
+
+TRAIN_ENTRY_MODULE="finetune_train_with_timing"
+TRAIN_CONFIG_BASE="${CONFIGS_DIR}/train_full_bf16_qwen35_122b.yaml"
+DEEPSPEED_CONFIG="${CONFIGS_DIR}/deepspeed_zero3_offload_bf16.json"
+MEGATRAIN_CONFIG_BASE="${CONFIGS_DIR}/megatrain_qwen35_122b_bf16.yaml"
+MEGATRAIN_ENTRYPOINT="${SCRIPT_DIR}/megatrain_qwen35_122b_train.py"
+VALIDATOR="${SCRIPT_DIR}/validate_benchmark_dataset.py"
+AGGREGATOR="${SCRIPT_DIR}/aggregate_sweep_results.py"
+TIMING_VALIDATOR="${SHARED_FLOW_DIR}/validate_step_timing.py"
+RESOURCE_EXEC="${SHARED_FLOW_DIR}/resource_scope_exec.py"
+MONITOR_SCRIPT="${SHARED_FLOW_DIR}/monitor.py"
+MEMORY_ANALYZER="${SHARED_FLOW_DIR}/analyze_memory_usage.py"
+STEP_PHASE_TIMER="${SHARED_FLOW_DIR}/step_phase_timer.py"
+
+if (( $# < 1 )); then
+    printf 'Internal error: backend argument is required\n' >&2
+    exit 2
+fi
+BACKEND="$1"
+shift
+case "${BACKEND}" in
+    deepspeed|megatrain) ;;
+    *) printf 'Unsupported backend: %s\n' "${BACKEND}" >&2; exit 2 ;;
+esac
+
+FFT_RUNTIME_ROOT="${FFT_RUNTIME_ROOT:-/mnt/data2/wbw/fft_runtime/qwen35_122b/${BACKEND}}"
+FFT_TMPDIR="${FFT_TMPDIR:-${FFT_RUNTIME_ROOT}/tmp}"
+FFT_CACHE_ROOT="${FFT_CACHE_ROOT:-${FFT_RUNTIME_ROOT}/cache}"
+export TMPDIR="${FFT_TMPDIR}"
+export TMP="${FFT_TMPDIR}"
+export TEMP="${FFT_TMPDIR}"
+export CUDA_CACHE_PATH="${FFT_CUDA_CACHE_PATH:-${FFT_CACHE_ROOT}/cuda}"
+export TORCH_EXTENSIONS_DIR="${FFT_TORCH_EXTENSIONS_DIR:-${FFT_CACHE_ROOT}/torch_extensions}"
+export TRITON_CACHE_DIR="${FFT_TRITON_CACHE_DIR:-${FFT_CACHE_ROOT}/triton}"
+export TORCHINDUCTOR_CACHE_DIR="${FFT_TORCHINDUCTOR_CACHE_DIR:-${FFT_CACHE_ROOT}/torchinductor}"
+export MPLCONFIGDIR="${FFT_MPLCONFIGDIR:-${FFT_CACHE_ROOT}/matplotlib}"
+
+readonly -a SERVER_SEQUENCE_LENGTHS=(32 64 128 256 512 1024 2048 4096)
+
+SEQUENCE_LENGTHS_CSV=""
+SEQUENCE_LENGTHS_OVERRIDE_SET=0
+SEQUENCE_LENGTH=""
+SEQUENCE_LENGTH_SET=0
+STEPS=15
+WARMUP_STEPS=5
+GRAD_ACCUM_STEPS=1
+LEARNING_RATE="1.0e-5"
+DEVICES_OVERRIDE=""
+CPU_THREADS_OVERRIDE="${FFT_CPU_THREADS:-}"
+DRY_RUN=0
+CONTINUE_ON_ERROR=0
+KEEP_MODEL_OUTPUT=0
+SKIP_DATASET_CHECK=0
+
+RUN_ROOT=""
+SUMMARY_FINALIZED=0
+ACTIVE_MONITOR_PID=""
+ACTIVE_MONITOR_FIFO=""
+ACTIVE_TRAIN_PID=""
+ACTIVE_TEE_PID=""
+ACTIVE_LOG_FIFO=""
+
+usage() {
+    cat <<EOF
+Usage: bash ${FFT_CANONICAL_LAUNCHER:-$(basename "$0")} [options]
+
+Fixed benchmark contract:
+  backend                 ${BACKEND}
+  server                  8 GPUs, global batch 8, seq 32..4096 (only profile)
+  precision               native BF16
+  finetuning type         full
+
+Options:
+  --seq-lengths LIST      Comma-separated sequence lengths; input order is kept
+  --seq-length N          Run exactly one canonical sequence length
+  --steps N               Optimizer steps per sequence (default: 15)
+  --warmup-steps N        Steps excluded from stable TPS (default: 5)
+  --gas N                 Gradient accumulation steps (default: 1)
+  --learning-rate VALUE   Default: 1.0e-5
+  --cpu-threads N         CPU threads per training rank
+  --devices LIST          Physical GPU ids; server uses the first 8 ids
+  --model-path PATH       Default: /mnt/data2/models/Qwen3.5-122B-A10B
+  --dataset-dir PATH      LLaMA-Factory-compatible dataset directory
+  --dataset-name NAME     Registered dataset name (default: fft_real_100)
+  --log-base PATH         Result directory base
+  --megatrain-root PATH   MegaTrain checkout (MegaTrain backend only)
+  --continue-on-error     Continue after a failed sequence
+  --keep-model-output     Keep DeepSpeed final model output
+  --skip-dataset-check    Skip checkpoint/tokenizer/dataset validation
+  --dry-run               Generate configs and print commands only
+  -h, --help              Show this help
+
+Each sequence runs in an independent process. DeepSpeed uses coarse host-wall
+timing without forced CUDA synchronization. MegaTrain retains its required
+backend CUDA synchronization and labels that timing mode in the output.
+EOF
+}
+
+need_value() {
+    local flag="$1" count="$2"
+    (( count >= 2 )) || {
+        printf 'Missing value for %s\n' "${flag}" >&2
+        exit 2
+    }
+}
+
+while (( $# > 0 )); do
+    case "$1" in
+        --seq-lengths)
+            need_value "$1" "$#"
+            SEQUENCE_LENGTHS_CSV="$2"
+            SEQUENCE_LENGTHS_OVERRIDE_SET=1
+            shift
+            ;;
+        --seq-length)
+            need_value "$1" "$#"
+            SEQUENCE_LENGTH="$2"
+            SEQUENCE_LENGTH_SET=1
+            shift
+            ;;
+        --steps) need_value "$1" "$#"; STEPS="$2"; shift ;;
+        --warmup-steps) need_value "$1" "$#"; WARMUP_STEPS="$2"; shift ;;
+        --gas) need_value "$1" "$#"; GRAD_ACCUM_STEPS="$2"; shift ;;
+        --learning-rate) need_value "$1" "$#"; LEARNING_RATE="$2"; shift ;;
+        --cpu-threads) need_value "$1" "$#"; CPU_THREADS_OVERRIDE="$2"; shift ;;
+        --devices) need_value "$1" "$#"; DEVICES_OVERRIDE="$2"; shift ;;
+        --model-path) need_value "$1" "$#"; MODEL_PATH="$2"; shift ;;
+        --dataset-dir) need_value "$1" "$#"; DATASET_DIR="$2"; shift ;;
+        --dataset-name) need_value "$1" "$#"; DATASET_NAME="$2"; shift ;;
+        --log-base) need_value "$1" "$#"; LOG_BASE="$2"; shift ;;
+        --megatrain-root) need_value "$1" "$#"; MEGATRAIN_ROOT="$2"; shift ;;
+        --continue-on-error) CONTINUE_ON_ERROR=1 ;;
+        --keep-model-output) KEEP_MODEL_OUTPUT=1 ;;
+        --skip-dataset-check) SKIP_DATASET_CHECK=1 ;;
+        --dry-run) DRY_RUN=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) printf 'Unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+warn() { printf '[%s] WARNING: %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
+die() { printf '[%s] ERROR: %s\n' "$(date '+%H:%M:%S')" "$*" >&2; exit 1; }
+
+require_positive_int() {
+    local name="$1" value="$2"
+    [[ "${value}" =~ ^[1-9][0-9]*$ ]] || \
+        die "${name} must be a positive integer, got ${value}"
+}
+
+require_nonnegative_int() {
+    local name="$1" value="$2"
+    [[ "${value}" =~ ^[0-9]+$ ]] || \
+        die "${name} must be a non-negative integer, got ${value}"
+}
+
+require_positive_number() {
+    local name="$1" value="$2"
+    [[ "${value}" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]] || \
+        die "${name} must be a positive number, got ${value}"
+    awk -v value="${value}" 'BEGIN { exit !(value > 0) }' || \
+        die "${name} must be greater than zero, got ${value}"
+}
+
+require_positive_int "--steps" "${STEPS}"
+require_nonnegative_int "--warmup-steps" "${WARMUP_STEPS}"
+require_positive_int "--gas" "${GRAD_ACCUM_STEPS}"
+require_positive_number "--learning-rate" "${LEARNING_RATE}"
+(( WARMUP_STEPS < STEPS )) || die "--warmup-steps must be smaller than --steps"
+if [[ -n "${CPU_THREADS_OVERRIDE}" ]]; then
+    require_positive_int "--cpu-threads" "${CPU_THREADS_OVERRIDE}"
+fi
+
+if [[ "${SEQUENCE_LENGTH_SET}" -eq 1 ]]; then
+    (( SEQUENCE_LENGTHS_OVERRIDE_SET == 0 )) || \
+        die "--seq-length and --seq-lengths are mutually exclusive"
+    require_positive_int "--seq-length" "${SEQUENCE_LENGTH}"
+    allowed=0
+    for seq in "${SERVER_SEQUENCE_LENGTHS[@]}"; do
+        if [[ "${seq}" == "${SEQUENCE_LENGTH}" ]]; then
+            allowed=1
+            break
+        fi
+    done
+    (( allowed == 1 )) || \
+        die "--seq-length must be one of: ${SERVER_SEQUENCE_LENGTHS[*]}"
+    SEQUENCE_LENGTHS_CSV="${SEQUENCE_LENGTH}"
+    SEQUENCE_LENGTHS_OVERRIDE_SET=1
+fi
+
+declare -a SEQUENCE_LENGTHS_OVERRIDE=()
+if (( SEQUENCE_LENGTHS_OVERRIDE_SET == 1 )); then
+    IFS=',' read -r -a SEQUENCE_LENGTHS_OVERRIDE <<< "${SEQUENCE_LENGTHS_CSV// /}"
+    (( ${#SEQUENCE_LENGTHS_OVERRIDE[@]} > 0 )) || die "sequence length list is empty"
+fi
+declare -A SEEN_SEQUENCE=()
+MAX_SEQUENCE_LENGTH=0
+for seq in "${SEQUENCE_LENGTHS_OVERRIDE[@]}"; do
+    require_positive_int "sequence length" "${seq}"
+    (( seq >= 32 && seq <= 4096 )) || \
+        die "server sequence length must be in [32, 4096], got ${seq}"
+    [[ -z "${SEEN_SEQUENCE[${seq}]:-}" ]] || \
+        die "duplicate sequence length: ${seq}"
+    SEEN_SEQUENCE["${seq}"]=1
+    (( seq > MAX_SEQUENCE_LENGTH )) && MAX_SEQUENCE_LENGTH="${seq}"
+done
+(( SEQUENCE_LENGTHS_OVERRIDE_SET == 1 )) || MAX_SEQUENCE_LENGTH=4096
+
+_find_conda_python() {
+    local env_name="$1"
+    local candidates=(
+        "/mnt/data2/wbw/conda/envs/${env_name}/bin/python3"
+        "/mnt/data2/wbw/miniconda3/envs/${env_name}/bin/python3"
+        "/opt/conda/envs/${env_name}/bin/python3"
+    )
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        [[ -x "${candidate}" ]] && {
+            printf '%s\n' "${candidate}"
+            return 0
+        }
+    done
+    return 1
+}
+
+VALIDATOR_PYTHON="$(_find_conda_python Kllama || true)"
+[[ -n "${VALIDATOR_PYTHON}" ]] || VALIDATOR_PYTHON="$(command -v python3 || true)"
+[[ -x "${VALIDATOR_PYTHON}" ]] || die "No Python is available for validation"
+
+case "${BACKEND}" in
+    deepspeed) CONDA_ENV="${FFT_CONDA_ENV:-Deepspeed}" ;;
+    megatrain) CONDA_ENV="${FFT_CONDA_ENV:-Megatrain}" ;;
+esac
+PYTHON="$(_find_conda_python "${CONDA_ENV}" || true)"
+[[ -n "${PYTHON}" ]] || die "Python for ${BACKEND} was not found (env=${CONDA_ENV})"
+CONDA_BIN_DIR="$(dirname "${PYTHON}")"
+MONITOR_PYTHON="$(_find_conda_python Deepspeed || true)"
+[[ -n "${MONITOR_PYTHON}" ]] || MONITOR_PYTHON="${PYTHON}"
+
+detect_physical_cores() {
+    "${VALIDATOR_PYTHON}" - <<'PY'
+import os
+from pathlib import Path
+
+try:
+    cpu_ids = set(os.sched_getaffinity(0))
+except (AttributeError, OSError):
+    cpu_ids = set(range(os.cpu_count() or 1))
+cores = set()
+for cpu_id in cpu_ids:
+    topology = Path(f"/sys/devices/system/cpu/cpu{cpu_id}/topology")
+    try:
+        cores.add(
+            (
+                (topology / "physical_package_id").read_text(),
+                (topology / "core_id").read_text(),
+            )
+        )
+    except OSError:
+        pass
+print(max(1, len(cores) if cores else len(cpu_ids)))
+PY
+}
+
+PHYSICAL_CORES="$(detect_physical_cores)"
+
+prepare_runtime_directories() {
+    local directory
+    for directory in \
+        "${TMPDIR}" "${CUDA_CACHE_PATH}" "${TORCH_EXTENSIONS_DIR}" \
+        "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${MPLCONFIGDIR}"; do
+        mkdir -p "${directory}"
+        [[ -d "${directory}" && -w "${directory}" ]] || \
+            die "runtime directory is not writable: ${directory}"
+    done
+}
+
+check_files_and_environment() {
+    [[ -d "${MODEL_PATH}" ]] || die "model directory not found: ${MODEL_PATH}"
+    [[ -d "${DATASET_DIR}" ]] || die "dataset directory not found: ${DATASET_DIR}"
+    local required
+    for required in \
+        "${VALIDATOR}" "${AGGREGATOR}" "${TIMING_VALIDATOR}" \
+        "${RESOURCE_EXEC}" "${MONITOR_SCRIPT}" "${MEMORY_ANALYZER}"; do
+        [[ -f "${required}" ]] || die "required file not found: ${required}"
+    done
+    env MPLCONFIGDIR="${MPLCONFIGDIR}" \
+        "${MONITOR_PYTHON}" -c 'import matplotlib, psutil, pynvml' || \
+        die "memory monitoring dependencies are unavailable"
+    command -v systemd-run >/dev/null || \
+        die "systemd-run is required for dedicated per-case cgroups"
+    command -v systemctl >/dev/null || \
+        die "systemctl is required for dedicated per-case cgroups"
+    if (( DRY_RUN == 0 )) && \
+       ! systemctl --user show-environment >/dev/null 2>&1; then
+        die "systemd user manager is unavailable; cannot create a dedicated per-case cgroup"
+    fi
+
+    if [[ "${BACKEND}" == "deepspeed" ]]; then
+        [[ -d "${LLAMA_FACTORY_DIR}/src/llamafactory" ]] || \
+            die "LLaMA-Factory source not found: ${LLAMA_FACTORY_DIR}"
+        [[ -f "${TRAIN_CONFIG_BASE}" && -f "${DEEPSPEED_CONFIG}" && \
+           -f "${STEP_PHASE_TIMER}" && \
+           -f "${SCRIPT_DIR}/finetune_train_with_timing.py" ]] || \
+            die "DeepSpeed training template/config/entrypoint/timer is missing"
+        "${PYTHON}" -c 'import accelerate, deepspeed, transformers, yaml' || \
+            die "DeepSpeed dependencies are unavailable in ${CONDA_ENV}"
+    else
+        [[ -d "${MEGATRAIN_ROOT}/infinity" ]] || \
+            die "MegaTrain root not found: ${MEGATRAIN_ROOT}"
+        [[ -f "${MEGATRAIN_CONFIG_BASE}" && -f "${MEGATRAIN_ENTRYPOINT}" ]] || \
+            die "MegaTrain training config/entrypoint is missing"
+        env PYTHONPATH="${SCRIPT_DIR}:${SHARED_FLOW_DIR}:${MEGATRAIN_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+            "${PYTHON}" -c \
+            'import causal_conv1d, deepspeed, flash_attn, fla, infinity, torch, transformers, yaml' || \
+            die "MegaTrain dependencies are unavailable in ${CONDA_ENV}"
+    fi
+    "${PYTHON}" -c \
+        'import importlib.util; from deepspeed.git_version_info import installed_ops; assert installed_ops.get("cpu_adam") and importlib.util.find_spec("deepspeed.ops.adam.cpu_adam_op")' || \
+        die "Prebuilt DeepSpeedCPUAdam is required in ${CONDA_ENV}"
+}
+
+profile_parameters() {
+    NUM_GPUS=8
+    GLOBAL_BATCH_SIZE=8
+    PER_DEVICE_BATCH_SIZE=1
+    CPU_THREADS_PER_RANK="${CPU_THREADS_OVERRIDE:-$((PHYSICAL_CORES / NUM_GPUS))}"
+    (( CPU_THREADS_PER_RANK > 0 )) || CPU_THREADS_PER_RANK=1
+    CPU_THREAD_BUDGET_TOTAL=$((CPU_THREADS_PER_RANK * NUM_GPUS))
+}
+
+resolve_devices() {
+    local requested="$1"
+    local source="${DEVICES_OVERRIDE:-${CUDA_VISIBLE_DEVICES:-}}"
+    [[ -n "${source}" ]] || source="0,1,2,3,4,5,6,7"
+    source="${source// /}"
+    local -a candidates
+    IFS=',' read -r -a candidates <<< "${source}"
+    (( ${#candidates[@]} >= requested )) || \
+        die "GPU list '${source}' has fewer than ${requested} entries"
+    local -a selected=("${candidates[@]:0:requested}")
+    local device
+    declare -A seen=()
+    for device in "${selected[@]}"; do
+        [[ "${device}" =~ ^[0-9]+$ ]] || die "invalid GPU id: ${device}"
+        [[ -z "${seen[${device}]:-}" ]] || die "duplicate GPU id: ${device}"
+        seen["${device}"]=1
+    done
+    local joined
+    joined="$(IFS=','; printf '%s' "${selected[*]}")"
+    printf '%s\n' "${joined}"
+}
+
+check_visible_gpu_capacity() {
+    local requested="$1"
+    (( DRY_RUN == 1 )) && return
+    command -v nvidia-smi >/dev/null || die "nvidia-smi is required for a real run"
+    local actual
+    actual="$(nvidia-smi -L | wc -l)"
+    (( actual >= requested )) || \
+        die "requested ${requested} GPUs but only ${actual} were detected"
+}
+
+declare -a RESOURCE_PREFIX=()
+MEMORY_LIMIT_LABEL=""
+NUMA_POLICY_LABEL=""
+
+build_resource_policy() {
+    RESOURCE_PREFIX=()
+    MEMORY_LIMIT_LABEL="dedicated cgroup accounting; no memory limit"
+    NUMA_POLICY_LABEL="host/default nodes 0,1"
+}
+
+make_deepspeed_train_config() {
+    local run_dir="$1" seq="$2"
+    local config="${run_dir}/train_config.yaml"
+    "${VALIDATOR_PYTHON}" - \
+        "${TRAIN_CONFIG_BASE}" "${config}" "${MODEL_PATH}" \
+        "${DATASET_NAME}" "${DATASET_DIR}" "${seq}" \
+        "${PER_DEVICE_BATCH_SIZE}" "${GRAD_ACCUM_STEPS}" \
+        "${LEARNING_RATE}" "${STEPS}" "${run_dir}/model_output" \
+        "${DEEPSPEED_CONFIG}" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+source, output = map(Path, sys.argv[1:3])
+config = yaml.safe_load(source.read_text(encoding="utf-8"))
+config.update(
+    {
+        "model_name_or_path": sys.argv[3],
+        "dataset": sys.argv[4],
+        "dataset_dir": sys.argv[5],
+        "template": "qwen3",
+        "cutoff_len": int(sys.argv[6]),
+        "per_device_train_batch_size": int(sys.argv[7]),
+        "gradient_accumulation_steps": int(sys.argv[8]),
+        "learning_rate": float(sys.argv[9]),
+        "max_steps": int(sys.argv[10]),
+        "output_dir": sys.argv[11],
+        "finetuning_type": "full",
+        "bf16": True,
+        "fp16": False,
+        "tf32": False,
+        "pure_bf16": False,
+        "gradient_checkpointing": True,
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        "use_kt": False,
+        "kt_weight_path": None,
+        "deepspeed": sys.argv[12],
+    }
+)
+output.write_text(
+    yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
+    encoding="utf-8",
+)
+PY
+    printf '%s\n' "${config}"
+}
+
+make_megatrain_config() {
+    local run_dir="$1" seq="$2"
+    local config="${run_dir}/megatrain_config.yaml"
+    "${VALIDATOR_PYTHON}" - \
+        "${MEGATRAIN_CONFIG_BASE}" "${config}" "${MODEL_PATH}" \
+        "${DATASET_NAME}" "${DATASET_DIR}" "${seq}" \
+        "${GLOBAL_BATCH_SIZE}" "${GRAD_ACCUM_STEPS}" \
+        "${STEPS}" "${LEARNING_RATE}" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+source, output = map(Path, sys.argv[1:3])
+config = yaml.safe_load(source.read_text(encoding="utf-8"))
+config["model"]["name"] = sys.argv[3]
+config["dataset"]["name"] = sys.argv[4]
+config["dataset"]["dataset_dir"] = sys.argv[5]
+config["dataset"]["max_seq_len"] = int(sys.argv[6])
+config["training"]["batch_size"] = int(sys.argv[7])
+config["training"]["gradient_accumulation_steps"] = int(sys.argv[8])
+config["training"]["num_steps"] = int(sys.argv[9])
+config["training"]["learning_rate"] = float(sys.argv[10])
+output.write_text(
+    yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
+    encoding="utf-8",
+)
+PY
+    printf '%s\n' "${config}"
+}
+
+write_run_config() {
+    local path="$1" profile_name="$2" seq="$3" devices="$4" tokens="$5"
+    "${VALIDATOR_PYTHON}" - \
+        "${path}" "${BACKEND}" "${profile_name}" "${seq}" "${NUM_GPUS}" \
+        "${GLOBAL_BATCH_SIZE}" "${PER_DEVICE_BATCH_SIZE}" \
+        "${GRAD_ACCUM_STEPS}" "${tokens}" "${STEPS}" "${WARMUP_STEPS}" \
+        "${LEARNING_RATE}" "${devices}" "${MODEL_PATH}" "${DATASET_NAME}" \
+        "${MEMORY_LIMIT_LABEL}" "${NUMA_POLICY_LABEL}" \
+        "${CPU_THREADS_PER_RANK}" "${CPU_THREAD_BUDGET_TOTAL}" "${DRY_RUN}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+backend = sys.argv[2]
+obj = {
+    "backend": backend,
+    "profile": sys.argv[3],
+    "benchmark_class": "exact_model_full_finetune",
+    "result_validity": "exact_model",
+    "weight_source": "pretrained_checkpoint",
+    "real_forward_backward_optimizer_update": True,
+    "precision": "bf16",
+    "modality": "text_only",
+    "finetuning_type": "full",
+    "source_architecture": "Qwen3_5MoeForConditionalGeneration",
+    "source_model_type": "qwen3_5_moe",
+    "model_load_architecture": "Qwen3_5MoeForCausalLM",
+    "model_load_type": "qwen3_5_moe_text",
+    "excluded_components": ["vision", "multimodal_processor", "mtp"],
+    "expected_text_parameters": 122111526912,
+    "sequence_length": int(sys.argv[4]),
+    "num_gpus": int(sys.argv[5]),
+    "global_batch_size": int(sys.argv[6]),
+    "per_device_batch_size": int(sys.argv[7]),
+    "gradient_accumulation_steps": int(sys.argv[8]),
+    "tokens_per_step": int(sys.argv[9]),
+    "steps": int(sys.argv[10]),
+    "warmup_steps": int(sys.argv[11]),
+    "learning_rate": sys.argv[12],
+    "devices": sys.argv[13],
+    "model_path": sys.argv[14],
+    "dataset_name": sys.argv[15],
+    "memory_limit": sys.argv[16],
+    "memory_enforcement": "none_by_benchmark",
+    "memory_monitoring": True,
+    "automatic_memory_termination": False,
+    "automatic_oom_classification": False,
+    "gpu_allocation_lifetime": "sequence_process_lifetime",
+    "persistent_profile_process": False,
+    "artificial_gpu_reservation": False,
+    "numa_policy": sys.argv[17],
+    "cpu_threads_per_rank": int(sys.argv[18]),
+    "cpu_thread_budget_total": int(sys.argv[19]),
+    "dry_run": bool(int(sys.argv[20])),
+    "timing_mode": (
+        "megatrain_host_wall_with_backend_cuda_sync"
+        if backend == "megatrain"
+        else "coarse_host_wall_no_cuda_sync"
+    ),
+    "result_scope": (
+        "end-to-end Qwen3.5-122B-A10B text-only full-finetune throughput via MegaTrain; "
+        "backend CUDA synchronization retained"
+        if backend == "megatrain"
+        else "end-to-end Qwen3.5-122B-A10B text-only full-finetune throughput via DeepSpeed"
+    ),
+}
+Path(sys.argv[1]).write_text(
+    json.dumps(obj, indent=2, ensure_ascii=False) + "\n",
+    encoding="utf-8",
+)
+PY
+}
+
+print_command() {
+    printf '[DRY-RUN]'
+    printf ' %q' "$@"
+    printf '\n'
+}
+
+stop_active_monitor() {
+    if [[ -n "${ACTIVE_MONITOR_PID}" ]] && \
+       kill -0 "${ACTIVE_MONITOR_PID}" 2>/dev/null; then
+        kill -TERM "${ACTIVE_MONITOR_PID}" 2>/dev/null || true
+        wait "${ACTIVE_MONITOR_PID}" 2>/dev/null || true
+    fi
+    ACTIVE_MONITOR_PID=""
+    if [[ -n "${ACTIVE_MONITOR_FIFO}" ]]; then
+        rm -f "${ACTIVE_MONITOR_FIFO}"
+    fi
+    ACTIVE_MONITOR_FIFO=""
+}
+
+stop_active_training() {
+    if [[ -n "${ACTIVE_TRAIN_PID}" ]] && \
+       kill -0 "${ACTIVE_TRAIN_PID}" 2>/dev/null; then
+        kill -TERM "${ACTIVE_TRAIN_PID}" 2>/dev/null || true
+        wait "${ACTIVE_TRAIN_PID}" 2>/dev/null || true
+    fi
+    ACTIVE_TRAIN_PID=""
+    if [[ -n "${ACTIVE_TEE_PID}" ]] && \
+       kill -0 "${ACTIVE_TEE_PID}" 2>/dev/null; then
+        kill -TERM "${ACTIVE_TEE_PID}" 2>/dev/null || true
+        wait "${ACTIVE_TEE_PID}" 2>/dev/null || true
+    fi
+    ACTIVE_TEE_PID=""
+    if [[ -n "${ACTIVE_LOG_FIFO}" ]]; then
+        rm -f "${ACTIVE_LOG_FIFO}"
+    fi
+    ACTIVE_LOG_FIFO=""
+}
+
+cleanup_active_processes() {
+    stop_active_training
+    stop_active_monitor
+}
+
+generate_sweep_summary() {
+    [[ -n "${RUN_ROOT}" && -d "${RUN_ROOT}" ]] || return 0
+    (( SUMMARY_FINALIZED == 0 )) || return 0
+    compgen -G "${RUN_ROOT}/*/seq_*/run_config.json" >/dev/null || return 0
+    SUMMARY_FINALIZED=1
+    if "${VALIDATOR_PYTHON}" "${AGGREGATOR}" --root "${RUN_ROOT}"; then
+        log "Sweep summary: ${RUN_ROOT}/summary.md"
+        log "Machine-readable results: ${RUN_ROOT}/sweep_results.csv"
+        return 0
+    fi
+    warn "Sweep aggregation failed for ${RUN_ROOT}"
+    return 98
+}
+
+finalize_sweep_on_exit() {
+    local original_status="${1:-0}"
+    local summary_status=0
+    trap - EXIT
+    set +e
+    cleanup_active_processes
+    generate_sweep_summary
+    summary_status=$?
+    if (( original_status == 0 && summary_status != 0 )); then
+        original_status="${summary_status}"
+    fi
+    exit "${original_status}"
+}
+
+start_memory_monitor() {
+    local run_dir="$1"
+    mkdir -p "${run_dir}/.mplconfig"
+    ACTIVE_MONITOR_FIFO="${run_dir}/monitor_events.fifo"
+    rm -f "${ACTIVE_MONITOR_FIFO}"
+    env MPLCONFIGDIR="${run_dir}/.mplconfig" \
+        "${MONITOR_PYTHON}" "${MONITOR_SCRIPT}" \
+        --out "${run_dir}/monitor.csv" \
+        --fifo "${ACTIVE_MONITOR_FIFO}" \
+        --interval 1 \
+        --disk-mount /mnt/data2 \
+        --pid "$$" \
+        --resource-contract "${run_dir}/resource_contract.json" \
+        >> "${run_dir}/monitor.log" 2>&1 &
+    ACTIVE_MONITOR_PID=$!
+    local attempt
+    for attempt in {1..30}; do
+        [[ -f "${run_dir}/monitor.csv" ]] && break
+        kill -0 "${ACTIVE_MONITOR_PID}" 2>/dev/null || \
+            die "memory monitor failed; see ${run_dir}/monitor.log"
+        sleep 0.1
+    done
+    [[ -f "${run_dir}/monitor.csv" ]] || \
+        die "memory monitor did not create monitor.csv"
+}
+
+analyze_memory_usage() {
+    local run_dir="$1"
+    env MPLCONFIGDIR="${run_dir}/.mplconfig" \
+        "${MONITOR_PYTHON}" "${MEMORY_ANALYZER}" \
+        --log-dir "${run_dir}" \
+        --require-cgroup-memory \
+        >> "${run_dir}/memory_analysis.log" 2>&1 || \
+        warn "Memory analysis failed; see ${run_dir}/memory_analysis.log"
+}
+
+run_one_sequence() {
+    local profile_name="$1" profile_dir="$2" seq="$3" devices="$4"
+    local run_dir="${profile_dir}/seq_${seq}"
+    local timing_dir="${run_dir}/step_timing"
+    local train_log="${run_dir}/train.log"
+    local case_unit="fft-qwen35-122b-${BACKEND}-seq${seq}-$$"
+    local tokens_per_step=$((NUM_GPUS * PER_DEVICE_BATCH_SIZE * seq * GRAD_ACCUM_STEPS))
+    local train_config
+    local run_cwd
+    mkdir -p "${run_dir}"
+    write_run_config \
+        "${run_dir}/run_config.json" "${profile_name}" "${seq}" "${devices}" \
+        "${tokens_per_step}"
+
+    local -a command
+    if [[ "${BACKEND}" == "deepspeed" ]]; then
+        train_config="$(make_deepspeed_train_config "${run_dir}" "${seq}")"
+        run_cwd="${LLAMA_FACTORY_DIR}"
+        local torchrun_bin="${CONDA_BIN_DIR}/torchrun"
+        [[ -x "${torchrun_bin}" ]] || torchrun_bin="torchrun"
+        command=(
+            env
+            USE_KT=0
+            ACCELERATE_USE_KT=false
+            FFT_TRAINING_BACKEND=deepspeed
+            FFT_TEXT_ONLY=1
+            FFT_PRECISION=bf16
+            FFT_FINETUNING_TYPE=full
+            FFT_SKIP_FINAL_SAVE="$((1 - KEEP_MODEL_OUTPUT))"
+            FFT_STEP_TIMING_OUT_DIR="${timing_dir}"
+            FFT_STEP_TIMING_WARMUP_STEPS="${WARMUP_STEPS}"
+            FFT_STEP_TIMING_TOKENS_PER_STEP="${tokens_per_step}"
+            FFT_DISABLE_PERF_PROBES=1
+            FFT_CPU_THREADS="${CPU_THREADS_PER_RANK}"
+            DS_PROBE_MODE=off
+            OMP_NUM_THREADS="${CPU_THREADS_PER_RANK}"
+            MKL_NUM_THREADS="${CPU_THREADS_PER_RANK}"
+            OPENBLAS_NUM_THREADS="${CPU_THREADS_PER_RANK}"
+            NUMEXPR_NUM_THREADS="${CPU_THREADS_PER_RANK}"
+            BLIS_NUM_THREADS="${CPU_THREADS_PER_RANK}"
+            OMP_DYNAMIC=FALSE
+            MKL_DYNAMIC=FALSE
+            TOKENIZERS_PARALLELISM=false
+            HF_DATASETS_OFFLINE=1
+            TRANSFORMERS_OFFLINE=1
+            CUDA_VISIBLE_DEVICES="${devices}"
+            PYTHONPATH="${SCRIPT_DIR}:${SHARED_FLOW_DIR}:${LLAMA_FACTORY_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+            "${torchrun_bin}" --standalone --nproc_per_node="${NUM_GPUS}"
+            -m "${TRAIN_ENTRY_MODULE}" train "${train_config}"
+        )
+    else
+        train_config="$(make_megatrain_config "${run_dir}" "${seq}")"
+        run_cwd="${MEGATRAIN_ROOT}"
+        local local_devices
+        local_devices="$(seq 0 $((NUM_GPUS - 1)) | paste -sd ',')"
+        command=(
+            env
+            FFT_TRAINING_BACKEND=megatrain
+            FFT_PRECISION=bf16
+            FFT_FINETUNING_TYPE=full
+            FFT_DISABLE_PERF_PROBES=1
+            OMP_NUM_THREADS="${CPU_THREADS_PER_RANK}"
+            MKL_NUM_THREADS="${CPU_THREADS_PER_RANK}"
+            OPENBLAS_NUM_THREADS="${CPU_THREADS_PER_RANK}"
+            NUMEXPR_NUM_THREADS="${CPU_THREADS_PER_RANK}"
+            BLIS_NUM_THREADS="${CPU_THREADS_PER_RANK}"
+            OMP_DYNAMIC=FALSE
+            MKL_DYNAMIC=FALSE
+            TOKENIZERS_PARALLELISM=false
+            HF_DATASETS_OFFLINE=1
+            TRANSFORMERS_OFFLINE=1
+            CUDA_VISIBLE_DEVICES="${devices}"
+            PYTHONPATH="${SCRIPT_DIR}:${SHARED_FLOW_DIR}:${MEGATRAIN_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+            "${PYTHON}" "${MEGATRAIN_ENTRYPOINT}"
+            --config "${train_config}"
+            --timing-output-dir "${timing_dir}"
+            --warmup-steps "${WARMUP_STEPS}"
+            --devices "${local_devices}"
+        )
+    fi
+
+    local -a execution_command=(
+        "${RESOURCE_PREFIX[@]}"
+        "${VALIDATOR_PYTHON}" "${RESOURCE_EXEC}"
+        --profile server
+        --output-dir "${run_dir}"
+        --expected-cgroup-suffix "${case_unit}.scope"
+        -- "${command[@]}"
+    )
+    execution_command=(
+        systemd-run --user --scope --quiet
+        --unit "${case_unit}"
+        --property MemoryAccounting=yes
+        -- "${execution_command[@]}"
+    )
+    log "${BACKEND}/${profile_name}: seq=${seq}, GPUs=${NUM_GPUS}, global_batch=${GLOBAL_BATCH_SIZE}, tokens/step=${tokens_per_step}, full BF16, memory=${MEMORY_LIMIT_LABEL}, NUMA=${NUMA_POLICY_LABEL}, CPU threads/rank=${CPU_THREADS_PER_RANK}"
+    if (( DRY_RUN == 1 )); then
+        print_command "${execution_command[@]}"
+        printf 'DRY_RUN\n' > "${run_dir}/exit_code.txt"
+        return 0
+    fi
+
+    start_memory_monitor "${run_dir}"
+    ACTIVE_LOG_FIFO="${run_dir}/.train-log.fifo"
+    rm -f "${ACTIVE_LOG_FIFO}"
+    mkfifo "${ACTIVE_LOG_FIFO}"
+    tee "${train_log}" < "${ACTIVE_LOG_FIFO}" &
+    ACTIVE_TEE_PID=$!
+
+    local exit_code=0
+    set +e
+    (
+        cd "${run_cwd}"
+        exec "${execution_command[@]}"
+    ) > "${ACTIVE_LOG_FIFO}" 2>&1 &
+    ACTIVE_TRAIN_PID=$!
+    wait "${ACTIVE_TRAIN_PID}"
+    exit_code=$?
+    ACTIVE_TRAIN_PID=""
+    wait "${ACTIVE_TEE_PID}"
+    ACTIVE_TEE_PID=""
+    set -e
+    rm -f "${ACTIVE_LOG_FIFO}"
+    ACTIVE_LOG_FIFO=""
+
+    local monitor_failed=0
+    if [[ -z "${ACTIVE_MONITOR_PID}" ]] || \
+       ! kill -0 "${ACTIVE_MONITOR_PID}" 2>/dev/null; then
+        monitor_failed=1
+    fi
+    stop_active_monitor
+    analyze_memory_usage "${run_dir}"
+    if (( exit_code == 0 && monitor_failed != 0 )); then
+        warn "Training succeeded but the memory monitor exited early"
+        exit_code=89
+    elif (( exit_code == 0 )) && [[ ! -f "${run_dir}/memory_summary.json" ]]; then
+        warn "Training succeeded but memory_summary.json is missing"
+        exit_code=89
+    fi
+
+    if (( exit_code == 0 )); then
+        if [[ ! -f "${timing_dir}/step_timing.json" ]]; then
+            warn "Training succeeded but canonical timing is missing"
+            exit_code=90
+        elif ! "${VALIDATOR_PYTHON}" "${TIMING_VALIDATOR}" \
+            --path "${timing_dir}/step_timing.json" \
+            --expected-steps "${STEPS}" \
+            --warmup-steps "${WARMUP_STEPS}" \
+            --backend "${BACKEND}"; then
+            warn "Timing output violates the backend timing contract"
+            exit_code=92
+        fi
+    fi
+    printf '%s\n' "${exit_code}" > "${run_dir}/exit_code.txt"
+
+    if (( KEEP_MODEL_OUTPUT == 0 )) && [[ -d "${run_dir}/model_output" ]]; then
+        log "Removing generated model output for seq=${seq}"
+        rm -rf "${run_dir}/model_output"
+    fi
+    if (( exit_code != 0 )); then
+        warn "${BACKEND}/${profile_name}/seq_${seq} failed with ${exit_code}"
+        return "${exit_code}"
+    fi
+}
+
+run_profile() {
+    local profile_name="server"
+    profile_parameters
+    build_resource_policy
+    check_visible_gpu_capacity "${NUM_GPUS}"
+    local devices
+    devices="$(resolve_devices "${NUM_GPUS}")"
+    local profile_dir="${RUN_ROOT}/${profile_name}_${NUM_GPUS}gpu_batch${GLOBAL_BATCH_SIZE}"
+    mkdir -p "${profile_dir}"
+
+    local -a profile_sequences
+    if (( SEQUENCE_LENGTHS_OVERRIDE_SET == 1 )); then
+        profile_sequences=("${SEQUENCE_LENGTHS_OVERRIDE[@]}")
+    else
+        profile_sequences=("${SERVER_SEQUENCE_LENGTHS[@]}")
+    fi
+    log "Profile ${profile_name}: GPUs=${NUM_GPUS}, global_batch=${GLOBAL_BATCH_SIZE}, devices=${devices}, sequences=${profile_sequences[*]}"
+
+    local profile_status=0
+    local seq
+    for seq in "${profile_sequences[@]}"; do
+        if ! run_one_sequence \
+            "${profile_name}" "${profile_dir}" "${seq}" "${devices}"; then
+            profile_status=1
+            (( CONTINUE_ON_ERROR == 1 )) || break
+        fi
+    done
+    return "${profile_status}"
+}
+
+trap 'finalize_sweep_on_exit $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+prepare_runtime_directories
+check_files_and_environment
+RUN_TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
+RUN_ROOT="${LOG_BASE}/${RUN_TIMESTAMP}_${BACKEND^^}_BF16_FULL_SWEEP"
+mkdir -p "${RUN_ROOT}"
+
+if (( SKIP_DATASET_CHECK == 0 )); then
+    log "Validating Qwen3.5-122B-A10B BF16 checkpoint and dataset lengths"
+    "${VALIDATOR_PYTHON}" "${VALIDATOR}" \
+        --model-path "${MODEL_PATH}" \
+        --dataset-dir "${DATASET_DIR}" \
+        --dataset-name "${DATASET_NAME}" \
+        --required-length "${MAX_SEQUENCE_LENGTH}" \
+        --output-json "${RUN_ROOT}/dataset_validation.json"
+else
+    warn "Dataset tokenizer validation skipped by request"
+fi
+
+log "Qwen3.5-122B-A10B full-finetuning sweep: backend=${BACKEND}, profile=server, precision=BF16"
+log "Result root: ${RUN_ROOT}"
+
+overall_status=0
+run_profile || overall_status=1
+generate_sweep_summary || overall_status=$?
+exit "${overall_status}"
