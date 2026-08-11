@@ -40,12 +40,15 @@ Full-FT，也不会把模型基座权重全部设为可训练。三个 scope 都
 `vlm_lora_scope` 功能的 LLaMA-Factory 版本；只有 `vision` 模式另外依赖包含
 `kt_freeze_experts` 的 KT 版本。
 
-在两个配套 PR 尚未合入各自主分支前，先让测试指向对应工作树：
+在两个配套 PR 尚未合入各自主分支前，可以让当前 shell 中的所有测试指向对应工作树：
 
 ```bash
 export VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr
 export VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel
 ```
+
+为避免遗漏环境变量，后续每条可复制命令都再次以内联方式设置这两个路径；因此不要求
+预先执行上述 `export`。
 
 这足以执行预检和三种 scope 的 `--dry-run`。真正启动 `vision` 训练时，当前 Python
 环境中的 kt-kernel 也必须包含 `kt_freeze_experts`；仅把 Conv3D helper 注册进旧
@@ -108,6 +111,8 @@ test -f /mnt/data2/wbw/ktransformers/kt-kernel/python/sft/conv3d_compat.py
 ms-swift Conv3D 前向/反向数值等价性，不加载 122B 权重：
 
 ```bash
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_vlm_lora_smoke.sh \
   --preflight-only \
   --model-path /mnt/data2/models/Qwen3.5-122B-A10B \
@@ -132,6 +137,8 @@ bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_
 ## 4. 渲染配置并检查完整启动命令
 
 ```bash
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_vlm_lora_smoke.sh \
   --dry-run \
   --model-path /mnt/data2/models/Qwen3.5-122B-A10B \
@@ -152,6 +159,8 @@ bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_
 ## 5. 一条命令运行 8 卡冒烟测试
 
 ```bash
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_vlm_lora_smoke.sh \
   --model-path /mnt/data2/models/Qwen3.5-122B-A10B \
   --dataset-dir /mnt/data2/wbw/LLaMA-Factory/data \
@@ -178,6 +187,8 @@ Qwen3.5 VLM config 后、加载权重前自动调用 `enable_swift_conv3d_patch(
 数据：
 
 ```bash
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_vlm_lora_formal.sh \
   --model-path /mnt/data2/models/Qwen3.5-122B-A10B \
   --dataset-dir /mnt/data2/wbw/LLaMA-Factory/data \
@@ -192,6 +203,8 @@ bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_
 正式脚本不接受少于 10 个 step。只检查配置与命令时执行：
 
 ```bash
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_vlm_lora_formal.sh \
   --dry-run \
   --lora-scope all \

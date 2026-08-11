@@ -62,6 +62,68 @@ def iter_modules(root: Any):
                 queue.append(child)
 
 
+def validate_patch_embed_conv3d(visual: Any, scope: str) -> list[str]:
+    """Validate the bare or PEFT-wrapped vision patch Conv3D for a LoRA scope."""
+    import torch
+
+    proj = getattr(getattr(visual, "patch_embed", None), "proj", None)
+    conv3d = [
+        name
+        for name, module in visual.named_modules()
+        if isinstance(module, torch.nn.Conv3d)
+    ]
+    if scope == "text":
+        if not isinstance(proj, torch.nn.Conv3d) or conv3d != ["patch_embed.proj"]:
+            raise RuntimeError(
+                f"text scope requires one unwrapped vision patch Conv3D, got {conv3d}"
+            )
+        return conv3d
+
+    if scope not in ("vision", "all"):
+        raise RuntimeError(f"cannot validate vision patch Conv3D for scope {scope!r}")
+
+    base_layer = getattr(proj, "base_layer", None)
+    lora_a = getattr(proj, "lora_A", None)
+    lora_b = getattr(proj, "lora_B", None)
+    if not isinstance(base_layer, torch.nn.Conv3d):
+        raise RuntimeError(
+            f"{scope} scope requires a PEFT-wrapped vision patch Conv3D base layer"
+        )
+    if not isinstance(lora_a, torch.nn.ModuleDict) or not isinstance(
+        lora_b, torch.nn.ModuleDict
+    ):
+        raise RuntimeError(
+            f"{scope} scope requires Conv3D LoRA A/B module dictionaries"
+        )
+
+    adapter_names = set(lora_a) & set(lora_b)
+    if not adapter_names or set(lora_a) != set(lora_b):
+        raise RuntimeError(
+            f"vision patch Conv3D LoRA adapter mismatch: "
+            f"lora_A={sorted(lora_a)}, lora_B={sorted(lora_b)}"
+        )
+    if any(
+        not isinstance(lora_a[name], torch.nn.Conv3d)
+        or not isinstance(lora_b[name], torch.nn.Conv3d)
+        for name in adapter_names
+    ):
+        raise RuntimeError("vision patch LoRA A/B modules must all be Conv3D")
+
+    expected = {"patch_embed.proj.base_layer"}
+    expected.update(
+        f"patch_embed.proj.lora_A.{name}" for name in adapter_names
+    )
+    expected.update(
+        f"patch_embed.proj.lora_B.{name}" for name in adapter_names
+    )
+    if set(conv3d) != expected:
+        raise RuntimeError(
+            f"unexpected PEFT-wrapped vision Conv3D modules: {conv3d}; "
+            f"expected={sorted(expected)}"
+        )
+    return conv3d
+
+
 def assert_vlm_contract(model: Any) -> Any:
     import torch
 
@@ -91,13 +153,7 @@ def assert_vlm_contract(model: Any) -> Any:
         raise RuntimeError(
             "full VLM must retain both model.visual and model.language_model"
         )
-    conv3d = [
-        name
-        for name, module in visual.named_modules()
-        if isinstance(module, torch.nn.Conv3d)
-    ]
-    if conv3d != ["patch_embed.proj"]:
-        raise RuntimeError(f"unexpected vision Conv3D modules: {conv3d}")
+    conv3d = validate_patch_embed_conv3d(visual, scope)
     compatibility_api = load_conv3d_compat()
     torch_version = torch.__version__
     torch_base_version = tuple(
