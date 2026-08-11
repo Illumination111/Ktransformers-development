@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Weight-free preflight for the Qwen3.5-122B-A10B VLM LoRA smoke test."""
+"""Weight-free preflight for a Qwen3.5 MoE VLM LoRA test."""
 
 from __future__ import annotations
 
@@ -48,7 +48,12 @@ def load_rows(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def validate_model(model_path: Path) -> tuple[Any, dict[str, Any]]:
+def validate_model(
+    model_path: Path,
+    expected_layers: int = EXPECTED_LAYERS,
+    expected_experts: int = EXPECTED_EXPERTS,
+    expected_top_k: int = EXPECTED_TOP_K,
+) -> tuple[Any, dict[str, Any]]:
     config_raw = load_json(model_path / "config.json")
     archs = config_raw.get("architectures") or []
     text = config_raw.get("text_config") or {}
@@ -57,9 +62,9 @@ def validate_model(model_path: Path) -> tuple[Any, dict[str, Any]]:
         "architecture": archs == [EXPECTED_ARCH],
         "model_type": config_raw.get("model_type") == EXPECTED_MODEL_TYPE,
         "text_model_type": text.get("model_type") == "qwen3_5_moe_text",
-        "layers": text.get("num_hidden_layers") == EXPECTED_LAYERS,
-        "experts": text.get("num_experts") == EXPECTED_EXPERTS,
-        "top_k": text.get("num_experts_per_tok") == EXPECTED_TOP_K,
+        "layers": text.get("num_hidden_layers") == expected_layers,
+        "experts": text.get("num_experts") == expected_experts,
+        "top_k": text.get("num_experts_per_tok") == expected_top_k,
         "vision_depth": vision.get("depth") == 27,
         "conv3d_kernel": [
             vision.get("temporal_patch_size"),
@@ -99,11 +104,11 @@ def validate_model(model_path: Path) -> tuple[Any, dict[str, Any]]:
     if _get_layers_prefix(config) != "model.language_model.layers":
         fail("KT did not resolve the Qwen3.5 VLM language-layer prefix")
     if (moe.expert_num, moe.intermediate_size, moe.num_experts_per_tok) != (
-        256,
+        expected_experts,
         1024,
-        8,
+        expected_top_k,
     ):
-        fail("KT MoE architecture values do not match the 122B-A10B checkpoint")
+        fail("KT MoE architecture values do not match the checkpoint contract")
     return config, config_raw
 
 
@@ -235,6 +240,9 @@ def main() -> int:
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--dataset-dir", type=Path, required=True)
     parser.add_argument("--dataset-name", required=True)
+    parser.add_argument("--expected-layers", type=int, default=EXPECTED_LAYERS)
+    parser.add_argument("--expected-experts", type=int, default=EXPECTED_EXPERTS)
+    parser.add_argument("--expected-top-k", type=int, default=EXPECTED_TOP_K)
     parser.add_argument("--require-cuda", action="store_true")
     args = parser.parse_args()
 
@@ -243,7 +251,12 @@ def main() -> int:
 
     model_path = args.model_path.resolve()
     dataset_dir = args.dataset_dir.resolve()
-    config, config_raw = validate_model(model_path)
+    config, config_raw = validate_model(
+        model_path,
+        expected_layers=args.expected_layers,
+        expected_experts=args.expected_experts,
+        expected_top_k=args.expected_top_k,
+    )
     data_path, rows, images = validate_dataset(dataset_dir, args.dataset_name)
     processor_summary = validate_processor(model_path, images[0], config_raw)
     from load_conv3d_compat import load_conv3d_compat
@@ -252,7 +265,7 @@ def main() -> int:
 
     if args.require_cuda and not torch.cuda.is_available():
         fail(
-            "CUDA is not visible; an actual 122B smoke run requires eight visible GPUs"
+            "CUDA is not visible; an actual smoke run requires eight visible GPUs"
         )
 
     summary = {

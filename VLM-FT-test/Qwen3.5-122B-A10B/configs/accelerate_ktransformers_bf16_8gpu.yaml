@@ -1,4 +1,4 @@
-# Qwen3.5-122B-A10B VLM LoRA: KT AMX BF16 + FSDP2 server profile.
+# Qwen3.5 MoE VLM LoRA: KT AMX BF16 + FSDP2 eight-GPU server profile.
 compute_environment: LOCAL_MACHINE
 distributed_type: FSDP
 fsdp_config:
@@ -7,7 +7,7 @@ fsdp_config:
   fsdp_offload_params: false
   fsdp_reshard_after_forward: true
   fsdp_state_dict_type: FULL_STATE_DICT
-  # The vision tower is frozen. Only the 48 language decoder blocks need the
+  # Vision base weights remain frozen; language decoder blocks use the
   # explicit transformer-layer wrapping contract.
   fsdp_transformer_layer_cls_to_wrap: Qwen3_5MoeDecoderLayer
   fsdp_version: 2

@@ -198,8 +198,11 @@ def assert_vlm_contract(model: Any) -> Any:
         )
     wrapper_owners = [node for node in nodes if getattr(node, "_kt_wrappers", None)]
     wrapper_count = max((len(node._kt_wrappers) for node in wrapper_owners), default=0)
-    if wrapper_count != 48:
-        raise RuntimeError(f"expected 48 KT-wrapped MoE layers, got {wrapper_count}")
+    expected_wrappers = int(os.getenv("VLM_EXPECTED_KT_WRAPPERS", "48"))
+    if wrapper_count != expected_wrappers:
+        raise RuntimeError(
+            f"expected {expected_wrappers} KT-wrapped MoE layers, got {wrapper_count}"
+        )
     conditional._qwen35_vlm_vision_forward_count = 0
 
     def record_vision_forward(_module, _inputs, _output):

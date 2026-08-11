@@ -1,5 +1,9 @@
 # Qwen3.5-122B-A10B VLM LoRA tests
 
+The one-step full-modality resource-instrumented test passed on 2026-08-11.
+See [RESULTS.md](RESULTS.md) for the parameter-update proof and measured
+RAM/VRAM peaks.
+
 This directory mirrors the staged structure of `FFTtest/Qwen3.5-122B-A10B`,
 but it deliberately keeps the full `Qwen3_5MoeForConditionalGeneration`
 instead of installing the FFT text-only loader.
@@ -110,6 +114,13 @@ non-empty assistant targets. Six rows are not sufficient for convergence,
 quality or throughput claims. Smoke results are written below
 `test_log/<UTC timestamp>/`; formal results are written below
 `formal_test_log/<UTC timestamp>/`.
+
+New smoke and formal runs also write `resource_samples.jsonl` and
+`resource_summary.json`. Host memory uses the `htop`/`free` top-panel physical
+memory value and never sums process RSS; the training increment is peak minus
+the pre-launch baseline. GPU memory comes from `nvidia-smi`. The existing
+`formal_test_log/20260811T052157Z` run predates this monitor and therefore has
+no auditable RAM or VRAM samples/peaks.
 
 See `../docs/task_bash_Qwen3.5-122B-A10B-VLM-LoRA.md` for copy-paste launch
 commands and acceptance criteria.

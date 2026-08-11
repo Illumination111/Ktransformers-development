@@ -5,6 +5,7 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEST_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONFIG_DIR="${SCRIPT_DIR}/configs"
 LLAMA_FACTORY_DIR="${VLM_LLAMA_FACTORY_DIR:-/mnt/data2/wbw/LLaMA-Factory}"
 KT_SOURCE_DIR="${VLM_KT_SOURCE_DIR:-/mnt/data2/wbw/ktransformers/kt-kernel}"
@@ -16,6 +17,10 @@ DEVICES="${VLM_DEVICES:-0,1,2,3,4,5,6,7}"
 MAX_STEPS=1
 CUTOFF_LEN=512
 LORA_SCOPE="${VLM_LORA_SCOPE:-text}"
+EXPECTED_LAYERS="${VLM_EXPECTED_LAYERS:-48}"
+EXPECTED_EXPERTS="${VLM_EXPECTED_EXPERTS:-256}"
+EXPECTED_TOP_K="${VLM_EXPECTED_TOP_K:-8}"
+EXPECTED_WRAPPERS="${VLM_EXPECTED_KT_WRAPPERS:-${EXPECTED_LAYERS}}"
 PREFLIGHT_ONLY=0
 DRY_RUN=0
 
@@ -81,6 +86,7 @@ ACCELERATE="$(dirname "${PYTHON}")/accelerate"
 export CUDA_VISIBLE_DEVICES="${DEVICES}"
 export VLM_KT_CONV3D_COMPAT="${KT_SOURCE_DIR}/python/sft/conv3d_compat.py"
 export VLM_LORA_SCOPE="${LORA_SCOPE}"
+export VLM_EXPECTED_KT_WRAPPERS="${EXPECTED_WRAPPERS}"
 export PYTHONPATH="${SCRIPT_DIR}:${LLAMA_FACTORY_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 preflight=(
@@ -88,6 +94,9 @@ preflight=(
     --model-path "${MODEL_PATH}"
     --dataset-dir "${DATASET_DIR}"
     --dataset-name "${DATASET_NAME}"
+    --expected-layers "${EXPECTED_LAYERS}"
+    --expected-experts "${EXPECTED_EXPERTS}"
+    --expected-top-k "${EXPECTED_TOP_K}"
 )
 if [[ "${PREFLIGHT_ONLY}" -eq 0 && "${DRY_RUN}" -eq 0 ]]; then
     preflight+=(--require-cuda)
@@ -127,8 +136,31 @@ printf ' %q' "${launch[@]}"
 printf '\n'
 [[ "${DRY_RUN}" -eq 0 ]] || exit 0
 
+RESOURCE_SAMPLES="${RUN_DIR}/resource_samples.jsonl"
+RESOURCE_SUMMARY="${RUN_DIR}/resource_summary.json"
+RESOURCE_MONITOR_PID=""
+stop_resource_monitor() {
+    if [[ -n "${RESOURCE_MONITOR_PID}" ]]; then
+        kill -TERM "${RESOURCE_MONITOR_PID}" 2>/dev/null || true
+        wait "${RESOURCE_MONITOR_PID}" 2>/dev/null || true
+        RESOURCE_MONITOR_PID=""
+    fi
+}
+trap stop_resource_monitor EXIT INT TERM
+"${PYTHON}" "${TEST_ROOT}/resource_monitor.py" \
+    --output "${RESOURCE_SAMPLES}" --devices "${DEVICES}" --interval 1 &
+RESOURCE_MONITOR_PID=$!
+
 cd "${LLAMA_FACTORY_DIR}"
+set +e
 "${launch[@]}" 2>&1 | tee "${RUN_DIR}/train.log"
+TRAIN_STATUS=${PIPESTATUS[0]}
+set -e
+stop_resource_monitor
+"${PYTHON}" "${TEST_ROOT}/summarize_resources.py" \
+    --input "${RESOURCE_SAMPLES}" --output "${RESOURCE_SUMMARY}" --require-gpu \
+    2>&1 | tee "${RUN_DIR}/resource_summary.log"
+[[ "${TRAIN_STATUS}" -eq 0 ]] || die "training command failed with status ${TRAIN_STATUS}"
 "${PYTHON}" "${SCRIPT_DIR}/validate_adapter_output.py" --output-dir "${RUN_DIR}/model_output" \
     --lora-scope "${LORA_SCOPE}" \
     2>&1 | tee "${RUN_DIR}/adapter_validation.log"

@@ -1,4 +1,4 @@
-# Qwen3.5-122B-A10B image-SFT LoRA formal functional/stability test.
+# Qwen3.5 MoE image-SFT LoRA formal functional/stability test.
 # Render through ../render_train_config.py; do not run this file directly.
 
 ### model
