@@ -12,7 +12,11 @@ from safetensors.torch import save_file
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from train_vlm_contract import is_visual_lora, required_lora_groups  # noqa: E402
+from train_vlm_contract import (  # noqa: E402
+    is_visual_lora,
+    required_lora_groups,
+    validate_patch_embed_conv3d,
+)
 from validate_adapter_output import validate_adapter  # noqa: E402
 
 
@@ -76,3 +80,48 @@ def test_scope_helpers_distinguish_modalities():
     assert required_lora_groups("text") == ("text",)
     assert required_lora_groups("vision") == ("vision",)
     assert required_lora_groups("all") == ("text", "vision")
+
+
+def make_visual(*, wrapped: bool) -> torch.nn.Module:
+    visual = torch.nn.Module()
+    visual.patch_embed = torch.nn.Module()
+    if not wrapped:
+        visual.patch_embed.proj = torch.nn.Conv3d(
+            3, 4, kernel_size=2, stride=2
+        )
+        return visual
+
+    proj = torch.nn.Module()
+    proj.base_layer = torch.nn.Conv3d(3, 4, kernel_size=2, stride=2)
+    proj.lora_A = torch.nn.ModuleDict(
+        {"default": torch.nn.Conv3d(3, 2, kernel_size=2, stride=2, bias=False)}
+    )
+    proj.lora_B = torch.nn.ModuleDict(
+        {"default": torch.nn.Conv3d(2, 4, kernel_size=1, bias=False)}
+    )
+    visual.patch_embed.proj = proj
+    return visual
+
+
+def test_text_scope_accepts_unwrapped_patch_conv3d():
+    conv3d = validate_patch_embed_conv3d(make_visual(wrapped=False), "text")
+
+    assert conv3d == ["patch_embed.proj"]
+
+
+@pytest.mark.parametrize("scope", ("vision", "all"))
+def test_visual_scope_accepts_peft_wrapped_patch_conv3d(scope):
+    conv3d = validate_patch_embed_conv3d(make_visual(wrapped=True), scope)
+
+    assert set(conv3d) == {
+        "patch_embed.proj.base_layer",
+        "patch_embed.proj.lora_A.default",
+        "patch_embed.proj.lora_B.default",
+    }
+
+
+def test_patch_conv3d_contract_rejects_wrong_scope_structure():
+    with pytest.raises(RuntimeError, match="unwrapped"):
+        validate_patch_embed_conv3d(make_visual(wrapped=True), "text")
+    with pytest.raises(RuntimeError, match="PEFT-wrapped"):
+        validate_patch_embed_conv3d(make_visual(wrapped=False), "all")
