@@ -68,8 +68,8 @@ PyTorch。导入动作由 LLaMA-Factory 新增的 KT-VLM 兼容模块自动完�
 首次准备环境时执行：
 
 ```bash
-HTTPS_PROXY=http://192.168.111.1:7897 \
-HTTP_PROXY=http://192.168.111.1:7897 \
+HTTPS_PROXY=http://192.168.108.139:7897 \
+HTTP_PROXY=http://192.168.108.139:7897 \
 /mnt/data2/wbw/conda/envs/Kllama/bin/python -m pip install "ms-swift==4.4.2"
 ```
 
