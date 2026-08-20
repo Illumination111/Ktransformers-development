@@ -2,3 +2,6 @@
 **/__pycache__/
 *.py[cod]
 .DS_Store
+
+# Generated RLFT probability comparison results
+RLFTtest/results/

@@ -1,0 +1,27 @@
+# Local KT/SGLang/HF probability-test environment (Python 3.11)
+#
+# The canonical source trees and runtime PYTHONPATH are documented in README.md.
+# Install the CUDA wheel first; do not install the CPU-only torch wheel.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.9.1+cu128
+torchvision==0.24.1+cu128
+torchaudio==2.9.1+cu128
+
+# Install the checked-out local KT and SGLang sources in editable mode (below).
+# HF integration packages used by the local KT kernel.
+transformers-kt==5.6.0.post2
+accelerate-kt==1.14.0.post2
+
+# HF+KT loader and the teacher-forced scorer.
+safetensors>=0.4.0
+peft>=0.14.0
+tokenizers>=0.21.0
+sentencepiece
+omegaconf
+tensordict
+requests
+
+# Local installs (run from /home/wubowen):
+# python -m pip install -e /home/wubowen/ktransformers-RL/ktransformers/kt-kernel --no-deps
+# python -m pip install -e /home/wubowen/ktransformers-RL/ktransformers/third_party/sglang/python --no-deps
+# python -m pip install -e /home/wubowen/ktransformers-RL/verl --no-deps
