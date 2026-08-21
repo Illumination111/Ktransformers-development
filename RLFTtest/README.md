@@ -99,3 +99,98 @@ the original HF model directory can also be passed as `--kt-weight-path`; for
 AMXINT8/AMXINT4 use the corresponding converted KT weight directory. Do not
 install the legacy `KTransformersOps` extension: the current runtime uses
 `transformers.integrations.kt`, `accelerate-kt`, and `kt_kernel`.
+
+## BF16 storage-rounding probe
+
+`probe_bf16_storage.py` isolates the error caused by storing FP32 intermediate
+results in BF16 buffers. It is a small native `AMXBF16_MOE` test, so attention,
+layernorm, routing differences, and the vocabulary head are excluded.
+
+For identical BF16 inputs/weights and FP32 routing weights, it computes:
+
+```text
+fp32_ideal:  FP32 calculation without intermediate BF16 stores
+bf16_store:  same calculation with explicit FP32 -> BF16 -> FP32 stores
+amx:         actual AMXBF16_MOE output
+```
+
+The report separates:
+
+```text
+storage_rounding = fp32_ideal vs bf16_store
+amx_extra        = bf16_store vs amx
+total            = fp32_ideal vs amx
+```
+
+Run it on an idle node. The probe uses CPU AMX; `CUDA_VISIBLE_DEVICES` is set
+for resource isolation and does not change the micro-kernel calculation:
+
+```bash
+conda activate kt-rlft
+CUDA_VISIBLE_DEVICES=1 \
+  python probe_bf16_storage.py \
+  --threads 48 \
+  --qlens 1 8 32 \
+  --output results/bf16_storage_probe.json
+```
+
+The run on 2026-08-21 used GPU 1 and produced:
+
+| qlen | storage relative L2 | AMX-extra relative L2 | total relative L2 |
+|---:|---:|---:|---:|
+| 1 | 0.003966 | 0.003486 | 0.003680 |
+| 8 | 0.003956 | 0.003250 | 0.003723 |
+| 32 | 0.003800 | 0.003173 | 0.003818 |
+
+Interpretation: FP32-to-BF16 storage is a material part of the error, about
+`0.38%` relative L2 in this micro-test. The AMX implementation adds a similar
+but slightly smaller error, about `0.32%-0.35%`. Therefore the current result
+does not support attributing the model-level logprob drift to storage rounding
+alone; AMX kernel/packing and operation-order differences must also be retained
+as independent contributors.
+
+## Rollout vs score consistency
+
+`rollout_score_consistency.py` tests the actual RLFT comparison contract. It
+generates a response once, saves its `response_ids` and rollout
+`output_token_logprobs`, and then scores the exact same prompt+response without
+sampling again. It reports token-level error, sequence ratio, and PPO clipping
+fraction. Use `--skip-hf` for the SGLang self-consistency control and
+`--replay-report` to run HF score on an already saved response:
+
+```bash
+CUDA_VISIBLE_DEVICES=5,6 \
+  python rollout_score_consistency.py \
+  --model-path /mnt/qjh007/models/Qwen3-30B-A3B \
+  --kt-weight-path /mnt/qjh007/models/Qwen3-30B-A3B \
+  --kt-method BF16 --tp-size 2 --kt-num-threads 48 \
+  --max-new-tokens 8 --temperature 1.0 --top-p 1.0 \
+  --skip-hf --output-dir results
+
+CUDA_VISIBLE_DEVICES=5,6 \
+  python rollout_score_consistency.py \
+  --model-path /mnt/qjh007/models/Qwen3-30B-A3B \
+  --kt-weight-path /mnt/qjh007/models/Qwen3-30B-A3B \
+  --kt-method BF16 --hf-device-map balanced --hf-max-memory-gib 44 \
+  --score-backend kt \
+  --replay-report results/<rollout-report>/rollout_score_result.json
+```
+
+The 2026-08-21 30B run used one prompt and eight response tokens. SGLang
+rollout and the same SGLang+KT server's fixed-response score matched to
+`2.38e-7` maximum absolute logprob error, with zero PPO clipping. The cross
+runtime comparisons were:
+
+| comparison | mean absolute error | max absolute error | sequence ratio | clip fraction |
+|---|---:|---:|---:|---:|
+| SGLang+KT rollout vs SGLang+KT score | `4.24e-8` | `2.38e-7` | `1.00000014` | `0%` |
+| SGLang+KT rollout vs HF+KT score | `0.40505` | `1.84347` | `0.0426` | `37.5%` |
+| SGLang+KT rollout vs plain HF score | `0.37467` | `1.76345` | `0.0619` | `25%` |
+| HF+KT score vs plain HF score | `0.09556` | `0.42927` | n/a | n/a |
+
+The SGLang log reports `AVX2_BF16_MOE_TP`, while the HF+KT log reports
+`AMX_MOE_TP`. Therefore the large cross-runtime difference cannot be assigned
+to BF16 storage rounding alone. The controls prove that SGLang's own rollout
+and score API are aligned; HF/SGLang runtime and kernel differences dominate
+this particular cross-path result, with an additional KT effect visible in the
+HF+KT versus plain-HF control.

@@ -5,3 +5,15 @@
 
 # Generated RLFT probability comparison results
 RLFTtest/results/
+RLFTtest/bf16_storage_probe*.json
+
+# Generated Qwen3-30B-A3B B0 artifacts
+RLFT-baseline/checkpoints/
+RLFT-baseline/data/processed/
+RLFT-baseline/data/raw/
+RLFT-baseline/env/tools/
+RLFT-baseline/eval/
+RLFT-baseline/logs/
+RLFT-baseline/metrics/
+RLFT-baseline/reports/
+RLFT-baseline/worktree/

@@ -1,0 +1,14 @@
+{
+  "python": "3.11.15 (main, Jun 11 2026, 15:20:16) [GCC 14.3.0]",
+  "platform": "Linux-5.15.0-91-generic-x86_64-with-glibc2.35",
+  "packages": {
+    "verl": "0.9.0.dev0",
+    "vllm": "0.12.0",
+    "torch": "2.9.0",
+    "transformers": "4.57.6",
+    "ray": "2.57.0",
+    "datasets": "4.8.5",
+    "pyarrow": "25.0.1",
+    "tensordict": "0.10.0"
+  }
+}
