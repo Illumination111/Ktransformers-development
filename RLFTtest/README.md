@@ -54,7 +54,7 @@ as an AMX/GGUF directory unless that is the intended format.
 
 ```bash
 conda activate kt-rlft
-cd /home/wubowen/Ktransformers-development/RLFTtest
+cd /mnt/qjh001/wubowen/Ktransformers-development/RLFTtest
 CUDA_VISIBLE_DEVICES=0,1 python compare_probability.py \
   --model-size 30b \
   --model-path /mnt/qjh007/models/Qwen3-30B-A3B \

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the deterministic DAPO 2048/256 B0 split and benchmark files."""
+"""Build the deterministic 2048/256 B0 split and benchmark files."""
 
 from __future__ import annotations
 
@@ -12,16 +12,20 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path("/home/wubowen/Ktransformers-development/RLFT-baseline")
+ROOT = Path(__file__).resolve().parents[1]
 MODEL = Path("/mnt/qjh007/models/Qwen3-30B-A3B")
 REVISION_RE = re.compile(r"^[0-9a-f]{40,64}$")
+NEKOQA_SYSTEM_PROMPT = (
+    "你是一只可爱的猫娘助手。请称呼用户为“主人”，在准确、直接回答问题的同时，"
+    "自然使用“喵”“的说”等口癖；保持友善、简洁，不要展示思维过程。"
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dapo-id", default="BytedTsinghua-SIA/DAPO-Math-17k")
-    parser.add_argument("--dapo-revision", required=True)
-    parser.add_argument("--dapo-split", default="train")
+    parser.add_argument("--dataset-id", default="liumindmind/NekoQA-10K")
+    parser.add_argument("--dataset-revision")
+    parser.add_argument("--dataset-split", default="train")
     parser.add_argument("--math500-id", default="HuggingFaceH4/MATH-500")
     parser.add_argument("--math500-revision", required=True)
     parser.add_argument("--math500-split", default="test")
@@ -57,7 +61,7 @@ def prompt_text(value: Any) -> str:
 
 
 def record_prompt(record: dict[str, Any]) -> str:
-    for key in ("prompt", "problem", "question", "query"):
+    for key in ("prompt", "problem", "question", "query", "instruction"):
         if key in record and record[key] not in (None, ""):
             return prompt_text(record[key])
     raise KeyError(f"no prompt-like field; keys={sorted(record)}")
@@ -67,7 +71,7 @@ def record_ground_truth(record: dict[str, Any]) -> str:
     reward = record.get("reward_model")
     if isinstance(reward, dict) and reward.get("ground_truth") not in (None, ""):
         return normalize_text(reward["ground_truth"])
-    for key in ("answer", "ground_truth", "solution", "target"):
+    for key in ("answer", "ground_truth", "solution", "target", "output", "response"):
         if key in record and record[key] not in (None, ""):
             return normalize_text(record[key])
     raise KeyError(f"no ground-truth field; keys={sorted(record)}")
@@ -139,8 +143,13 @@ def benchmark_records(dataset: Any, source: str) -> tuple[list[dict[str, Any]], 
 
 def main() -> int:
     args = parse_args()
+    dataset_id = args.dataset_id
+    dataset_revision = args.dataset_revision
+    dataset_split = args.dataset_split
+    if not dataset_revision:
+        raise ValueError("an immutable --dataset-revision is required")
     for value, label in (
-        (args.dapo_revision, "DAPO revision"),
+        (dataset_revision, "dataset revision"),
         (args.math500_revision, "MATH-500 revision"),
         (args.aime2024_revision, "AIME-2024 revision"),
     ):
@@ -154,12 +163,12 @@ def main() -> int:
 
     api = HfApi()
     revisions = {
-        "dapo": resolve_revision(api, args.dapo_id, args.dapo_revision),
+        "dataset": resolve_revision(api, dataset_id, dataset_revision),
         "math500": resolve_revision(api, args.math500_id, args.math500_revision),
         "aime2024": resolve_revision(api, args.aime2024_id, args.aime2024_revision),
     }
     load_kwargs = {"cache_dir": str(args.cache_dir)}
-    dapo = load_dataset(args.dapo_id, split=args.dapo_split, revision=revisions["dapo"], **load_kwargs)
+    source_dataset = load_dataset(dataset_id, split=dataset_split, revision=revisions["dataset"], **load_kwargs)
     math500 = load_dataset(
         args.math500_id, split=args.math500_split, revision=revisions["math500"], **load_kwargs
     )
@@ -171,10 +180,10 @@ def main() -> int:
     benchmark_prompts = math_prompts | aime_prompts
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True, local_files_only=True)
-    # The published DAPO parquet stores the same 17,917 source IDs in 100
-    # repeated blocks (1,791,700 physical rows). Collapse that storage-level
-    # expansion first, then perform the protocol's normalized-prompt dedupe.
-    source_infos = dapo["extra_info"]
+    # Collapse storage-level duplicate source IDs when present, then perform
+    # normalized-prompt dedupe. NekoQA has no extra_info column, so each row is
+    # its own source record at this stage.
+    source_infos = source_dataset["extra_info"] if "extra_info" in source_dataset.column_names else [{}] * len(source_dataset)
     unique_source_ids: set[str] = set()
     unique_positions: list[int] = []
     for position, info in enumerate(source_infos):
@@ -182,23 +191,39 @@ def main() -> int:
         if source_id not in unique_source_ids:
             unique_source_ids.add(source_id)
             unique_positions.append(position)
-    unique_dapo = dapo.select(unique_positions)
+    unique_source = source_dataset.select(unique_positions)
     candidates: list[dict[str, Any]] = []
     exclusions: list[dict[str, Any]] = []
     seen_prompts: set[str] = set()
-    for unique_index, raw in enumerate(unique_dapo):
+    source_label = "nekoqa" if dataset_id == "liumindmind/NekoQA-10K" else dataset_id.replace("/", "_")
+    for unique_index, raw in enumerate(unique_source):
         index = unique_positions[unique_index]
         text = record_prompt(raw)
-        truth = record_ground_truth(raw)
-        sample_hash = sha256_text("math_dapo\0" + text + "\0" + truth)
+        try:
+            truth = record_ground_truth(raw)
+        except KeyError:
+            exclusions.append(
+                {
+                    "source_index": index,
+                    "sample_hash": sha256_text(source_label + "\0" + text),
+                    "reason": "missing_ground_truth",
+                }
+            )
+            continue
+        sample_hash = sha256_text(source_label + "\0" + text + "\0" + truth)
         reason = None
         if text in seen_prompts:
             reason = "duplicate_prompt"
         elif text in benchmark_prompts:
             reason = "benchmark_overlap"
         else:
+            messages = [{"role": "user", "content": text}]
+            template_kwargs: dict[str, Any] = {}
+            if source_label == "nekoqa":
+                messages.insert(0, {"role": "system", "content": NEKOQA_SYSTEM_PROMPT})
+                template_kwargs["enable_thinking"] = False
             rendered = tokenizer.apply_chat_template(
-                [{"role": "user", "content": text}], tokenize=True, add_generation_prompt=True
+                messages, tokenize=True, add_generation_prompt=True, **template_kwargs
             )
             if len(rendered) > args.max_prompt_length:
                 reason = "overlong_prompt"
@@ -208,9 +233,9 @@ def main() -> int:
             continue
         candidates.append(
             {
-                "data_source": "math_dapo",
-                "prompt": [{"role": "user", "content": text}],
-                "ability": "math",
+                "data_source": source_label,
+                "prompt": messages,
+                "ability": "chat" if source_label == "nekoqa" else "math",
                 "reward_model": {"style": "rule", "ground_truth": truth},
                 "extra_info": {"source_index": index, "sample_hash": sample_hash, "split": "unassigned"},
                 "_prompt_tokens": len(rendered),
@@ -243,7 +268,7 @@ def main() -> int:
     manifest = {
         "protocol": "qwen3-30b-a3b-verl-grpo-b0",
         "datasets": {
-            "dapo": {"id": args.dapo_id, "revision": revisions["dapo"], "split": args.dapo_split},
+            "train": {"id": dataset_id, "revision": revisions["dataset"], "split": dataset_split},
             "math500": {"id": args.math500_id, "revision": revisions["math500"], "split": args.math500_split},
             "aime2024": {
                 "id": args.aime2024_id,
@@ -251,14 +276,14 @@ def main() -> int:
                 "split": args.aime2024_split,
             },
         },
-        "source_rows": {"dapo": len(dapo), "math500": len(math500), "aime2024": len(aime2024)},
+        "source_rows": {"train": len(source_dataset), "math500": len(math500), "aime2024": len(aime2024)},
         "source_unique_rows": {
-            "dapo_ids": len(unique_dapo),
+            "train_source_ids": len(unique_source),
             "math500_prompts": len(math_rows),
             "aime2024_prompts": len(aime_rows),
         },
         "source_repetition": {
-            "dapo_physical_rows_minus_unique_ids": len(dapo) - len(unique_dapo),
+            "train_physical_rows_minus_unique_ids": len(source_dataset) - len(unique_source),
             "aime2024_physical_rows_minus_unique_prompts": len(aime2024) - len(aime_rows),
         },
         "eligible_rows": len(candidates),
@@ -269,16 +294,18 @@ def main() -> int:
         "exclusions": exclusions,
         "exclusion_counts": {
             reason: sum(item["reason"] == reason for item in exclusions)
-            for reason in ("duplicate_prompt", "benchmark_overlap", "overlong_prompt")
+            for reason in ("duplicate_prompt", "benchmark_overlap", "overlong_prompt", "missing_ground_truth")
         },
         "prompt_token_lengths": describe(prompt_lengths),
         "model_path": str(args.model_path.resolve()),
         "max_prompt_length": args.max_prompt_length,
+        "system_prompt": NEKOQA_SYSTEM_PROMPT if source_label == "nekoqa" else None,
         "outputs": {
             name: {"path": str(path.resolve()), "sha256": sha256_file(path), "rows": len(Dataset.from_parquet(str(path)))}
             for name, path in outputs.items()
         },
         "selection": "normalize -> exact prompt dedupe -> benchmark exclusion -> overlength exclusion -> sha256 sort",
+        "train_source": source_label,
     }
     args.manifest.parent.mkdir(parents=True, exist_ok=True)
     args.manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Teacher-force the fixed vLLM trajectory through native veRL FSDP2."""
+"""Teacher-force the fixed rollout trajectory through native veRL FSDP2."""
 
 from __future__ import annotations
 

@@ -51,6 +51,9 @@ base_overrides=(
     "data.val_files=['$B0_VAL_DATA']"
     "data.seed=$B0_SEED"
     "actor_rollout_ref.actor.data_loader_seed=$B0_SEED"
+    "actor_rollout_ref.rollout.name=$B0_ROLLOUT_BACKEND"
+    "reward.custom_reward_function.path=$B0_REWARD_FUNCTION"
+    reward.custom_reward_function.name=compute_score
     "trainer.project_name=$B0_PROJECT"
     "trainer.experiment_name=$experiment"
     "trainer.default_local_dir=$checkpoint_dir"
@@ -115,6 +118,7 @@ export ROLLOUT_N="$B0_ROLLOUT_N"
 export TOTAL_EPOCHS="$B0_TOTAL_EPOCHS"
 export PROJECT_NAME="$B0_PROJECT"
 export EXPERIMENT_NAME="$experiment"
+export REWARD_FUNCTION_PATH="$B0_REWARD_FUNCTION"
 
 cd "$B0_WORKTREE"
 printf 'Starting stage %s; log=%s\n' "$stage" "$log_file"

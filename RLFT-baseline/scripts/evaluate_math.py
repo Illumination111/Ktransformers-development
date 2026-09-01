@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the fixed B0 MATH-500 or AIME-2024 protocol with native vLLM."""
+"""Run the fixed B0 MATH-500 or AIME-2024 protocol with native SGLang."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path("/home/wubowen/Ktransformers-development/RLFT-baseline")
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,6 +26,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--limit", type=int, help="Diagnostic only: evaluate the first N questions")
     parser.add_argument("--seed-count", type=int, help="Diagnostic only: use the first N protocol seeds")
+    parser.add_argument(
+        "--allow-noncanonical-data",
+        action="store_true",
+        help="Allow a local train/validation subset instead of canonical MATH-500 (diagnostic only)",
+    )
     return parser.parse_args()
 
 
@@ -57,13 +62,13 @@ def main() -> int:
 
     from datasets import Dataset
     from transformers import AutoTokenizer
-    from vllm import LLM, SamplingParams
+    import sglang as sgl
 
     from verl.utils.reward_score import default_compute_score
 
     dataset = Dataset.from_parquet(str(data_path))
     expected = 500 if args.benchmark == "math500" else None
-    if expected is not None and len(dataset) != expected:
+    if expected is not None and len(dataset) != expected and not args.allow_noncanonical_data:
         raise RuntimeError(f"{args.benchmark} must contain {expected} rows, got {len(dataset)}")
     if args.limit is not None:
         if args.limit < 1 or args.limit > len(dataset):
@@ -85,33 +90,36 @@ def main() -> int:
         if args.seed_count < 1 or args.seed_count > len(seeds):
             raise ValueError(f"invalid --seed-count={args.seed_count}")
         seeds = seeds[: args.seed_count]
-    llm = LLM(
-        model=str(args.model_path),
-        tensor_parallel_size=args.tensor_parallel_size,
+    engine = sgl.Engine(
+        model_path=str(args.model_path),
+        tp_size=args.tensor_parallel_size,
         dtype="bfloat16",
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=max_prompt + args.max_new_tokens,
-        enable_chunked_prefill=True,
-        enable_prefix_caching=True,
+        mem_fraction_static=args.gpu_memory_utilization,
+        context_length=max_prompt + args.max_new_tokens,
+        chunked_prefill_size=8192,
         trust_remote_code=True,
-        distributed_executor_backend="mp",
-        seed=42,
+        random_seed=42,
     )
     all_rows: list[dict[str, Any]] = []
     started = time.time()
     for sample_index, seed in enumerate(seeds):
-        params = SamplingParams(
-            temperature=0.6,
-            top_p=0.95,
-            top_k=20,
-            min_p=0.0,
-            max_tokens=args.max_new_tokens,
-            seed=seed,
-        )
-        outputs = llm.generate([{"prompt_token_ids": ids} for ids in prompt_ids], params, use_tqdm=True)
+        params = {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0.0,
+            "max_new_tokens": args.max_new_tokens,
+            "sampling_seed": seed,
+        }
+        outputs = engine.generate(input_ids=prompt_ids, sampling_params=params)
+        if isinstance(outputs, dict):
+            outputs = [outputs]
         for problem_index, (source, output) in enumerate(zip(dataset, outputs, strict=True)):
-            completion = output.outputs[0]
-            text = completion.text
+            text = output["text"]
+            output_ids = list(output["output_ids"])
+            finish_reason = output.get("meta_info", {}).get("finish_reason")
+            if isinstance(finish_reason, dict):
+                finish_reason = finish_reason.get("type")
             verifier = default_compute_score(
                 data_source=source["data_source"],
                 solution_str=text,
@@ -126,9 +134,9 @@ def main() -> int:
                     "seed": seed,
                     "correct": correct,
                     "response": text,
-                    "response_token_ids": list(completion.token_ids),
-                    "response_tokens": len(completion.token_ids),
-                    "finish_reason": completion.finish_reason,
+                    "response_token_ids": output_ids,
+                    "response_tokens": len(output_ids),
+                    "finish_reason": finish_reason,
                     "verifier": verifier_detail,
                 }
             )
@@ -180,9 +188,7 @@ def main() -> int:
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(metrics, indent=2))
     print(args.output)
-    shutdown = getattr(llm, "shutdown", None)
-    if callable(shutdown):
-        shutdown()
+    engine.shutdown()
     return 0
 
 

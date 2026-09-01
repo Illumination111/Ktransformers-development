@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path("/home/wubowen/Ktransformers-development/RLFT-baseline")
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def parse_args() -> argparse.Namespace:

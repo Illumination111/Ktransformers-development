@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path("/home/wubowen/Ktransformers-development/RLFT-baseline")
+ROOT = Path(__file__).resolve().parents[1]
 MODEL = Path("/mnt/qjh007/models/Qwen3-30B-A3B")
 
 
@@ -44,7 +44,18 @@ def command(*args: str) -> dict[str, Any]:
 
 def package_versions() -> dict[str, str | None]:
     result = {}
-    for name in ("verl", "vllm", "torch", "transformers", "ray", "datasets", "pyarrow", "tensordict"):
+    for name in (
+        "verl",
+        "sglang",
+        "sgl-kernel",
+        "flashinfer-python",
+        "torch",
+        "transformers",
+        "ray",
+        "datasets",
+        "pyarrow",
+        "tensordict",
+    ):
         try:
             result[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:

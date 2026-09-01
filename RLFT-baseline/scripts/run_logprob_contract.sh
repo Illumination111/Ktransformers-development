@@ -14,11 +14,11 @@ fi
 
 contract_dir="$B0_ROOT/metrics/logprob_contract"
 prompt_manifest="$contract_dir/prompt.json"
-rollout_result="$contract_dir/vllm_rollout.json"
+rollout_result="$contract_dir/sglang_rollout.json"
 fsdp_result="$contract_dir/fsdp2_score.json"
 commands=(
     "$B0_CONDA_PREFIX/bin/python $script_dir/make_contract_prompt.py --model-path $B0_MODEL --output $prompt_manifest"
-    "CUDA_VISIBLE_DEVICES=0,1,2,3 $B0_CONDA_PREFIX/bin/python $script_dir/vllm_contract_rollout.py --manifest $prompt_manifest --output $rollout_result --tensor-parallel-size 4 --gpu-memory-utilization 0.6"
+    "CUDA_VISIBLE_DEVICES=0,1,2,3 $B0_CONDA_PREFIX/bin/python $script_dir/sglang_contract_rollout.py --manifest $prompt_manifest --output $rollout_result --tensor-parallel-size 4 --gpu-memory-utilization 0.6"
     "CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 $B0_CONDA_PREFIX/bin/torchrun --standalone --nproc_per_node=8 $script_dir/fsdp_contract_score.py --rollout $rollout_result --output $fsdp_result"
 )
 
@@ -42,7 +42,7 @@ export PYTHONPATH="$script_dir:$B0_WORKTREE${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONHASHSEED="$B0_SEED"
 
 "$B0_CONDA_PREFIX/bin/python" "$script_dir/make_contract_prompt.py" --model-path "$B0_MODEL" --output "$prompt_manifest"
-CUDA_VISIBLE_DEVICES=0,1,2,3 "$B0_CONDA_PREFIX/bin/python" "$script_dir/vllm_contract_rollout.py" \
+CUDA_VISIBLE_DEVICES=0,1,2,3 "$B0_CONDA_PREFIX/bin/python" "$script_dir/sglang_contract_rollout.py" \
     --manifest "$prompt_manifest" --output "$rollout_result" \
     --tensor-parallel-size 4 --gpu-memory-utilization 0.6
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 "$B0_CONDA_PREFIX/bin/torchrun" --standalone --nproc_per_node=8 \
