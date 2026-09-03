@@ -35,6 +35,7 @@ fi
 "$uv_bin" pip install --python "$B0_CONDA_PREFIX/bin/python" --index-url https://download.pytorch.org/whl/cu128 --no-deps "torch==$B0_PYTORCH_VERSION"
 "$uv_bin" pip install --python "$B0_CONDA_PREFIX/bin/python" --no-deps "transformers==$B0_TRANSFORMERS_VERSION"
 "$uv_bin" pip install --python "$B0_CONDA_PREFIX/bin/python" --no-deps "peft==$B0_PEFT_VERSION"
+"$uv_bin" pip install --python "$B0_CONDA_PREFIX/bin/python" "math-verify==$B0_MATH_VERIFY_VERSION"
 
 "$uv_bin" pip freeze --python "$B0_CONDA_PREFIX/bin/python" > "$B0_ROOT/env/pip-freeze.txt"
 RLFT_BASELINE_ROOT="$B0_ROOT" "$B0_CONDA_PREFIX/bin/python" - <<'PY'
@@ -46,7 +47,7 @@ import sys
 from pathlib import Path
 
 root = Path(os.environ["RLFT_BASELINE_ROOT"])
-names = ["verl", "sglang", "sgl-kernel", "flashinfer-python", "flash-attn", "torch", "transformers", "accelerate", "peft", "torchao", "ray", "datasets", "pyarrow", "tensordict"]
+names = ["verl", "sglang", "sgl-kernel", "flashinfer-python", "flash-attn", "torch", "transformers", "accelerate", "peft", "torchao", "ray", "datasets", "pyarrow", "tensordict", "math-verify"]
 versions = {}
 for name in names:
     try:

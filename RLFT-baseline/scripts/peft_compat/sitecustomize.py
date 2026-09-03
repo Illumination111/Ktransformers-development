@@ -22,6 +22,29 @@ def _find_spec_without_old_torchao(name, *args, **kwargs):
 importlib.util.find_spec = _find_spec_without_old_torchao
 
 
+def _patch_transformers_tensor_parallel_symbols():
+    """Provide the PEFT-only embedding TP sentinel missing in Transformers 4.57."""
+    try:
+        from transformers.integrations import tensor_parallel
+    except Exception:
+        return
+    if hasattr(tensor_parallel, "EmbeddingParallel"):
+        return
+
+    class EmbeddingParallel:
+        """Compatibility sentinel for PEFT's optional embedding-LoRA branch.
+
+        This run targets only q/k/v/o projections and does not use embedding
+        LoRA or Hugging Face tensor parallelism. PEFT imports the class before
+        checking whether that branch is needed, so a sentinel is sufficient.
+        """
+
+    tensor_parallel.EmbeddingParallel = EmbeddingParallel
+
+
+_patch_transformers_tensor_parallel_symbols()
+
+
 def _patch_sgl_kernel_optional_symbols():
     """Let SGLang register native Qwen3-MoE with its fused QK path disabled."""
     try:

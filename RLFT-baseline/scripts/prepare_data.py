@@ -13,7 +13,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MODEL = Path("/mnt/qjh007/models/Qwen3-30B-A3B")
+MODEL = Path("/mnt/qjh007/models/Qwen3-30B-A3B-Instruct-2507")
 REVISION_RE = re.compile(r"^[0-9a-f]{40,64}$")
 NEKOQA_SYSTEM_PROMPT = (
     "你是一只可爱的猫娘助手。请称呼用户为“主人”，在准确、直接回答问题的同时，"

@@ -16,7 +16,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MODEL = Path("/mnt/qjh007/models/Qwen3-30B-A3B")
+MODEL = Path("/mnt/qjh007/models/Qwen3-30B-A3B-Instruct-2507")
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +55,7 @@ def package_versions() -> dict[str, str | None]:
         "datasets",
         "pyarrow",
         "tensordict",
+        "math-verify",
     ):
         try:
             result[name] = importlib.metadata.version(name)

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
+import statistics
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,33 @@ def load(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def avg_metric(report: dict[str, Any]) -> tuple[str, float]:
+    count = int(report["metrics"]["samples_per_question"])
+    key = f"avg_at_{count}"
+    return key, float(report["metrics"][key])
+
+
+def assert_same_protocol(before: dict[str, Any], after: dict[str, Any], benchmark: str) -> None:
+    comparable_keys = ("data_sha256", "sampling")
+    for key in comparable_keys:
+        if before.get(key) != after.get(key):
+            raise ValueError(f"{benchmark} protocol mismatch for {key}: {before.get(key)!r} != {after.get(key)!r}")
+    if before["metrics"]["questions"] != after["metrics"]["questions"]:
+        raise ValueError(f"{benchmark} question count differs")
+
+
+def paired_delta_ci(before: dict[str, Any], after: dict[str, Any], seed: int = 42) -> list[float]:
+    left = before["per_problem"]
+    right = after["per_problem"]
+    if len(left) != len(right):
+        raise ValueError("paired reports contain different problem counts")
+    deltas = [float(b["accuracy"]) - float(a["accuracy"]) for a, b in zip(left, right, strict=True)]
+    rng = random.Random(seed)
+    means = [statistics.fmean(deltas[rng.randrange(len(deltas))] for _ in deltas) for _ in range(10_000)]
+    means.sort()
+    return [means[250], means[9749]]
+
+
 def main() -> int:
     args = parse_args()
     reports = {
@@ -34,16 +63,25 @@ def main() -> int:
     }
     summary: dict[str, Any] = {"protocol": "qwen3-30b-a3b-verl-grpo-b0", "benchmarks": {}}
     lines = ["# Qwen3-30B-A3B veRL GRPO B0 结果", "", "| Benchmark | Step 0 | Final | Delta |", "|---|---:|---:|---:|"]
-    for benchmark, key in (("math500", "avg_at_4"), ("aime2024", "avg_at_16")):
-        before = float(reports["step0"][benchmark]["metrics"][key])
-        after = float(reports["final"][benchmark]["metrics"][key])
+    for benchmark in ("math500", "aime2024"):
+        step0_report = reports["step0"][benchmark]
+        final_report = reports["final"][benchmark]
+        assert_same_protocol(step0_report, final_report, benchmark)
+        before_key, before = avg_metric(step0_report)
+        after_key, after = avg_metric(final_report)
+        if before_key != after_key:
+            raise ValueError(f"{benchmark} sampling count differs: {before_key} != {after_key}")
+        key = before_key
         summary["benchmarks"][benchmark] = {
             "metric": key,
             "step0": before,
             "final": after,
             "delta": after - before,
-            "step0_ci": reports["step0"][benchmark]["metrics"]["bootstrap_95_ci"],
-            "final_ci": reports["final"][benchmark]["metrics"]["bootstrap_95_ci"],
+            "step0_ci": step0_report["metrics"]["bootstrap_95_ci"],
+            "final_ci": final_report["metrics"]["bootstrap_95_ci"],
+            "paired_delta_95_ci": paired_delta_ci(step0_report, final_report),
+            "step0_pass_at_n": step0_report["metrics"][f"pass_at_{step0_report['metrics']['samples_per_question']}"],
+            "final_pass_at_n": final_report["metrics"][f"pass_at_{final_report['metrics']['samples_per_question']}"],
         }
         lines.append(f"| {benchmark} {key} | {before:.4f} | {after:.4f} | {after - before:+.4f} |")
     lines.extend(["", "本文件由固定汇总脚本生成；完整生成、逐题评分与置信区间保存在对应 JSON。", ""])
