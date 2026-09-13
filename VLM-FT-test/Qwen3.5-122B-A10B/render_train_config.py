@@ -19,7 +19,7 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=1)
     parser.add_argument("--cutoff-len", type=int, default=512)
     parser.add_argument(
-        "--lora-scope", choices=("text", "vision", "all"), default="text"
+        "--lora-scope", choices=("text",), default="text"
     )
     args = parser.parse_args()
     if args.max_steps < 1 or args.cutoff_len < 32:
@@ -32,7 +32,6 @@ def main() -> None:
         "__OUTPUT_DIR__": str(args.model_output.resolve()),
         "__MAX_STEPS__": str(args.max_steps),
         "__CUTOFF_LEN__": str(args.cutoff_len),
-        "__LORA_SCOPE__": args.lora_scope,
     }
     rendered = args.template.read_text(encoding="utf-8")
     for marker, value in replacements.items():

@@ -7,8 +7,8 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONFIG_DIR="${SCRIPT_DIR}/configs"
-LLAMA_FACTORY_DIR="${VLM_LLAMA_FACTORY_DIR:-/mnt/data2/wbw/LlamaFactory-vlm-pr}"
-KT_SOURCE_DIR="${VLM_KT_SOURCE_DIR:-/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel}"
+LLAMA_FACTORY_DIR="${VLM_LLAMA_FACTORY_DIR:-/mnt/data2/wbw/LLaMA-Factory}"
+KT_SOURCE_DIR="${VLM_KT_SOURCE_DIR:-/mnt/data2/wbw/ktransformers/kt-kernel}"
 MODEL_PATH="${VLM_MODEL_PATH:-/mnt/data3/models/Qwen3-VL-30B-A3B-Instruct}"
 DATASET_DIR="${VLM_DATASET_DIR:-${LLAMA_FACTORY_DIR}/data}"
 DATASET_NAME="${VLM_DATASET_NAME:-mllm_demo}"
@@ -30,7 +30,7 @@ Usage: bash $(basename "$0") [options]
   --devices LIST          exactly eight comma-separated GPU ids
   --max-steps N           default: 1
   --cutoff-len N          default: 512
-  --lora-scope SCOPE      text, vision or all; default: ${LORA_SCOPE}
+  --lora-scope SCOPE      text (ordinary LlamaFactory VLM LoRA); default: ${LORA_SCOPE}
   --log-base PATH         default: ${LOG_BASE}
   --preflight-only        audit checkpoint, Processor, data and both codebases
   --dry-run               preflight, render YAML and print launch command
@@ -61,12 +61,14 @@ done
 
 [[ "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]] || die "--max-steps must be a positive integer"
 [[ "${CUTOFF_LEN}" =~ ^[1-9][0-9]*$ ]] || die "--cutoff-len must be a positive integer"
-[[ "${LORA_SCOPE}" =~ ^(text|vision|all)$ ]] || die "--lora-scope must be text, vision or all"
+[[ "${LORA_SCOPE}" == "text" ]] || die "this test covers ordinary text-side LlamaFactory VLM LoRA only"
 IFS=',' read -r -a DEVICE_IDS <<< "${DEVICES}"
 [[ ${#DEVICE_IDS[@]} -eq 8 ]] || die "this profile requires exactly eight GPU ids"
 [[ -d "${LLAMA_FACTORY_DIR}" ]] || die "LLaMA-Factory not found: ${LLAMA_FACTORY_DIR}"
-[[ -f "${LLAMA_FACTORY_DIR}/src/llamafactory/model/model_utils/vlm_lora.py" ]] ||
-    die "LLaMA-Factory lacks scoped VLM LoRA support: ${LLAMA_FACTORY_DIR}"
+[[ -f "${LLAMA_FACTORY_DIR}/src/llamafactory/model/loader.py" ]] ||
+    die "LLaMA-Factory model loader not found: ${LLAMA_FACTORY_DIR}"
+[[ -f "${LLAMA_FACTORY_DIR}/requirements/ktransformers.txt" ]] ||
+    die "LLaMA-Factory KT requirement not found: ${LLAMA_FACTORY_DIR}"
 [[ -f "${KT_SOURCE_DIR}/python/sft/arch.py" ]] || die "KT architecture source not found: ${KT_SOURCE_DIR}"
 [[ -f "${KT_SOURCE_DIR}/python/sft/conv3d_compat.py" ]] || die "KT Conv3D source not found: ${KT_SOURCE_DIR}"
 

@@ -35,14 +35,14 @@ Usage: bash $(basename "$0") [options]
   --devices LIST          exactly eight comma-separated GPU ids
   --max-steps N           default: 1
   --cutoff-len N          default: 512
-  --lora-scope SCOPE      text, vision or all; default: ${LORA_SCOPE}
+  --lora-scope SCOPE      text (ordinary LlamaFactory VLM LoRA); default: ${LORA_SCOPE}
   --log-base PATH         default: ${LOG_BASE}
   --preflight-only        validate config, checkpoint index, data and Processor
   --dry-run               preflight, render files and print the launch command
   -h, --help
 
-On torch 2.9.x the runner requires ms-swift>=4.4.2,<4.5 and verifies its
-Conv3D replacement before loading the VLM.
+On torch 2.9.x the runner verifies the instance-scoped KT Conv3D fallback
+before loading the VLM weights.
 EOF
 }
 
@@ -69,12 +69,14 @@ done
 
 [[ "${MAX_STEPS}" =~ ^[1-9][0-9]*$ ]] || die "--max-steps must be a positive integer"
 [[ "${CUTOFF_LEN}" =~ ^[1-9][0-9]*$ ]] || die "--cutoff-len must be a positive integer"
-[[ "${LORA_SCOPE}" =~ ^(text|vision|all)$ ]] || die "--lora-scope must be text, vision or all"
+[[ "${LORA_SCOPE}" == "text" ]] || die "this test covers ordinary text-side LlamaFactory VLM LoRA only"
 IFS=',' read -r -a DEVICE_IDS <<< "${DEVICES}"
 [[ ${#DEVICE_IDS[@]} -eq 8 ]] || die "this server profile requires exactly eight GPU ids"
 [[ -d "${LLAMA_FACTORY_DIR}" ]] || die "LLaMA-Factory not found: ${LLAMA_FACTORY_DIR}"
-[[ -f "${LLAMA_FACTORY_DIR}/src/llamafactory/model/model_utils/vlm_lora.py" ]] ||
-    die "LLaMA-Factory lacks scoped VLM LoRA support: ${LLAMA_FACTORY_DIR}"
+[[ -f "${LLAMA_FACTORY_DIR}/src/llamafactory/model/loader.py" ]] ||
+    die "LLaMA-Factory model loader not found: ${LLAMA_FACTORY_DIR}"
+[[ -f "${LLAMA_FACTORY_DIR}/requirements/ktransformers.txt" ]] ||
+    die "LLaMA-Factory KT requirement not found: ${LLAMA_FACTORY_DIR}"
 [[ -f "${KT_SOURCE_DIR}/python/sft/conv3d_compat.py" ]] || die "KT source not found: ${KT_SOURCE_DIR}"
 
 PYTHON="${VLM_PYTHON:-/mnt/data2/wbw/conda/envs/Kllama/bin/python}"

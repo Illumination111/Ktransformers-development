@@ -259,9 +259,9 @@ def main() -> int:
     )
     data_path, rows, images = validate_dataset(dataset_dir, args.dataset_name)
     processor_summary = validate_processor(model_path, images[0], config_raw)
-    from load_conv3d_compat import load_conv3d_compat
+    from load_conv3d_compat import self_test_conv3d_compat
 
-    conv3d_summary = load_conv3d_compat().self_test_swift_conv3d_patch()
+    conv3d_summary = self_test_conv3d_compat()
 
     if args.require_cuda and not torch.cuda.is_available():
         fail(
@@ -280,7 +280,7 @@ def main() -> int:
         "torch": torch.__version__,
         "transformers": transformers.__version__,
         "cuda_visible": torch.cuda.is_available(),
-        "dataset_functional_scope": "image processor + scoped text/vision LoRA gradient/optimizer smoke",
+        "dataset_functional_scope": "image processor + ordinary text-side VLM LoRA gradient/optimizer smoke",
         "conv3d_compatibility": conv3d_summary,
         **processor_summary,
     }

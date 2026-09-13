@@ -1,8 +1,11 @@
 # Qwen3.5-122B-A10B VLM LoRA 功能测试启动命令
 
 本测试使用完整的 `Qwen3_5MoeForConditionalGeneration`，保留视觉塔和
-`patch_embed.proj` Conv3D，并用 KTransformers 包装 48 层 MoE decoder。启动参数
-`--lora-scope` 可以选择只训练文本侧 LoRA、只训练视觉侧 LoRA，或同时训练两侧 LoRA。
+`patch_embed.proj` Conv3D，并用 KTransformers 包装 48 层 MoE decoder。当前 PR 只
+验证 LlamaFactory 原生的文本侧 LoRA，视觉塔和多模态 projector 保持冻结。
+
+> 本文后续若仍出现 `vlm_lora_scope` 或 `vision`/`all`，属于早期范围实验记录，不是
+> 当前 PR 的可执行接口；当前 runner 只接受 `--lora-scope text`。
 
 默认数据集直接使用 LLaMA-Factory 自带的 `mllm_demo`：
 
@@ -43,8 +46,8 @@ Full-FT，也不会把模型基座权重全部设为可训练。三个 scope 都
 在两个配套 PR 尚未合入各自主分支前，可以让当前 shell 中的所有测试指向对应工作树：
 
 ```bash
-export VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr
-export VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel
+export VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LLaMA-Factory
+export VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers/kt-kernel
 ```
 
 为避免遗漏环境变量，后续每条可复制命令都再次以内联方式设置这两个路径；因此不要求
@@ -59,19 +62,9 @@ export VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel
 
 ## 2. 环境准备
 
-测试固定使用 Kllama 环境中的 `ms-swift 4.4.2`。该版本兼容当前
-`torch 2.9.1+cu128` 和 `transformers 5.6.0`，导入 `swift.model.utils` 时会自动将
-Conv3D 替换成 `unfold + F.linear` 实现，不需要使用 `swift sft` 命令，也不需要降级
-PyTorch。导入动作由 LLaMA-Factory 新增的 KT-VLM 兼容模块自动完成，不由测试脚本
-主动执行。
-
-首次准备环境时执行：
-
-```bash
-HTTPS_PROXY=http://192.168.108.139:7897 \
-HTTP_PROXY=http://192.168.108.139:7897 \
-/mnt/data2/wbw/conda/envs/Kllama/bin/python -m pip install "ms-swift==4.4.2"
-```
+测试固定使用 Kllama 环境中的 `torch 2.9.1+cu128`。Conv3D fallback 已由
+KTransformers 自己实现为实例级 `unfold + F.linear` 路径，不再安装或导入
+ms-swift，也不会全局修改 `torch.nn.Conv3d.forward`。
 
 测试入口通过 `VLM_KT_CONV3D_COMPAT` 从 KT 源码树加载兼容 helper，同时继续使用
 Kllama 中与 `ktransformers 0.6.3.post1` 匹配的正式 `kt-kernel 0.6.3.post1`，避免把
@@ -79,12 +72,10 @@ Kllama 中与 `ktransformers 0.6.3.post1` 匹配的正式 `kt-kernel 0.6.3.post1
 Python API，不激活补丁，也不替换已安装 KT 二进制。正式 wheel 发布后应改为：
 
 ```bash
-python -m pip install 'ktransformers[vlm-sft]'
+python -m pip install 'ktransformers[sft]'
 ```
 
-顶层 extra 会安装训练栈并转发到 `kt-kernel[vlm-sft]`；`vlm-sft` 最终只是同一个
-`kt-kernel` wheel 的 optional dependency extra，不是另行预编译的 VLM 专用 KT
-版本。确认开发树源码文件存在：
+文本和 VLM 使用同一个训练 extra。确认开发树源码文件存在：
 
 ```bash
 test -f /mnt/data2/wbw/ktransformers/kt-kernel/python/sft/conv3d_compat.py
@@ -95,24 +86,23 @@ test -f /mnt/data2/wbw/ktransformers/kt-kernel/python/sft/conv3d_compat.py
 ```bash
 /mnt/data2/wbw/conda/envs/Kllama/bin/python -m pip check
 /mnt/data2/wbw/conda/envs/Kllama/bin/python -c \
-  'import importlib.metadata as m; print(m.version("ms-swift")); print(m.version("kt-kernel"))'
+  'import importlib.metadata as m; print(m.version("kt-kernel"))'
 ```
 
 预期输出包含：
 
 ```text
-4.4.2
 0.6.3.post1
 ```
 
 ## 3. 不加载 122B 权重的预检
 
 以下命令检查 checkpoint 架构、KT MoE 参数、Processor、全部 demo 图片、训练目标和
-ms-swift Conv3D 前向/反向数值等价性，不加载 122B 权重：
+KT Conv3D 前向/反向数值等价性，不加载 122B 权重：
 
 ```bash
-VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
-VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LLaMA-Factory \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_vlm_lora_smoke.sh \
   --preflight-only \
   --model-path /mnt/data2/models/Qwen3.5-122B-A10B \
@@ -126,8 +116,6 @@ bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_
 
 ```text
 "status": "ok"
-"swift_version": "4.4.2"
-"swift_module": "swift.model.utils"
 "self_test": "passed"
 "processor": "Qwen3VLProcessor"
 "rows": 6
@@ -137,8 +125,8 @@ bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_
 ## 4. 渲染配置并检查完整启动命令
 
 ```bash
-VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
-VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LLaMA-Factory \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_vlm_lora_smoke.sh \
   --dry-run \
   --model-path /mnt/data2/models/Qwen3.5-122B-A10B \
@@ -159,8 +147,8 @@ bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_
 ## 5. 一条命令运行 8 卡冒烟测试
 
 ```bash
-VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
-VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LLaMA-Factory \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_vlm_lora_smoke.sh \
   --model-path /mnt/data2/models/Qwen3.5-122B-A10B \
   --dataset-dir /mnt/data2/wbw/LLaMA-Factory/data \
@@ -172,10 +160,9 @@ bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_
   --log-base /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/test_log
 ```
 
-每个 accelerate rank 都会先注册开发树中的新增 API；随后 LLaMA-Factory 在读取
-Qwen3.5 VLM config 后、加载权重前自动调用 `enable_swift_conv3d_patch()`，并在模型
-构造后验证真实 Conv3D 参数和 patch marker。测试合同本身只检查结果。不能在另一个
-`python -c` 进程中提前导入 Swift 来代替这一步，因为 monkeypatch 不会跨进程保留。
+每个 accelerate rank 都会为旧版已安装 kt-kernel 注册开发树 wrapper hook；KT 在
+模型权重加载完成后、首次 forward 前 patch 当前 VLM 的 Conv3D 实例。LLaMA-Factory
+只验证真实 Conv3D 参数上的 KT marker，测试合同本身只检查结果。
 
 要测试视觉侧或联合 LoRA，只需把同一条命令中的参数分别改成
 `--lora-scope vision` 或 `--lora-scope all`。
@@ -187,8 +174,8 @@ Qwen3.5 VLM config 后、加载权重前自动调用 `enable_swift_conv3d_patch(
 数据：
 
 ```bash
-VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
-VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LLaMA-Factory \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_vlm_lora_formal.sh \
   --model-path /mnt/data2/models/Qwen3.5-122B-A10B \
   --dataset-dir /mnt/data2/wbw/LLaMA-Factory/data \
@@ -203,8 +190,8 @@ bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_
 正式脚本不接受少于 10 个 step。只检查配置与命令时执行：
 
 ```bash
-VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
-VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LLaMA-Factory \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3.5-122B-A10B/run_vlm_lora_formal.sh \
   --dry-run \
   --lora-scope all \
@@ -248,7 +235,7 @@ FSDP2 会把 LoRA 参数和梯度暴露为 DTensor。测试 callback 会先通�
 
 ```text
 [qwen35_vlm_conv3d] required=True active=True ...
-[qwen35_vlm_contract] OK scope=<text|vision|all> ... swift_conv3d_patch=active
+[qwen35_vlm_contract] OK scope=<text|vision|all> ... kt_conv3d_fallback=active
 [qwen35_vlm_functional] GRADIENT_OK scope=<text|vision|all> ...
 [qwen35_vlm_functional] OPTIMIZER_OK scope=<text|vision|all> ...
 [qwen35_vlm_functional] PASS optimizer_steps=1 global_step=1
@@ -257,7 +244,7 @@ FSDP2 会把 LoRA 参数和梯度暴露为 DTensor。测试 callback 会先通�
 
 这些标记分别证明：
 
-1. ms-swift 补丁在当前 rank 生效；
+1. KT 实例级 Conv3D fallback 在当前 rank 生效；
 2. 完整 VLM、scope 对应的 LoRA 参数和 48 层 KT wrapper 均存在；
 3. demo 的真实图片经过视觉 PatchEmbed，请求的 LoRA 模态得到有限非零梯度；
 4. optimizer 确实改变 LoRA 权重；

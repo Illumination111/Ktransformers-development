@@ -4,6 +4,10 @@
 KTransformers/LlamaFactory、准备 Qwen3.5 VLM 权重和图文/视频数据集、配置 LoRA
 范围、启动训练并验收输出。
 
+> 当前 PR 和配套 runner 只保留 LlamaFactory 原生的文本侧 VLM LoRA，视觉塔与多模态
+> projector 冻结。本文中 `vlm_lora_scope`、`vision`、`all` 章节是早期实验记录，不能
+> 作为当前 PR 的安装或启动接口。
+
 本文以 **Qwen3.5-122B-A10B 原生 BF16 权重、8 张 GPU、Intel AMX BF16 CPU 后端**
 作为已经实际验证的基线。其他 Qwen3.5 MoE VLM 可以参考相同流程，但必须根据模型规模、
 decoder 层类型、CPU 内存、GPU 数量和权重精度调整配置，不能直接把 122B 的资源结论套用
@@ -139,7 +143,6 @@ git -C "$LF_DIR" log --oneline --left-right upstream/main...main
 - PyTorch `2.9.1+cu128`；
 - `transformers-kt==5.6.0.post1`；
 - `accelerate-kt==1.14.0.post1`；
-- `ms-swift>=4.4.2,<4.5`，实际验证版本为 4.4.2；
 - 8 个 CUDA process，FSDP2；
 - Intel AMX BF16 后端，双 thread pool。
 
@@ -189,14 +192,14 @@ CUDA 13.0 环境可选择 PyTorch 对应的 cu130 index。不要在一个已经�
 python -m pip install -e "$LF_DIR"
 
 git -C "$KT_DIR" submodule update --init --recursive
-cd "$KT_DIR"
-python -m pip install -r requirements-vlm-lora.txt
+python -m pip install -e "$KT_DIR/kt-kernel"
+python -m pip install -e "$KT_DIR[sft]"
 ```
 
-专用 requirements 会安装本地 editable `kt-kernel[vlm-sft]` 和
-`ktransformers[vlm-sft]`，并固定已验证的 PyTorch、Transformers-KT、Accelerate-KT 与
-ms-swift 组合。不要只执行 PyPI 上的 `pip install ktransformers[vlm-sft]` 后就假设已经
-获得 fork `main` 的未发布代码。
+文本与 VLM 共用 `ktransformers[sft]`。KT 自己声明并维护所需的
+Transformers-KT/Accelerate-KT 版本；LlamaFactory 的唯一 KT requirements 文件不再重复
+固定这些传递依赖，也不引入 ms-swift。开发验证必须先安装本地 `kt-kernel`，以确保使用
+fork 中尚未发布的 Conv3D fallback。
 
 源码构建若提示缺少 CMake、hwloc、NUMA 或编译器，请根据发行版安装对应开发包。编译
 前应确保 `nvcc`/CUDA toolkit 与所选 PyTorch、GPU 架构兼容。
@@ -624,7 +627,7 @@ bash "$TEST_DIR/run_vlm_lora_smoke.sh" \
 - 视觉塔及 Processor 文件是否完整；
 - 图片路径、placeholder 数量和 assistant 目标；
 - KT 能否识别 Qwen3.5 MoE 层前缀；
-- ms-swift Conv3D 替换的前向/反向自测。
+- KT 实例级 Conv3D fallback 的前向/反向自测。
 
 渲染并查看实际启动命令但不训练：
 
@@ -776,10 +779,10 @@ Accelerate 配置中启用 `kt_config` 时也会设置 KT opt-in 标记。
 
 ```bash
 python -c 'from kt_kernel.sft import conv3d_compat; print(conv3d_compat.__file__)'
-python -m pip show kt-kernel ms-swift
+python -m pip show kt-kernel ktransformers
 ```
 
-路径应指向本次 PR 安装，`ms-swift` 应处于 `>=4.4.2,<4.5`。
+路径应指向本次 PR 安装；该兼容路径不需要安装 ms-swift。
 
 ### 10.4 `vision` 模式提示缺少 `kt_freeze_experts`
 

@@ -19,9 +19,9 @@ The audit distinguishes the installed runtime from development sources. At
 the time this test was added:
 
 - LLaMA-Factory's VLM development worktree recognizes `qwen3_vl_moe`, the
-  `qwen3_vl` template, scoped text/vision/all LoRA, and KT Conv3D handling;
+  `qwen3_vl` template, ordinary text-side VLM LoRA, and KT Conv3D handling;
 - the installed `kt-kernel` rejects `Qwen3VLMoeForConditionalGeneration`;
-- `/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel/python/sft/arch.py` contains
+- `/mnt/data2/wbw/ktransformers/kt-kernel/python/sft/arch.py` contains
   the required Qwen3-VL-MoE architecture and checkpoint-prefix support, but
   that change is not installed and is currently uncommitted.
 
@@ -62,6 +62,6 @@ optimizer step changes a LoRA tensor in every requested modality.
 Default development locations can be overridden with:
 
 ```bash
-export VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr
-export VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel
+export VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LLaMA-Factory
+export VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers/kt-kernel
 ```

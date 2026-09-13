@@ -9,7 +9,7 @@ from typing import Any
 
 from transformers import TrainerCallback
 
-from load_conv3d_compat import load_conv3d_compat
+from load_conv3d_compat import install_wrapper_hook, load_conv3d_compat
 
 
 VALID_LORA_SCOPES = ("text", "vision", "all")
@@ -160,12 +160,11 @@ def assert_vlm_contract(model: Any) -> Any:
         int(part) for part in torch_version.split("+", 1)[0].split(".")[:2]
     )
     compatibility_required = torch_base_version == (2, 9)
-    compatibility_active = compatibility_api.is_swift_conv3d_patch_active()
-    compatibility_api.validate_swift_conv3d_modules(visual)
+    compatibility_active = compatibility_api.is_vlm_conv3d_compatible(visual)
     if compatibility_required and not compatibility_active:
         raise RuntimeError(
-            "LLaMA-Factory did not automatically activate the KT/ms-swift "
-            "Conv3D compatibility layer in this training rank"
+            "KTransformers did not mark every VLM Conv3D instance compatible "
+            "in this training rank"
         )
     visual_trainable = [
         name for name, param in visual.named_parameters() if param.requires_grad
@@ -214,7 +213,7 @@ def assert_vlm_contract(model: Any) -> Any:
         f"class={type(conditional).__name__} scope={scope} conv3d={conv3d} "
         f"text_lora={len(text_lora)} visual_lora={len(visual_lora)} "
         f"visual_base_trainable=0 kt_wrappers={wrapper_count} "
-        f"swift_conv3d_patch={'active' if compatibility_required else 'not_required'}",
+        f"kt_conv3d_fallback={'active' if compatibility_required else 'not_required'}",
         flush=True,
     )
     print(
@@ -397,8 +396,8 @@ def install_contract() -> None:
 def main() -> None:
     # Development shim only: make the new additive KT API visible while the
     # environment keeps its released kt-kernel binary. LLaMA-Factory remains
-    # responsible for detecting torch/VLM/Conv3D and activating ms-swift.
-    load_conv3d_compat(register_as_kt_module=True)
+    # responsible for detecting torch/VLM/Conv3D and activating the fallback.
+    install_wrapper_hook()
     install_contract()
     from llamafactory.train.tuner import run_exp
 
