@@ -11,7 +11,9 @@ EXPECTED_ARCHITECTURE = "Qwen3_5MoeForCausalLM"
 EXPECTED_LOGICAL_PARAMETERS = 122_111_526_912
 EXPECTED_ROUTED_EXPERT_PARAMETERS = 115_964_116_992
 EXPECTED_KT_WRAPPERS = 48
-SUPPORTED_BACKENDS = {"kt", "deepspeed"}
+EXPECTED_TORCH_OWNED_LAYERS = 6
+EXPECTED_TORCH_OWNED_EXPERT_PARAMETERS = EXPECTED_ROUTED_EXPERT_PARAMETERS // 8
+SUPPORTED_BACKENDS = {"kt", "deepspeed", "pytorch_cuda", "pytorch_torch"}
 
 
 def _validate_full_finetuning_contract(model) -> dict[str, int]:  # type: ignore[no-untyped-def]
@@ -154,6 +156,71 @@ def _validate_full_finetuning_contract(model) -> dict[str, int]:  # type: ignore
     }
 
 
+def _validate_pytorch_torch_full_finetuning_contract(
+    model,
+) -> dict[str, int]:  # type: ignore[no-untyped-def]
+    """Validate owner-sharded Torch MoE full-FT after the FFTtest patches."""
+    from install_torch_moe_full_ft import collect_expert_weight_parameters
+
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    wrappers = list(getattr(model, "_kt_wrappers", None) or [])
+    if len(wrappers) != EXPECTED_KT_WRAPPERS:
+        raise RuntimeError(
+            "Unexpected Torch MoE wrapper coverage: "
+            f"got={len(wrappers)}, expected={EXPECTED_KT_WRAPPERS}"
+        )
+    if getattr(model, "_kt_train_mode", None) != "full" or not getattr(model, "_kt_full_weight_grad", False):
+        raise RuntimeError(
+            "Torch MoE full-weight gradient mode is not active: "
+            f"train_mode={getattr(model, '_kt_train_mode', None)!r}, "
+            f"full_weight_grad={getattr(model, '_kt_full_weight_grad', None)!r}"
+        )
+    owned = [
+        wrapper
+        for wrapper in wrappers
+        if int(getattr(wrapper, "owner_rank", -1)) == rank
+        and bool(getattr(wrapper, "_has_expert_weights", False))
+        and bool(getattr(wrapper, "_full_weight_grad", False))
+    ]
+    expected_owned = EXPECTED_KT_WRAPPERS // max(world_size, 1)
+    if len(owned) != expected_owned:
+        raise RuntimeError(
+            "Torch MoE owner-layer mapping is wrong: "
+            f"rank={rank} owned={len(owned)} expected={expected_owned}"
+        )
+    expert_params = collect_expert_weight_parameters(model)
+    expert_numel = sum(int(parameter.numel()) for parameter in expert_params)
+    if expert_numel != EXPECTED_TORCH_OWNED_EXPERT_PARAMETERS:
+        raise RuntimeError(
+            "Unexpected owner expert parameter coverage: "
+            f"got={expert_numel}, expected={EXPECTED_TORCH_OWNED_EXPERT_PARAMETERS}"
+        )
+    frozen_real = [
+        name
+        for name, parameter in model.named_parameters()
+        if not parameter.requires_grad and "experts" not in name.lower()
+    ]
+    if frozen_real:
+        raise RuntimeError(
+            "Full fine-tuning contract failed: non-expert parameters are frozen: "
+            f"{frozen_real[:5]}"
+        )
+    registered_trainable = sum(
+        parameter.numel() for _, parameter in model.named_parameters() if parameter.requires_grad
+    )
+    registered_total = sum(parameter.numel() for _, parameter in model.named_parameters())
+    return {
+        "registered_trainable": registered_trainable,
+        "placeholder_numel": EXPECTED_ROUTED_EXPERT_PARAMETERS - expert_numel,
+        "kt_managed_numel": expert_numel,
+        "logical_trainable": EXPECTED_LOGICAL_PARAMETERS,
+        "logical_total": EXPECTED_LOGICAL_PARAMETERS,
+        "kt_wrappers": len(wrappers),
+        "registered_total": registered_total,
+    }
+
+
 def _validate_deepspeed_full_finetuning_contract(
     model,
 ) -> dict[str, int]:  # type: ignore[no-untyped-def]
@@ -208,7 +275,7 @@ def _training_backend() -> str:
 
 def _configure_rank_threads() -> None:
     backend = _training_backend()
-    if backend == "deepspeed":
+    if backend in {"deepspeed", "pytorch_cuda", "pytorch_torch"}:
         threads = int(os.environ["FFT_CPU_THREADS"])
         if threads <= 0:
             raise RuntimeError("FFT_CPU_THREADS must be positive")
@@ -222,7 +289,7 @@ def _configure_rank_threads() -> None:
             os.environ[name] = str(threads)
         rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
         print(
-            f"[qwen35_122b_bf16_threads] rank={rank} role=deepspeed "
+            f"[qwen35_122b_bf16_threads] rank={rank} role={backend} "
             f"cpu_threads={threads}",
             flush=True,
         )
@@ -285,7 +352,12 @@ def _install_model_contract() -> None:
             )
 
         backend = _training_backend()
-        if backend == "kt":
+        if backend == "pytorch_torch":
+            from install_torch_moe_full_ft import enable_full_weight_grad
+
+            enable_full_weight_grad(model)
+            stats = _validate_pytorch_torch_full_finetuning_contract(model)
+        elif backend == "kt":
             stats = _validate_full_finetuning_contract(model)
         else:
             stats = _validate_deepspeed_full_finetuning_contract(model)
@@ -412,6 +484,10 @@ def _disable_benchmark_saves() -> None:
 def main() -> None:
     _configure_rank_threads()
     _disable_benchmark_saves()
+    if _training_backend() == "pytorch_torch":
+        from install_torch_moe_full_ft import install_torch_moe_full_ft
+
+        install_torch_moe_full_ft()
     from qwen35_text_only import install_text_only_loading
 
     install_text_only_loading()

@@ -10,6 +10,7 @@ from typing import Any
 
 
 EXPECTED_EXPERT_BF16_BYTES = 6 * (1 << 20)
+DEFAULT_LOOKUP_BENCHMARK_CLASS = "aptmoe_qwen35_proxy_lookup"
 
 
 def _positive_number(mapping: dict[str, Any], key: str) -> float:
@@ -32,11 +33,17 @@ class ProxyPlacementSolver:
         allow_unprofiled: bool,
         expected_profile: str | None = None,
         required_max_tokens: int | None = None,
+        expected_expert_bf16_bytes: int = EXPECTED_EXPERT_BF16_BYTES,
+        expected_benchmark_class: str = DEFAULT_LOOKUP_BENCHMARK_CLASS,
     ) -> None:
         if num_experts <= 0 or num_chunks <= 0:
             raise ValueError("num_experts and num_chunks must be positive")
         if required_max_tokens is not None and required_max_tokens <= 0:
             raise ValueError("required_max_tokens must be positive")
+        if expected_expert_bf16_bytes <= 0:
+            raise ValueError("expected_expert_bf16_bytes must be positive")
+        if not expected_benchmark_class:
+            raise ValueError("expected_benchmark_class must not be empty")
         if not 0.0 < prefetch_portion <= 1.0:
             raise ValueError("prefetch_portion must be in (0, 1]")
         self.num_experts = num_experts
@@ -44,6 +51,8 @@ class ProxyPlacementSolver:
         self.prefetch_portion = prefetch_portion
         self.expected_profile = expected_profile
         self.required_max_tokens = required_max_tokens
+        self.expected_expert_bf16_bytes = expected_expert_bf16_bytes
+        self.expected_benchmark_class = expected_benchmark_class
         self.lookup_path = Path(lookup_path).resolve() if lookup_path else None
         self.lookup: dict[str, Any] | None = None
         self.lookup_sha256: str | None = None
@@ -64,8 +73,12 @@ class ProxyPlacementSolver:
     def _validate_lookup(self, lookup: dict[str, Any]) -> None:
         if lookup.get("schema_version") != 1:
             raise ValueError("lookup schema_version must be 1")
-        if lookup.get("benchmark_class") != "aptmoe_qwen35_proxy_lookup":
-            raise ValueError("lookup benchmark_class is not a Qwen3.5 proxy lookup")
+        if lookup.get("benchmark_class") != self.expected_benchmark_class:
+            raise ValueError(
+                "lookup benchmark_class="
+                f"{lookup.get('benchmark_class')!r}, "
+                f"expected {self.expected_benchmark_class!r}"
+            )
         if (
             self.expected_profile is not None
             and lookup.get("deployment_profile") != self.expected_profile
@@ -76,9 +89,10 @@ class ProxyPlacementSolver:
                 f"expected {self.expected_profile!r}"
             )
         expert = lookup.get("expert") or {}
-        if expert.get("bf16_bytes") != EXPECTED_EXPERT_BF16_BYTES:
+        if expert.get("bf16_bytes") != self.expected_expert_bf16_bytes:
             raise ValueError(
-                "lookup expert size does not match the Qwen3.5 6 MiB BF16 expert"
+                "lookup expert size does not match the target Qwen3.5 "
+                f"BF16 expert ({self.expected_expert_bf16_bytes} bytes)"
             )
         if expert.get("num_experts") != self.num_experts:
             raise ValueError(
@@ -216,4 +230,6 @@ class ProxyPlacementSolver:
             "num_chunks": self.num_chunks,
             "deployment_profile": self.expected_profile,
             "required_max_tokens": self.required_max_tokens,
+            "expected_expert_bf16_bytes": self.expected_expert_bf16_bytes,
+            "expected_benchmark_class": self.expected_benchmark_class,
         }

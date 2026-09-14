@@ -44,6 +44,8 @@ DRY_RUN=0
 CONTINUE_ON_ERROR=0
 KEEP_MODEL_OUTPUT=0
 SKIP_DATASET_CHECK=0
+CAPTURE_APTMOE_ROUTES=0
+APTMOE_ROUTE_ROOT="${FFT_APTMOE_ROUTE_ROOT:-/mnt/data2/wbw/Ktransformers-development/FFTtest/APTMoE-simulate/routes/qwen35_122b}"
 
 RUN_ROOT=""
 SUMMARY_FINALIZED=0
@@ -82,6 +84,7 @@ Options:
   --continue-on-error     Continue after a failed sequence
   --keep-model-output     Keep generated final model output
   --skip-dataset-check    Skip model/tokenizer/dataset length validation
+  --capture-aptmoe-routes Capture exact warmup routes for the 122B APTMoE proxy
   --dry-run               Generate configs and print commands only
   -h, --help              Show this help
 
@@ -129,6 +132,7 @@ while [[ $# -gt 0 ]]; do
         --continue-on-error) CONTINUE_ON_ERROR=1 ;;
         --keep-model-output) KEEP_MODEL_OUTPUT=1 ;;
         --skip-dataset-check) SKIP_DATASET_CHECK=1 ;;
+        --capture-aptmoe-routes) CAPTURE_APTMOE_ROUTES=1 ;;
         --dry-run) DRY_RUN=1 ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'Unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
@@ -300,6 +304,14 @@ check_files_and_environment() {
         "${SCRIPT_DIR}/qwen35_text_only.py"; do
         [[ -f "${required}" ]] || die "required file not found: ${required}"
     done
+    if [[ "${CAPTURE_APTMOE_ROUTES}" -eq 1 ]]; then
+        [[ -f "${SHARED_FLOW_DIR}/qwen35_route_capture.py" ]] || \
+            die "route capture helper not found"
+        [[ -f "${SHARED_FLOW_DIR}/merge_qwen35_route_traces.py" ]] || \
+            die "route merge helper not found"
+        "${PYTHON}" -c 'import numpy' || \
+            die "route capture requires NumPy in ${CONDA_ENV}"
+    fi
     "${PYTHON}" -c \
         'import accelerate, ktransformers, kt_kernel, transformers' || \
         die "KTransformers dependencies are unavailable in ${CONDA_ENV}"
@@ -593,6 +605,14 @@ run_one_sequence() {
     local case_unit="fft-qwen35-122b-ktransformers-seq${seq}-$$"
     local tokens_per_step=$((NUM_GPUS * PER_DEVICE_BATCH_SIZE * seq * GRAD_ACCUM_STEPS))
     local empty_cache_after_prepare=0
+    local route_capture_dir=""
+    local route_trace=""
+    if [[ "${CAPTURE_APTMOE_ROUTES}" -eq 1 ]]; then
+        route_capture_dir="${APTMOE_ROUTE_ROOT}/server/seq_${seq}_ranks"
+        route_trace="${APTMOE_ROUTE_ROOT}/server/seq_${seq}.npz"
+        rm -rf "${route_capture_dir}"
+        mkdir -p "${route_capture_dir}"
+    fi
     mkdir -p "${run_dir}"
 
     local train_config accel_config
@@ -606,6 +626,18 @@ run_one_sequence() {
     [[ "${KT_DISTRIBUTED_CHECKPOINT_REUSE}" == "on" ]] && reuse_enabled=1
     local accelerate_bin="${CONDA_BIN_DIR}/accelerate"
     [[ -x "${accelerate_bin}" ]] || accelerate_bin="accelerate"
+    local -a route_capture_env=()
+    if [[ "${CAPTURE_APTMOE_ROUTES}" -eq 1 ]]; then
+        route_capture_env=(
+            FFT_ROUTE_TRACE_DIR="${route_capture_dir}"
+            FFT_ROUTE_TRACE_SEQUENCE_LENGTH="${seq}"
+            FFT_ROUTE_TRACE_PATTERNS="${WARMUP_STEPS}"
+            FFT_ROUTE_TRACE_EXPECTED_LAYERS=48
+            FFT_ROUTE_TRACE_TOP_K=8
+            FFT_ROUTE_TRACE_PROXY_TAG=qwen35_122b
+            FFT_APTMOE_SIMULATION_ROOT="${FFT_ROOT}/APTMoE-simulate"
+        )
+    fi
     local -a command=(
         env
         USE_KT=1
@@ -644,8 +676,10 @@ run_one_sequence() {
         TOKENIZERS_PARALLELISM=false
         HF_DATASETS_OFFLINE=1
         TRANSFORMERS_OFFLINE=1
+        DISABLE_VERSION_CHECK=1
         PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
         CUDA_VISIBLE_DEVICES="${devices}"
+        "${route_capture_env[@]}"
         PYTHONPATH="${SCRIPT_DIR}:${SHARED_FLOW_DIR}:${LLAMA_FACTORY_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
         "${accelerate_bin}" launch
         --config_file "${accel_config}"
@@ -712,6 +746,23 @@ run_one_sequence() {
         exit_code=89
     fi
 
+    if [[ "${exit_code}" -eq 0 ]]; then
+        if [[ "${CAPTURE_APTMOE_ROUTES}" -eq 1 ]]; then
+            if ! "${PYTHON}" "${SHARED_FLOW_DIR}/merge_qwen35_route_traces.py" \
+                --input-dir "${route_capture_dir}" \
+                --output "${route_trace}" \
+                --expected-ranks "${NUM_GPUS}" \
+                --expected-patterns "${WARMUP_STEPS}" \
+                --expected-layers 48 \
+                --proxy-tag qwen35_122b \
+                --sequence-length "${seq}" \
+                --global-batch-size "${GLOBAL_BATCH_SIZE}" \
+                --simulation-root "${FFT_ROOT}/APTMoE-simulate"; then
+                warn "exact training succeeded but 122B route merge failed"
+                exit_code=94
+            fi
+        fi
+    fi
     if [[ "${exit_code}" -eq 0 ]]; then
         if [[ ! -f "${timing_dir}/step_timing.json" ]]; then
             warn "Training succeeded but canonical rank-0 timing is missing"

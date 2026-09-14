@@ -164,7 +164,7 @@ class APTQwen35RoutePredictor(nn.Module):
 
 
 class APTQwen35MoELayer(nn.Module):
-    """Top-8 weighted dispatch over independently movable 6 MiB experts."""
+    """Config-driven top-k dispatch over independently movable experts."""
 
     def __init__(
         self,

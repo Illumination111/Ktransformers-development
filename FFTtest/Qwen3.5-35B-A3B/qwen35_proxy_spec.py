@@ -294,7 +294,11 @@ def _training_state_projection(parameters: int) -> dict[str, Any]:
 def build_manifest(
     model_path: Path,
     qwen3_reference_model_path: Path | None = None,
+    *,
+    proxy_tag: str = "qwen35",
 ) -> dict[str, Any]:
+    if not proxy_tag or not proxy_tag.replace("_", "").isalnum():
+        raise ValueError(f"invalid proxy_tag: {proxy_tag!r}")
     source, text = _load_text_config(model_path)
     target = _target_components(text)
     fallback = _plain_qwen3_fallback(text)
@@ -328,15 +332,19 @@ def build_manifest(
         "sequence_complexity_matches": False,
         "valid_proxy": False,
         "reason": (
-            "All 40 layers use quadratic GQA, while the target has 30 linear-attention "
-            "and 10 full-attention layers. Similar total parameters do not make this "
+            f"All {len(layer_types)} layers use quadratic GQA, while the target has "
+            f"{layer_types.count('linear_attention')} linear-attention and "
+            f"{layer_types.count('full_attention')} full-attention layers. "
+            "Similar total parameters do not make this "
             "a valid attention or long-sequence performance proxy."
         ),
     }
 
     manifest: dict[str, Any] = {
         "schema_version": 1,
-        "benchmark_class": "aptmoe_qwen35_component_isomorphic_deployment_proxy",
+        "benchmark_class": (
+            f"aptmoe_{proxy_tag}_component_isomorphic_deployment_proxy"
+        ),
         "target": {
             "model_path": str(model_path.resolve()),
             "source_model_type": source["model_type"],
@@ -367,6 +375,8 @@ def build_manifest(
             "numerical_weight_change_required": True,
             "checkpoint_save_required": False,
             "llamafactory_backend_claim_allowed": False,
+            "end_to_end_target_model_tps_claim_allowed": False,
+            # Legacy key retained for the existing 35B contract reader.
             "end_to_end_qwen35_tps_claim_allowed": False,
             "allowed_claims": [
                 "GPU token-mixer component time and memory",
@@ -588,6 +598,11 @@ def parse_args() -> argparse.Namespace:
         help="do not include the Qwen3-30B-A3B baseline comparison",
     )
     parser.add_argument(
+        "--proxy-tag",
+        default="qwen35",
+        help="manifest identity tag (default: qwen35)",
+    )
+    parser.add_argument(
         "--output", type=Path, help="write the proxy manifest to this JSON file"
     )
     parser.add_argument(
@@ -603,7 +618,11 @@ def main() -> None:
     reference_path = (
         None if args.no_qwen3_reference else args.qwen3_reference_model_path
     )
-    manifest = build_manifest(args.model_path, reference_path)
+    manifest = build_manifest(
+        args.model_path,
+        reference_path,
+        proxy_tag=args.proxy_tag,
+    )
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(

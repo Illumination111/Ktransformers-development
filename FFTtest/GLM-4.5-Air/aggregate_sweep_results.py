@@ -14,6 +14,8 @@ FIELDS = (
     "status",
     "backend",
     "profile",
+    "benchmark_class",
+    "result_validity",
     "precision",
     "finetuning_type",
     "sequence_length",
@@ -31,8 +33,13 @@ FIELDS = (
     "optimizer_sec",
     "cpu_threads_per_rank",
     "kt_owner_threads",
+    "cpu_memory_scope",
+    "cgroup_memory_peak_gb",
     "process_tree_peak_gb",
+    "host_used_peak_gb",
     "max_gpu_task_peak_gib",
+    "timing_mode",
+    "full_update_verified",
     "exit_code",
     "run_dir",
 )
@@ -67,11 +74,49 @@ def collect_case(config_path: Path) -> dict[str, Any]:
     timing = read_json(timing_path) if timing_path.is_file() else {}
     memory_path = run_dir / "memory_summary.json"
     memory = read_json(memory_path) if memory_path.is_file() else {}
+    manifest_path = run_dir / "proxy_manifest.json"
+    verification_path = run_dir / "full_update_verification.json"
+    manifest = read_json(manifest_path) if manifest_path.is_file() else {}
+    verification = (
+        read_json(verification_path) if verification_path.is_file() else {}
+    )
 
     if exit_text == "DRY_RUN":
         status = "DRY_RUN"
     elif exit_text == "0" and timing:
-        status = "SUCCESS"
+        if config.get("benchmark_class") != "deployment_proxy":
+            status = "SUCCESS"
+        elif (
+            config.get("model_load_architecture")
+            != "Glm45AirComponentIsomorphicAPTMoEProxy"
+            or config.get("checkpoint_compatible") is not False
+            or config.get("exact_model_claim_allowed") is not False
+        ):
+            status = "PROXY_CONTRACT_MISMATCH"
+        elif (
+            manifest.get("benchmark_class") != "deployment_proxy"
+            or manifest.get("proxy_architecture")
+            != "glm45_air_component_isomorphic"
+            or manifest.get("parameter_count") != 106_852_245_504
+            or manifest.get("checkpoint_compatible") is not False
+        ):
+            status = "PROXY_MANIFEST_MISMATCH"
+        elif verification.get("valid_full_update") is not True:
+            status = "FULL_UPDATE_AUDIT_FAILED"
+        elif config.get("result_validity") == "SMOKE_ONLY":
+            status = "SMOKE_ONLY"
+        else:
+            route = manifest.get("route") or {}
+            placement = manifest.get("placement") or {}
+            status = (
+                "OK_PROXY"
+                if route.get("mode")
+                == "replayed_glm45_air_topk_indices"
+                and route.get("trace_sha256")
+                and placement.get("mode") == "profiled_compute_load"
+                and placement.get("lookup_sha256")
+                else "FORMAL_PROXY_GUARD_FAILED"
+            )
     else:
         status = "FAILED"
 
@@ -86,6 +131,8 @@ def collect_case(config_path: Path) -> dict[str, Any]:
         "status": status,
         "backend": config.get("backend"),
         "profile": config.get("profile"),
+        "benchmark_class": config.get("benchmark_class"),
+        "result_validity": config.get("result_validity"),
         "precision": config.get("precision"),
         "finetuning_type": config.get("finetuning_type"),
         "sequence_length": config.get("sequence_length"),
@@ -105,10 +152,17 @@ def collect_case(config_path: Path) -> dict[str, Any]:
         "optimizer_sec": nested_mean(timing, "optimizer_sec"),
         "cpu_threads_per_rank": config.get("cpu_threads_per_rank"),
         "kt_owner_threads": config.get("kt_owner_threads"),
+        "cpu_memory_scope": memory.get("cpu_memory_scope"),
+        "cgroup_memory_peak_gb": memory.get(
+            "cgroup_memory_peak_gb_decimal"
+        ),
         "process_tree_peak_gb": memory.get(
             "process_tree_peak_gb_decimal"
         ),
+        "host_used_peak_gb": memory.get("host_used_peak_gb_decimal"),
         "max_gpu_task_peak_gib": max(gpu_peaks) if gpu_peaks else None,
+        "timing_mode": timing.get("timing_mode"),
+        "full_update_verified": verification.get("valid_full_update"),
         "exit_code": exit_text,
         "run_dir": str(run_dir),
     }
@@ -132,7 +186,10 @@ def write_csv(root: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def write_summary(root: Path, rows: list[dict[str, Any]]) -> None:
-    success = sum(row["status"] == "SUCCESS" for row in rows)
+    success = sum(
+        row["status"] in {"SUCCESS", "OK_PROXY", "SMOKE_ONLY"}
+        for row in rows
+    )
     failed = sum(row["status"] == "FAILED" for row in rows)
     dry_run = sum(row["status"] == "DRY_RUN" for row in rows)
     backends = sorted(
@@ -143,28 +200,31 @@ def write_summary(root: Path, rows: list[dict[str, Any]]) -> None:
         }
     )
     lines = [
-        "# GLM-4.5-Air BF16 Full-Finetuning Sweep",
+        "# GLM-4.5-Air BF16 Sweep",
         "",
         "- Profiles: `server` (8 GPUs, global batch 8) and/or "
         "`consumer` (2 GPUs, global batch 2).",
         f"- Backend: `{', '.join(backends)}`",
         "- Each sequence length runs in an independent process.",
         "- TPS excludes configured warm-up optimizer steps.",
+        "- APTMoE rows are random-weight component-isomorphic deployment "
+        "proxies, not exact-model throughput or quality results.",
+        "- Synthetic routing or unprofiled placement is labeled `SMOKE_ONLY`.",
         "- DeepSpeed/KTransformers use coarse host-wall timing without forced "
         "CUDA synchronization; MegaTrain retains backend-required synchronization.",
         "- CPU/GPU resource sampling runs outside the measured phase path.",
         "",
         f"Cases: {len(rows)}; success: {success}; failed: {failed}; dry-run: {dry_run}.",
         "",
-        "| Profile | GPUs | Seq | Status | Stable steps | Step sec | TPS | Forward | Backward | Optimizer | CPU peak GB | GPU peak GiB |",
-        "|:---|---:|---:|:---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Profile | GPUs | Seq | Status | Stable steps | Step sec | TPS | Forward | Backward | Optimizer | CPU cgroup GB | CPU peak GB | GPU peak GiB |",
+        "|:---|---:|---:|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         lines.append(
             "| {profile} | {num_gpus} | {sequence_length} | {status} | {stable_steps} | "
             "{mean_step_sec} | {stable_tps} | {forward_sec} | "
             "{backward_sec} | {optimizer_sec} | "
-            "{process_tree_peak_gb} | {max_gpu_task_peak_gib} |".format(
+            "{cgroup_memory_peak_gb} | {process_tree_peak_gb} | {max_gpu_task_peak_gib} |".format(
                 profile=display(row["profile"]),
                 num_gpus=display(row["num_gpus"], 0),
                 sequence_length=display(row["sequence_length"], 0),
@@ -175,6 +235,9 @@ def write_summary(root: Path, rows: list[dict[str, Any]]) -> None:
                 forward_sec=display(row["forward_sec"]),
                 backward_sec=display(row["backward_sec"]),
                 optimizer_sec=display(row["optimizer_sec"]),
+                cgroup_memory_peak_gb=display(
+                    row["cgroup_memory_peak_gb"], 2
+                ),
                 process_tree_peak_gb=display(
                     row["process_tree_peak_gb"], 2
                 ),

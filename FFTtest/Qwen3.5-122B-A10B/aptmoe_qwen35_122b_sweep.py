@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Run APTMoE proxy sequences in persistent torchrun ranks."""
+"""Run Qwen3.5-122B APTMoE proxy cases in persistent torchrun ranks."""
 
 from __future__ import annotations
 
 import argparse
 import datetime
 import os
+import sys
 from argparse import Namespace
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,12 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from aptmoe_qwen35_proxy_train import run, validate_args
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SHARED_DIR = SCRIPT_DIR.parent / "Qwen3.5-35B-A3B"
+sys.path.insert(0, str(SHARED_DIR))
+
+from aptmoe_qwen35_122b_proxy_train import run, validate_args
 from persistent_sweep import (
     activate_cuda_cache_hold,
     collect_without_releasing_cuda,
@@ -65,14 +71,12 @@ def main() -> None:
         ),
     )
 
+    case: dict[str, Any] | None = None
     try:
         for case in manifest["cases"]:
             sequence = int(case["sequence_length"])
             emit_monitor_phase(manifest, f"seq_{sequence}")
-            print(
-                f"[aptmoe-persistent-sweep] BEGIN seq={sequence}",
-                flush=True,
-            )
+            print(f"[aptmoe-qwen35-122b] BEGIN seq={sequence}", flush=True)
             case_args = build_args(case["aptmoe_arguments"])
             validate_args(case_args)
             run(case_args)
@@ -81,14 +85,10 @@ def main() -> None:
             if rank == 0:
                 write_case_exit(case, 0)
             collect_without_releasing_cuda()
-            print(
-                f"[aptmoe-persistent-sweep] END seq={sequence}; "
-                "CUDA allocator and NCCL process group retained",
-                flush=True,
-            )
+            print(f"[aptmoe-qwen35-122b] END seq={sequence}", flush=True)
         emit_monitor_phase(manifest, "profile_release")
     except BaseException:
-        if rank == 0:
+        if rank == 0 and case is not None:
             write_case_exit(case, 1)
         emit_monitor_phase(manifest, "profile_abort")
         raise
