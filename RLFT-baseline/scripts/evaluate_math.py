@@ -21,14 +21,39 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--benchmark", choices=("hardmath", "math500", "aime2024"), required=True)
     parser.add_argument("--model-path", type=Path, required=True)
+    parser.add_argument(
+        "--tokenizer-path",
+        type=Path,
+        help="Tokenizer/chat-template source; keep fixed to the base model across checkpoints.",
+    )
     parser.add_argument("--data", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
+    parser.add_argument(
+        "--data-parallel-size",
+        type=int,
+        default=1,
+        help="Number of independent SGLang replicas; total GPUs are TP x DP.",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--max-new-tokens", type=int, default=8192)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--limit", type=int, help="Diagnostic only: evaluate the first N questions")
     parser.add_argument("--seed-count", type=int, help="Diagnostic only: use the first N protocol seeds")
+    parser.add_argument(
+        "--seed-start",
+        type=int,
+        default=42,
+        help="First sampling seed; use a disjoint range for independent candidate confirmation.",
+    )
+    parser.add_argument(
+        "--engine-seed",
+        type=int,
+        help=(
+            "SGLang Engine initialization seed. Defaults to --seed-start so "
+            "process-level seed shards do not replay the same RNG stream."
+        ),
+    )
     parser.add_argument(
         "--allow-noncanonical-data",
         action="store_true",
@@ -64,6 +89,20 @@ def correctness(result: Any) -> tuple[bool, Any]:
 
 def main() -> int:
     args = parse_args()
+    if args.tensor_parallel_size < 1 or args.data_parallel_size < 1:
+        raise ValueError("tensor/data parallel sizes must be positive")
+    if args.data_parallel_size != 1:
+        raise ValueError(
+            "SGLang 0.5.8 Engine.generate(list) corrupts batched responses with dp_size > 1; "
+            "use process-level data sharding instead"
+        )
+    # This project intentionally pins sgl-kernel 0.3.18 for its historical
+    # Torch 2.8 runtime.  Newer SGLang metadata asks for 0.3.21 (Torch 2.9),
+    # so use the same guarded compatibility override as the training path.
+    os.environ.setdefault("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK", "1")
+    # Avoid spawning 32 idle Inductor workers per scheduler. CUDA graphs stay
+    # enabled unless RLFT_DISABLE_CUDA_GRAPH=1 is explicitly requested.
+    os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
     default_data = (
         ROOT / "data" / "processed" / "math_grpo_v2" / "train.parquet"
         if args.benchmark == "hardmath"
@@ -74,6 +113,9 @@ def main() -> int:
         raise FileNotFoundError(data_path)
     if not args.model_path.is_dir():
         raise FileNotFoundError(args.model_path)
+    tokenizer_path = args.tokenizer_path or args.model_path
+    if not tokenizer_path.is_dir():
+        raise FileNotFoundError(tokenizer_path)
 
     from datasets import Dataset
     from transformers import AutoTokenizer
@@ -89,7 +131,7 @@ def main() -> int:
         if args.limit < 1 or args.limit > len(dataset):
             raise ValueError(f"invalid --limit={args.limit} for {len(dataset)} rows")
         dataset = dataset.select(range(args.limit))
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True, local_files_only=True)
     prompts = [ensure_answer_instruction(row["prompt"]) for row in dataset]
     prompt_ids = [
         tokenizer.apply_chat_template(
@@ -102,14 +144,20 @@ def main() -> int:
         raise RuntimeError(f"benchmark prompt exceeds 2048 tokens: {max_prompt}")
 
     default_seed_count = 16 if args.benchmark == "aime2024" else 8
-    seeds = list(range(42, 42 + default_seed_count))
+    seeds = list(range(args.seed_start, args.seed_start + default_seed_count))
     if args.seed_count is not None:
         if args.seed_count < 1 or args.seed_count > len(seeds):
             raise ValueError(f"invalid --seed-count={args.seed_count}")
         seeds = seeds[: args.seed_count]
+    engine_seed = args.seed_start if args.engine_seed is None else args.engine_seed
     engine_kwargs = {
         "model_path": str(args.model_path),
+        "tokenizer_path": str(tokenizer_path),
+        # Request SGLang's model path. The launcher must also include the
+        # repository peft_compat shim for native Qwen3-MoE registration.
+        "model_impl": "sglang",
         "tp_size": args.tensor_parallel_size,
+        "dp_size": args.data_parallel_size,
         "dtype": "bfloat16",
         "mem_fraction_static": args.gpu_memory_utilization,
         # SGLang rejects requests whose total token count is equal to the
@@ -118,7 +166,11 @@ def main() -> int:
         "context_length": max_prompt + args.max_new_tokens + 1,
         "chunked_prefill_size": 8192,
         "trust_remote_code": True,
-        "random_seed": 42,
+        # SGLang 0.5.8 native Engine currently advances its engine RNG stream
+        # across generate() calls, but process-level runs initialized with the
+        # same random_seed can replay identical outputs even when individual
+        # SamplingParams carry different sampling_seed values.
+        "random_seed": engine_seed,
     }
     if os.environ.get("RLFT_DISABLE_CUDA_GRAPH", "0") == "1":
         engine_kwargs.update(disable_cuda_graph=True, enable_torch_compile=False)
@@ -140,6 +192,11 @@ def main() -> int:
         for problem_index, (source, output) in enumerate(zip(dataset, outputs, strict=True)):
             text = output["text"]
             output_ids = list(output["output_ids"])
+            if len(output_ids) > args.max_new_tokens:
+                raise RuntimeError(
+                    f"response has {len(output_ids)} tokens, exceeding max_new_tokens="
+                    f"{args.max_new_tokens}; possible SGLang DP output concatenation"
+                )
             finish_reason = output.get("meta_info", {}).get("finish_reason")
             if isinstance(finish_reason, dict):
                 finish_reason = finish_reason.get("type")
@@ -147,7 +204,10 @@ def main() -> int:
                 data_source=source["data_source"],
                 solution_str=text,
                 ground_truth=source["reward_model"]["ground_truth"],
-                extra_info=source.get("extra_info"),
+                extra_info={
+                    **(source.get("extra_info") or {}),
+                    "verifier_prompt": source["prompt"],
+                },
             )
             correct, verifier_detail = correctness(verifier)
             all_rows.append(
@@ -200,6 +260,7 @@ def main() -> int:
         "protocol": "qwen3-30b-a3b-hard-math-grpo-v2-eval",
         "benchmark": args.benchmark,
         "model_path": str(args.model_path.resolve()),
+        "tokenizer_path": str(tokenizer_path.resolve()),
         "data_path": str(data_path.resolve()),
         "data_sha256": sha256_file(data_path),
         "sampling": {
@@ -210,6 +271,19 @@ def main() -> int:
             "min_p": 0.0,
             "max_new_tokens": args.max_new_tokens,
             "seeds": seeds,
+        },
+        "runtime": {
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "data_parallel_size": args.data_parallel_size,
+            "torchinductor_compile_threads": os.environ.get(
+                "TORCHINDUCTOR_COMPILE_THREADS"
+            ),
+            "model_impl": "sglang",
+            "engine_seed": engine_seed,
+            "cuda_graph_disabled": os.environ.get("RLFT_DISABLE_CUDA_GRAPH", "0") == "1",
+            "sglang_skip_sgl_kernel_version_check": os.environ.get(
+                "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"
+            ),
         },
         "diagnostic_subset": args.limit is not None or args.seed_count is not None,
         "metrics": metrics,

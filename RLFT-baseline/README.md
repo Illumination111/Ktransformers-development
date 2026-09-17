@@ -17,7 +17,7 @@
 - 长度：prompt=1024，response=512，单卡 token budget=8192
 - 外部评测：MATH-500 和 AIME-2024
 
-完整协议见 `/home/wubowen/development-docs/01-baseline/grpo-baseline.md`。
+完整协议见 `/mnt/qjh001/wubowen/development-docs/01-baseline/grpo-baseline.md`。
 
 ## 执行顺序
 
@@ -26,7 +26,7 @@
 bash scripts/setup_env.sh
 
 # 2. 下载/固定 NekoQA revision 后生成数据（当前 parquet 已生成）
-/home/wubowen/miniconda3/envs/kt-rflt-baseline/bin/python scripts/prepare_data.py \
+/mnt/qjh001/wubowen/miniconda3/envs/kt-rflt-baseline/bin/python scripts/prepare_data.py \
   --dataset-id liumindmind/NekoQA-10K \
   --dataset-revision 1b2110c996a8237823b86c1a3d3e8a6762b38430 \
   --math500-revision 6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be \
@@ -47,7 +47,7 @@ bash scripts/run_b0_puregpu.sh formal
 
 ```bash
 # 1. 下载、去重并生成 hard-math 训练集与固定 MATH-500 validation gate
-/home/wubowen/miniconda3/envs/kt-rflt-baseline/bin/python scripts/prepare_hard_math_data.py
+/mnt/qjh001/wubowen/miniconda3/envs/kt-rflt-baseline/bin/python scripts/prepare_hard_math_data.py
 
 # 2. 用当前模型比较 4096/8192/10240 长度；formal 默认要求该 gate 已通过
 bash scripts/run_math_static_gate.sh
@@ -84,7 +84,7 @@ bash scripts/run_math_sft_grpo_pipeline.sh
 source configs/b0.env
 
 # 1. 从 DAPO-Math GRPO 数据生成 veRL messages 格式（默认 1% 确定性验证集）
-/home/wubowen/miniconda3/envs/kt-rflt-baseline/bin/python scripts/prepare_math_sft_data.py
+/mnt/qjh001/wubowen/miniconda3/envs/kt-rflt-baseline/bin/python scripts/prepare_math_sft_data.py
 
 # 2. 四卡 FSDP2 + LoRA SFT；默认一轮，输出到 checkpoints/math_sft_qwen3_30b_a3b_lora
 bash scripts/run_math_sft_puregpu.sh

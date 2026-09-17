@@ -12,7 +12,7 @@ fi
 [ -n "$uv_bin" ] && [ -x "$uv_bin" ] || die "uv is required but was not found"
 require_clean_worktree
 
-conda_bin=/home/wubowen/miniconda3/bin/conda
+conda_bin=/mnt/qjh001/wubowen/miniconda3/bin/conda
 [ -x "$conda_bin" ] || die "Conda executable not found: $conda_bin"
 if ! "$conda_bin" env list | awk '{print $1}' | grep -Fxq "$B0_CONDA_ENV"; then
     "$conda_bin" create -y -n "$B0_CONDA_ENV" python=3.11 pip

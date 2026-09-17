@@ -19,33 +19,47 @@ sft_ngpus="${MATH_SFT_NGPUS:-4}"
 export CUDA_VISIBLE_DEVICES="${MATH_SFT_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 sft_model="${MATH_SFT_MODEL_PATH:-$B0_MATH_MODEL}"
 sft_data_dir="${MATH_SFT_DATA_DIR:-$B0_ROOT/data/processed/math_sft}"
-train_data="$sft_data_dir/train.parquet"
-val_data="$sft_data_dir/validation.parquet"
+train_data="${MATH_SFT_TRAIN_DATA:-$sft_data_dir/train.parquet}"
+val_data="${MATH_SFT_VALIDATION_DATA:-$sft_data_dir/validation.parquet}"
 experiment="${MATH_SFT_EXPERIMENT:-math_sft_qwen3_30b_a3b_lora}"
 checkpoint_dir="${MATH_SFT_CHECKPOINT_DIR:-$B0_ROOT/checkpoints/$experiment}"
 log_file="$B0_ROOT/logs/$experiment/console.log"
+sft_train_batch_size="${MATH_SFT_TRAIN_BATCH_SIZE:-16}"
+sft_micro_batch_size="${MATH_SFT_MICRO_BATCH_SIZE_PER_GPU:-2}"
+sft_max_length="${MATH_SFT_MAX_LENGTH:-2048}"
+sft_max_token_len_per_gpu="${MATH_SFT_MAX_TOKEN_LEN_PER_GPU:-8192}"
+sft_num_workers="${MATH_SFT_NUM_WORKERS:-4}"
+sft_enable_thinking="${MATH_SFT_ENABLE_THINKING:-false}"
+sft_lr="${MATH_SFT_LR:-1e-5}"
+sft_total_epochs="${MATH_SFT_TOTAL_EPOCHS:-1}"
+sft_save_freq="${MATH_SFT_SAVE_FREQ:-500}"
+sft_test_freq="${MATH_SFT_TEST_FREQ:-500}"
 
 require_clean_worktree
 require_dir "$sft_model"
 require_file "$train_data"
 require_file "$val_data"
 [[ "$sft_ngpus" =~ ^[1-9][0-9]*$ ]] || die "MATH_SFT_NGPUS must be a positive integer"
+case "$sft_enable_thinking" in
+    true|false) ;;
+    *) die "MATH_SFT_ENABLE_THINKING must be true or false" ;;
+esac
 
 command=(
     torchrun --standalone --nnodes=1 --nproc_per_node="$sft_ngpus"
     -m verl.trainer.sft_trainer
     "data.train_files=['$train_data']"
     "data.val_files=['$val_data']"
-    data.train_batch_size=16
-    data.micro_batch_size_per_gpu=2
-    data.max_length=2048
+    data.train_batch_size="$sft_train_batch_size"
+    data.micro_batch_size_per_gpu="$sft_micro_batch_size"
+    data.max_length="$sft_max_length"
     data.truncation=error
     data.use_dynamic_bsz=True
-    data.max_token_len_per_gpu=8192
+    data.max_token_len_per_gpu="$sft_max_token_len_per_gpu"
     data.messages_key=messages
     data.ignore_input_ids_mismatch=True
-    data.num_workers=4
-    +data.apply_chat_template_kwargs.enable_thinking=False
+    data.num_workers="$sft_num_workers"
+    +data.apply_chat_template_kwargs.enable_thinking="$sft_enable_thinking"
     model=hf_model
     "model.path=$sft_model"
     model.trust_remote_code=True
@@ -63,16 +77,16 @@ command=(
     engine.fsdp2_checkpoint_load_mode=hf_safetensors
     engine.use_torch_compile=False
     optim=fsdp
-    optim.lr=1e-5
+    optim.lr="$sft_lr"
     optim.lr_warmup_steps_ratio=0.05
     optim.weight_decay=0.01
     trainer.default_local_dir="$checkpoint_dir"
     "trainer.project_name=${B0_PROJECT}_math_sft"
     "trainer.experiment_name=$experiment"
     'trainer.logger=["console","wandb"]'
-    trainer.total_epochs=1
-    trainer.save_freq=500
-    trainer.test_freq=500
+    trainer.total_epochs="$sft_total_epochs"
+    trainer.save_freq="$sft_save_freq"
+    trainer.test_freq="$sft_test_freq"
     trainer.max_ckpt_to_keep=2
     trainer.resume_mode=disable
     trainer.device=cuda

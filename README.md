@@ -9,6 +9,9 @@ serving, and vision-language model training.
 - `MLStest/`: multi-LoRA serving test harnesses.
 - `VLM-FT-test/`: vision-language model fine-tuning tests.
 
+For VLM LoRA module selection, configuration examples, and upstream guide
+corrections, see [VLM LoRA configuration notes](VLM-FT-test/docs/VLM-LoRA-%E8%AE%AD%E7%BB%83%E6%A8%A1%E5%9D%97%E4%B8%8E%E9%85%8D%E7%BD%AE%E8%AF%B4%E6%98%8E.md).
+
 The original Git histories of FFTtest and MLStest are retained as merge
 parents. Their original branch tips are also available under
 `history/FFTtest/*` and `history/MLStest/*`. VLM-FT-test was not previously

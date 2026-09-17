@@ -8,9 +8,10 @@ source "$script_dir/common.sh"
 # formal tmux session. Override with MATH_CUDA_VISIBLE_DEVICES if needed.
 math_ngpus="${MATH_NGPUS:-4}"
 export CUDA_VISIBLE_DEVICES="${MATH_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK="${SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK:-1}"
 
 usage() {
-    printf 'Usage: %s {smoke|pilot|formal} [--dry-run]\n' "$0"
+    printf 'Usage: %s {smoke|pilot|small-smoke|small-val-only|small|formal} [--dry-run]\n' "$0"
 }
 
 [ "$#" -ge 1 ] || { usage >&2; exit 2; }
@@ -28,6 +29,8 @@ val_data="${MATH_VALIDATION_DATA:-$B0_MATH_VALIDATION_GATE_DATA}"
 math_reward="${MATH_REWARD_FUNCTION:-$B0_MATH_REWARD_FUNCTION}"
 math_model="${MATH_MODEL_PATH:-$B0_MATH_MODEL}"
 math_compile="${MATH_ENABLE_TORCH_COMPILE:-0}"
+math_format_reward_weight="${MATH_FORMAT_REWARD_WEIGHT:-0.1}"
+math_val_batch_size="${MATH_VAL_BATCH_SIZE:-16}"
 # MultiTurnSFTDataset tokenized each completed assistant turn without the
 # non-thinking generation prefix, so retain the raw Qwen assistant prefix at
 # rollout time.  This matches the actual SFT token stream.
@@ -85,6 +88,76 @@ case "$stage" in
             actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=10240
         )
         ;;
+    small-smoke)
+        experiment="${MATH_EXPERIMENT:-openr1_small_sft_grpo_smoke_2step_v1}"
+        stage_overrides=(
+            trainer.total_training_steps=2
+            trainer.save_freq=2
+            trainer.test_freq=2
+            trainer.val_before_train=True
+            data.train_batch_size=4
+            data.val_batch_size="$math_val_batch_size"
+            data.max_prompt_length=1024
+            data.max_response_length=8192
+            actor_rollout_ref.rollout.n=8
+            actor_rollout_ref.rollout.max_model_len=10240
+            actor_rollout_ref.rollout.max_num_batched_tokens=8192
+            actor_rollout_ref.rollout.max_num_seqs=8
+            actor_rollout_ref.actor.ppo_mini_batch_size=4
+            actor_rollout_ref.actor.ppo_max_token_len_per_gpu=10240
+            actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=10240
+            actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=10240
+        )
+        ;;
+    small-val-only)
+        experiment="${MATH_EXPERIMENT:-openr1_small_grpo_val_only}"
+        resume_from_path="${MATH_RESUME_FROM_PATH:-}"
+        [ -n "$resume_from_path" ] || die "MATH_RESUME_FROM_PATH is required for small-val-only"
+        require_dir "$resume_from_path"
+        [[ "$resume_from_path" = */global_step_* ]] \
+            || die "MATH_RESUME_FROM_PATH must point to a global_step_N directory"
+        stage_overrides=(
+            trainer.resume_mode=resume_path
+            trainer.resume_from_path="$resume_from_path"
+            trainer.val_before_train=True
+            trainer.val_only=True
+            trainer.save_freq=-1
+            trainer.test_freq=-1
+            data.train_batch_size=4
+            data.val_batch_size="$math_val_batch_size"
+            data.max_prompt_length=1024
+            data.max_response_length=8192
+            actor_rollout_ref.rollout.n=8
+            actor_rollout_ref.rollout.max_model_len=10240
+            actor_rollout_ref.rollout.max_num_batched_tokens=8192
+            actor_rollout_ref.rollout.max_num_seqs=8
+            actor_rollout_ref.actor.ppo_mini_batch_size=4
+            actor_rollout_ref.actor.ppo_max_token_len_per_gpu=10240
+            actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=10240
+            actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=10240
+        )
+        ;;
+    small)
+        experiment="${MATH_EXPERIMENT:-openr1_small_sft_grpo_8step_v1}"
+        stage_overrides=(
+            trainer.total_training_steps=8
+            trainer.save_freq=2
+            trainer.test_freq=2
+            trainer.val_before_train=True
+            data.train_batch_size=4
+            data.val_batch_size="$math_val_batch_size"
+            data.max_prompt_length=1024
+            data.max_response_length=8192
+            actor_rollout_ref.rollout.n=8
+            actor_rollout_ref.rollout.max_model_len=10240
+            actor_rollout_ref.rollout.max_num_batched_tokens=8192
+            actor_rollout_ref.rollout.max_num_seqs=8
+            actor_rollout_ref.actor.ppo_mini_batch_size=4
+            actor_rollout_ref.actor.ppo_max_token_len_per_gpu=10240
+            actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=10240
+            actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=10240
+        )
+        ;;
     formal)
         experiment="${MATH_EXPERIMENT:-math_grpo_v2_4gpu_formal_80step}"
         stage_overrides=(
@@ -126,7 +199,7 @@ base_overrides=(
     "data.val_files=['$val_data']"
     data.seed="$B0_SEED"
     data.train_batch_size=16
-    data.val_batch_size=16
+    data.val_batch_size="$math_val_batch_size"
     data.max_prompt_length=1024
     data.max_response_length=8192
     data.filter_overlong_prompts=True
@@ -187,6 +260,8 @@ base_overrides=(
     +actor_rollout_ref.rollout.engine_kwargs.sglang.lora_backend=torch_native
     +actor_rollout_ref.rollout.engine_kwargs.sglang.enable_fused_qk_norm_rope=False
     "+ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH=$B0_ROOT/scripts/peft_compat:$B0_ROOT/scripts:$B0_WORKTREE"
+    "+ray_kwargs.ray_init.runtime_env.env_vars.MATH_FORMAT_REWARD_WEIGHT=\"$math_format_reward_weight\""
+    "+ray_kwargs.ray_init.runtime_env.env_vars.SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=\"$SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK\""
     '+ray_kwargs.ray_init.runtime_env.env_vars.RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES="1"'
     ray_kwargs.ray_init.num_cpus=16
     trainer.balance_batch=True
@@ -266,6 +341,11 @@ cd "$B0_WORKTREE"
 printf 'Starting math GRPO stage %s; log=%s\n' "$stage" "$log_file"
 "${command[@]}" 2>&1 | tee "$log_file"
 
+if [ "$stage" = small-val-only ]; then
+    printf 'Completed checkpoint validation-only stage; validation=%s\n' "$validation_dir"
+    exit 0
+fi
+
 audit_output="$B0_ROOT/metrics/$experiment/rollout_audit.json"
 audit_args=(
     "$B0_CONDA_PREFIX/bin/python"
@@ -277,6 +357,8 @@ audit_args=(
 case "$stage" in
     smoke) audit_args+=(--max-response-tokens 4096 --min-format-rate 0.5 --min-answer-extracted-rate 0.5 --max-clip-rate 0.5) ;;
     pilot) audit_args+=(--max-response-tokens 4096 --min-effective-steps 1) ;;
+    small-smoke) audit_args+=(--max-response-tokens 8192 --min-effective-steps 1 --max-clip-rate 0.1) ;;
+    small) audit_args+=(--max-response-tokens 8192 --min-effective-steps 4 --max-clip-rate 0.1) ;;
     formal) audit_args+=(--max-response-tokens 8192 --min-effective-steps 50 --max-clip-rate 0.5) ;;
 esac
 "${audit_args[@]}"

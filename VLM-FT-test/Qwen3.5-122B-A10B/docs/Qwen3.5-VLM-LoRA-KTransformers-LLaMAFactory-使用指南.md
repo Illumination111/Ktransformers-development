@@ -1,5 +1,10 @@
 # 使用 KTransformers + LlamaFactory 微调 Qwen3.5 VLM LoRA
 
+> 本文记录 2026-08-11 的 fork 测试环境，包含未合入上游的
+> `vlm_lora_scope` 配置。使用当前官方 KTransformers 与 LLaMA-Factory 时，
+> 请先阅读[上游版本的训练模块与配置说明](../../docs/VLM-LoRA-训练模块与配置说明.md)，
+> 不要直接套用本文的 fork 专有字段。
+
 本文面向需要从零搭建训练环境的用户，说明如何同步 GitHub `main`、安装
 KTransformers/LlamaFactory、准备 Qwen3.5 VLM 权重和图文/视频数据集、配置 LoRA
 范围、启动训练并验收输出。
