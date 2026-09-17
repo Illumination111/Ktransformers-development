@@ -1,17 +1,14 @@
 # 使用 KTransformers + LlamaFactory 微调 Qwen3.5 VLM LoRA
 
-> 本文记录 2026-08-11 的 fork 测试环境，包含未合入上游的
-> `vlm_lora_scope` 配置。使用当前官方 KTransformers 与 LLaMA-Factory 时，
-> 请先阅读[上游版本的训练模块与配置说明](../../docs/VLM-LoRA-训练模块与配置说明.md)，
-> 不要直接套用本文的 fork 专有字段。
+> 本文记录 2026-08-11 的 fork 测试环境。当前 PR 和配套 runner 只保留
+> LlamaFactory 原生的文本侧 VLM LoRA，视觉塔与多模态 projector 冻结。
+> 下文的 `vlm_lora_scope`、`vision`、`all` 是早期实验记录，不能作为当前上游
+> 安装或启动接口。使用官方版本时，请先阅读
+> [训练模块与配置说明](../../docs/VLM-LoRA-训练模块与配置说明.md)。
 
 本文面向需要从零搭建训练环境的用户，说明如何同步 GitHub `main`、安装
 KTransformers/LlamaFactory、准备 Qwen3.5 VLM 权重和图文/视频数据集、配置 LoRA
 范围、启动训练并验收输出。
-
-> 当前 PR 和配套 runner 只保留 LlamaFactory 原生的文本侧 VLM LoRA，视觉塔与多模态
-> projector 冻结。本文中 `vlm_lora_scope`、`vision`、`all` 章节是早期实验记录，不能
-> 作为当前 PR 的安装或启动接口。
 
 本文以 **Qwen3.5-122B-A10B 原生 BF16 权重、8 张 GPU、Intel AMX BF16 CPU 后端**
 作为已经实际验证的基线。其他 Qwen3.5 MoE VLM 可以参考相同流程，但必须根据模型规模、
