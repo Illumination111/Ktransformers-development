@@ -23,8 +23,8 @@ The directory provides two levels of testing:
 Until the companion branches are merged, select their development worktrees:
 
 ```bash
-export VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr
-export VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel
+export VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LLaMA-Factory
+export VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers/kt-kernel
 ```
 
 Run the weight-free preflight first:
@@ -33,27 +33,18 @@ Run the weight-free preflight first:
 bash run_vlm_lora_smoke.sh --preflight-only
 ```
 
-The Kllama environment uses torch 2.9.1. LLaMA-Factory's additive KT-VLM
-integration automatically imports the verified `ms-swift==4.4.2` package in
-every rank before model loading. The test entrypoint does not activate the
-patch; it checks that the framework did so, while the preflight runs a
+The Kllama environment uses torch 2.9.1. KTransformers patches only the
+supported Conv3D instances on the loaded VLM and marks them before returning
+the model. The test entrypoint checks those markers, while the preflight runs a
 Qwen3.5-shaped forward/backward self-test. For a diagnostic-only config render:
 
 ```bash
 bash run_vlm_lora_smoke.sh --dry-run
 ```
 
-Install the test dependency without changing torch or Transformers:
-
-```bash
-/mnt/data2/wbw/conda/envs/Kllama/bin/python -m pip install "ms-swift==4.4.2"
-```
-
-For a released KT package, use `pip install 'ktransformers[vlm-sft]'` for the
-complete training stack, or `pip install 'kt-kernel[vlm-sft]'` at the kernel
-layer. Both install the same kt-kernel wheel plus an optional Python dependency;
-neither is a separate VLM-specific precompiled kernel build. The source-tree
-test uses a small module registration shim only because Kllama currently
+No VLM-only Python dependency is required. For a released KT package, use the
+same `pip install 'ktransformers[sft]'` command as text SFT. The source-tree test
+uses a small wrapper hook only because Kllama currently
 retains the older matched `ktransformers/kt-kernel 0.6.3.post1` pair.
 
 For a real one-step run:
@@ -62,23 +53,15 @@ For a real one-step run:
 bash run_vlm_lora_smoke.sh --lora-scope text --max-steps 1 --devices 0,1,2,3,4,5,6,7
 ```
 
-Use `--lora-scope vision` for the vision tower and multimodal projector only,
-or `--lora-scope all` for text and vision LoRA together. `text` remains the
-default for backward compatibility. The runner writes the selection as
-`vlm_lora_scope` in the immutable per-run YAML and validates gradients,
-optimizer updates, and saved adapter tensors against the requested scope.
-
-A real vision-only run also requires the active kt-kernel Python package to
-include `kt_freeze_experts`; the development Conv3D-module shim alone does not
-change KT expert training.
-The runners fail before loading 122B weights if scoped LLaMA-Factory support is
-missing, or if a real vision-only launch imports a kt-kernel without that flag.
+The current runners intentionally cover only LlamaFactory's ordinary text-side
+VLM LoRA path. They explicitly freeze the vision tower and multimodal projector;
+the former `vision`/`all` scope experiment is outside the current PR.
 
 For the formal 20-step run:
 
 ```bash
 bash run_vlm_lora_formal.sh \
-  --lora-scope all \
+  --lora-scope text \
   --model-path /mnt/data2/models/Qwen3.5-122B-A10B \
   --dataset-dir /mnt/data2/wbw/LLaMA-Factory/data \
   --dataset-name mllm_demo \
@@ -99,7 +82,7 @@ shard; it never gathers a complete parameter.
 The custom entrypoint fails before training unless all of these are true:
 
 - the full conditional-generation VLM and its `patch_embed.proj` Conv3D remain;
-- the ms-swift Conv3D patch is active in the same rank before model loading;
+- every Conv3D instance carries the KT compatibility marker in the same rank;
 - no visual base parameter is trainable;
 - LoRA parameters exist only in the requested text/vision scope;
 - all 48 Qwen3.5-MoE decoder layers are wrapped by KT;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile Qwen3.5 6 MiB experts and token mixers for APTMoE placement."""
+"""Profile Qwen3.5 experts and token mixers for APTMoE placement."""
 
 from __future__ import annotations
 
@@ -166,13 +166,18 @@ def time_token_mixer(
     return median(values)
 
 
-def main() -> None:
+def main(
+    *,
+    default_model_path: Path = Path("/mnt/data3/models/Qwen3.5-35B-A3B"),
+    default_proxy_tag: str = "qwen35",
+) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model-path",
         type=Path,
-        default=Path("/mnt/data3/models/Qwen3.5-35B-A3B"),
+        default=default_model_path,
     )
+    parser.add_argument("--proxy-tag", default=default_proxy_tag)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--deployment-profile",
@@ -200,6 +205,8 @@ def main() -> None:
         args.cpu_threads,
     ) <= 0:
         raise SystemExit("profile sizes, iterations, and threads must be positive")
+    if not args.proxy_tag or not args.proxy_tag.replace("_", "").isalnum():
+        raise SystemExit(f"invalid --proxy-tag: {args.proxy_tag!r}")
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required to profile APTMoE transfers and attention")
     torch.cuda.set_device(0)
@@ -330,7 +337,11 @@ def main() -> None:
 
     mixer_profiles: dict[str, dict[str, float | int]] = {}
     non_mixer_load_seconds = router_h2d + shared_h2d + norms_h2d
-    for layer_idx in (0, 3):
+    representative_layers = [
+        config.layer_types.index(layer_type)
+        for layer_type in ("linear_attention", "full_attention")
+    ]
+    for layer_idx in representative_layers:
         mixer = Qwen35TokenMixer(config, layer_idx).to(
             device="cpu",
             dtype=torch.bfloat16,
@@ -367,7 +378,8 @@ def main() -> None:
 
     lookup = {
         "schema_version": 1,
-        "benchmark_class": "aptmoe_qwen35_proxy_lookup",
+        "benchmark_class": f"aptmoe_{args.proxy_tag}_proxy_lookup",
+        "proxy_tag": args.proxy_tag,
         "deployment_profile": args.deployment_profile,
         "host": {
             "hostname": platform.node(),
@@ -389,7 +401,12 @@ def main() -> None:
             "num_experts": config.num_experts,
             "hidden_size": config.hidden_size,
             "intermediate_size": config.moe_intermediate_size,
-            "bf16_bytes": 6 * (1 << 20),
+            "bf16_bytes": (
+                3
+                * config.hidden_size
+                * config.moe_intermediate_size
+                * 2
+            ),
             "transfer_timing": "host_wall_module_to_plus_cuda_synchronize",
             "h2d_seconds": expert_h2d,
             "d2h_seconds": expert_d2h,

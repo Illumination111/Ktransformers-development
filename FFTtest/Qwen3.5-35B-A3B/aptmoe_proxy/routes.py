@@ -38,6 +38,8 @@ class RouteController:
         expected_patterns: int | None = None,
         trace_path: str | Path | None,
         allow_synthetic: bool,
+        formal_trace_source: str = "merged_exact_qwen35_router_trace",
+        formal_replay_mode: str = "replayed_qwen35_topk_indices",
     ) -> None:
         self.num_layers = num_layers
         self.num_experts = num_experts
@@ -50,6 +52,10 @@ class RouteController:
         if expected_patterns is not None and expected_patterns <= 0:
             raise ValueError("expected_patterns must be positive")
         self.expected_patterns = expected_patterns
+        if not formal_trace_source or not formal_replay_mode:
+            raise ValueError("formal route identity must not be empty")
+        self.formal_trace_source = formal_trace_source
+        self.formal_replay_mode = formal_replay_mode
         self.step = 0
         self.microbatch = 0
         self._cache: dict[tuple[int, int, str], torch.Tensor] = {}
@@ -63,7 +69,7 @@ class RouteController:
         if self.trace_path is not None:
             self._load_trace(self.trace_path)
             source = self.metadata.get("source")
-            if source == "merged_exact_qwen35_router_trace":
+            if source == self.formal_trace_source:
                 assert self.trace is not None
                 if self.trace.ndim != 4:
                     raise ValueError(
@@ -87,14 +93,14 @@ class RouteController:
                         "formal Qwen3.5 route trace is missing an exact "
                         "source_backend"
                     )
-                self.mode = "replayed_qwen35_topk_indices"
+                self.mode = self.formal_replay_mode
             elif allow_synthetic:
                 self.mode = "synthetic_trace_smoke_only"
             else:
                 raise ValueError(
                     "formal APTMoE proxy runs only accept a trace produced by "
-                    "merge_qwen35_route_traces.py from exact Qwen3.5 router "
-                    f"hooks; got metadata source={source!r}"
+                    "an exact Qwen3.5 router capture/merge flow; "
+                    f"got metadata source={source!r}"
                 )
         elif allow_synthetic:
             self.mode = "random_router_synthetic"
@@ -306,4 +312,6 @@ class RouteController:
             "tokens_per_microbatch": self.tokens_per_microbatch,
             "microbatches_per_step": self.microbatches_per_step,
             "expected_patterns": self.expected_patterns,
+            "formal_trace_source": self.formal_trace_source,
+            "formal_replay_mode": self.formal_replay_mode,
         }

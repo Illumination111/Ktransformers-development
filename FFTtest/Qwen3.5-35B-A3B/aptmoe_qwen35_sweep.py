@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
 from argparse import Namespace
 from pathlib import Path
@@ -55,7 +56,14 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for an APTMoE persistent sweep")
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+    dist.init_process_group(
+        backend="nccl",
+        timeout=datetime.timedelta(
+            minutes=int(os.environ.get("FFT_NCCL_TIMEOUT_MINUTES", "30"))
+        ),
+    )
 
     try:
         for case in manifest["cases"]:

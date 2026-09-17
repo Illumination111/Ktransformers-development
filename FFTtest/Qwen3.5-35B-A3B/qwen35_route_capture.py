@@ -56,6 +56,7 @@ class RouteTraceCapture:
         max_patterns: int,
         expected_layers: int = 40,
         top_k: int = 8,
+        proxy_tag: str = "qwen35",
     ) -> None:
         simulation_root = Path(
             os.environ.get(
@@ -73,6 +74,7 @@ class RouteTraceCapture:
         self.max_patterns = max_patterns
         self.expected_layers = expected_layers
         self.top_k = top_k
+        self.proxy_tag = proxy_tag
         self.rank = int(os.environ.get("RANK", "0"))
         self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
         self.backend = os.environ.get("FFT_TRAINING_BACKEND", "unknown")
@@ -189,7 +191,7 @@ class RouteTraceCapture:
         topk_indices = np.stack(pattern_arrays, axis=0)
         metadata = {
             "schema_version": 1,
-            "source": "exact_qwen35_router_forward_hook",
+            "source": f"exact_{self.proxy_tag}_router_forward_hook",
             "backend": self.backend,
             "rank": self.rank,
             "world_size": self.world_size,
@@ -282,10 +284,23 @@ def install_route_capture(
         Qwen3_5MoeTopKRouter,
     )
 
+    config = getattr(model, "config", None)
+    expected_layers = int(os.environ.get(
+        "FFT_ROUTE_TRACE_EXPECTED_LAYERS",
+        getattr(config, "num_hidden_layers", 40),
+    ))
+    top_k = int(os.environ.get(
+        "FFT_ROUTE_TRACE_TOP_K",
+        getattr(config, "num_experts_per_tok", 8),
+    ))
+    proxy_tag = os.environ.get("FFT_ROUTE_TRACE_PROXY_TAG", "qwen35")
     capture = RouteTraceCapture(
         output_dir=Path(output_dir),
         sequence_length=sequence_length,
         max_patterns=int(os.environ.get("FFT_ROUTE_TRACE_PATTERNS", "1")),
+        expected_layers=expected_layers,
+        top_k=top_k,
+        proxy_tag=proxy_tag,
     )
     registered: set[int] = set()
     handles: list[Any] = []
@@ -310,7 +325,7 @@ def install_route_capture(
             handles.append(module.register_forward_hook(capture.hook(layer_idx)))
         if registered != set(range(capture.expected_layers)):
             raise RuntimeError(
-                "Qwen3.5 route capture expected layers 0..39, "
+                f"Qwen3.5 route capture expected layers 0..{capture.expected_layers - 1}, "
                 f"found {sorted(registered)}"
             )
         source = "transformers.TopKRouter"

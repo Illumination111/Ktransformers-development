@@ -107,7 +107,7 @@ class Qwen35TokenMixer(nn.Module):
 
 
 class Qwen35RoutedExpert(nn.Module):
-    """One movable Qwen3.5 fused-gate/up expert (6 MiB in BF16)."""
+    """One movable Qwen3.5 fused-gate/up expert with config-driven shape."""
 
     def __init__(
         self,

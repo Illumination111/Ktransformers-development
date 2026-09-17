@@ -23,13 +23,14 @@ export TORCHINDUCTOR_CACHE_DIR="${FFT_TORCHINDUCTOR_CACHE_DIR:-${FFT_CACHE_ROOT}
 export MPLCONFIGDIR="${FFT_MPLCONFIGDIR:-${FFT_CACHE_ROOT}/matplotlib}"
 LLAMA_FACTORY_DIR="${FFT_LLAMA_FACTORY_DIR:-/mnt/data2/wbw/LLaMA-Factory}"
 MODEL_PATH="${FFT_MODEL_PATH:-/mnt/data3/models/Qwen3.5-35B-A3B}"
+MODEL_DISPLAY_NAME="${FFT_MODEL_DISPLAY_NAME:-Qwen3.5-35B-A3B}"
 DATASET_DIR="${FFT_DATASET_DIR:-${FFT_ROOT}/dataset}"
 DATASET_NAME="${FFT_DATASET_NAME:-fft_real_100}"
 TRAIN_ENTRY_MODULE="finetune_train_with_timing"
 TRAIN_CONFIG_BASE="${CONFIGS_DIR}/train_full_bf16_qwen35.yaml"
 DEEPSPEED_CONFIG="${CONFIGS_DIR}/deepspeed_zero3_offload_bf16.json"
 VALIDATOR="${SCRIPT_DIR}/validate_benchmark_dataset.py"
-AGGREGATOR="${SCRIPT_DIR}/aggregate_sweep_results.py"
+AGGREGATOR="${FFT_AGGREGATOR:-${SCRIPT_DIR}/aggregate_sweep_results.py}"
 TIMING_VALIDATOR="${SCRIPT_DIR}/validate_step_timing.py"
 RESOURCE_EXEC="${SCRIPT_DIR}/resource_scope_exec.py"
 MONITOR_SCRIPT="${SCRIPT_DIR}/monitor.py"
@@ -40,7 +41,7 @@ MEGATRAIN_ROOT="${FFT_MEGATRAIN_ROOT:-/mnt/data2/wbw/MegaTrain}"
 MEGATRAIN_ENTRYPOINT="${SCRIPT_DIR}/megatrain_qwen35_train.py"
 MEGATRAIN_SWEEP_ENTRYPOINT="${SCRIPT_DIR}/megatrain_qwen35_sweep.py"
 MEGATRAIN_CONFIG_BASE="${CONFIGS_DIR}/megatrain_qwen35_bf16.yaml"
-APTMOE_SWEEP_ENTRYPOINT="${SCRIPT_DIR}/aptmoe_qwen35_sweep.py"
+APTMOE_SWEEP_ENTRYPOINT="${FFT_APTMOE_SWEEP_ENTRYPOINT:-${SCRIPT_DIR}/aptmoe_qwen35_sweep.py}"
 ACTIVE_MONITOR_PID=""
 ACTIVE_MONITOR_FIFO=""
 ACTIVE_TRAIN_GUARD_PID=""
@@ -51,6 +52,8 @@ GPU_RELEASE_TOLERANCE_MIB="${FFT_GPU_RELEASE_TOLERANCE_MIB:-512}"
 GPU_PEAK_HOLD_TOLERANCE_MIB="${FFT_GPU_PEAK_HOLD_TOLERANCE_MIB:-512}"
 PREPARE_ONLY=0
 SUMMARY_FINALIZED=0
+SWEEP_LOCK_FD=""
+SWEEP_LOCK_PATH=""
 
 if [[ $# -lt 1 ]]; then
     echo "Internal error: backend argument is required" >&2
@@ -94,8 +97,11 @@ APTMOE_ROOT="${FFT_APTMOE_ROOT:-/mnt/data2/wbw/APTMoE-baseline}"
 APTMOE_SIMULATION_ROOT="${FFT_APTMOE_SIMULATION_ROOT:-${FFT_ROOT}/APTMoE-simulate}"
 APTMOE_ENTRYPOINT="${FFT_APTMOE_ENTRYPOINT:-${SCRIPT_DIR}/aptmoe_qwen35_proxy_train.py}"
 APTMOE_PYTHON="${FFT_APTMOE_PYTHON:-}"
-APTMOE_ROUTE_ROOT="${FFT_APTMOE_ROUTE_ROOT:-${APTMOE_SIMULATION_ROOT}/routes/qwen35}"
-APTMOE_LOOKUP_ROOT="${FFT_APTMOE_LOOKUP_ROOT:-${APTMOE_SIMULATION_ROOT}/lookups/qwen35}"
+APTMOE_PROXY_TAG="${FFT_APTMOE_PROXY_TAG:-qwen35}"
+APTMOE_PROXY_ARCHITECTURE="${FFT_APTMOE_PROXY_ARCHITECTURE:-qwen35_component_isomorphic}"
+APTMOE_MODEL_LOAD_ARCHITECTURE="${FFT_APTMOE_MODEL_LOAD_ARCHITECTURE:-Qwen35ComponentIsomorphicAPTMoEProxy}"
+APTMOE_ROUTE_ROOT="${FFT_APTMOE_ROUTE_ROOT:-${APTMOE_SIMULATION_ROOT}/routes/${APTMOE_PROXY_TAG}}"
+APTMOE_LOOKUP_ROOT="${FFT_APTMOE_LOOKUP_ROOT:-${APTMOE_SIMULATION_ROOT}/lookups/${APTMOE_PROXY_TAG}}"
 APTMOE_LOOKUP_TABLE="${FFT_APTMOE_LOOKUP_TABLE:-}"
 APTMOE_ALLOW_SYNTHETIC_ROUTING=0
 APTMOE_ALLOW_UNPROFILED_PLACEMENT=0
@@ -238,6 +244,26 @@ done
 log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
 warn() { printf '[%s] WARNING: %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
 die() { printf '[%s] ERROR: %s\n' "$(date '+%H:%M:%S')" "$*" >&2; exit 1; }
+
+acquire_aptmoe_sweep_lock() {
+    [[ "${BACKEND}" == "aptmoe" ]] || return 0
+    command -v flock >/dev/null || die "flock is required for APTMoE sweep serialization"
+    local devices="${DEVICES_OVERRIDE:-${CUDA_VISIBLE_DEVICES:-}}"
+    if [[ -z "${devices}" ]]; then
+        if [[ "${PROFILE}" == "consumer" ]]; then
+            devices="0,1"
+        else
+            devices="0,1,2,3,4,5,6,7"
+        fi
+    fi
+    devices="${devices// /}"
+    local lock_key="${devices//,/_}"
+    SWEEP_LOCK_PATH="${FFT_APTMOE_SWEEP_LOCK_PATH:-/tmp/fft-aptmoe-gpus-${lock_key}.lock}"
+    exec {SWEEP_LOCK_FD}>"${SWEEP_LOCK_PATH}"
+    flock -n "${SWEEP_LOCK_FD}" || \
+        die "another APTMoE sweep is already using devices ${devices} (lock: ${SWEEP_LOCK_PATH})"
+    log "APTMoE sweep lock acquired for devices ${devices}: ${SWEEP_LOCK_PATH}"
+}
 
 require_positive_int() {
     local name="$1" value="$2"
@@ -719,7 +745,10 @@ write_run_config() {
         "${APTMOE_ALLOW_LINEAR_ATTENTION_FALLBACK}" \
         "${CAPTURE_APTMOE_ROUTES}" "${APTMOE_ROOT}" \
         "${APTMOE_ENTRYPOINT}" "${FINETUNING_TYPE}" \
-        "${EFFECTIVE_LORA_RANK}" "${EFFECTIVE_LORA_ALPHA}" <<'PY'
+        "${EFFECTIVE_LORA_RANK}" "${EFFECTIVE_LORA_ALPHA}" \
+        "${MODEL_DISPLAY_NAME}" "${APTMOE_PROXY_TAG}" \
+        "${APTMOE_PROXY_ARCHITECTURE}" \
+        "${APTMOE_MODEL_LOAD_ARCHITECTURE}" "${SCRIPT_DIR}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -729,6 +758,18 @@ is_proxy = sys.argv[2] == "aptmoe"
 is_megatrain = sys.argv[2] == "megatrain"
 fallback_requested = any(bool(int(value)) for value in sys.argv[28:31])
 finetuning_type = sys.argv[34]
+model_display_name = sys.argv[37]
+proxy_tag = sys.argv[38]
+proxy_architecture = sys.argv[39]
+proxy_load_architecture = sys.argv[40]
+sys.path.insert(0, sys.argv[41])
+from qwen35_proxy_spec import build_manifest
+
+target = build_manifest(
+    Path(sys.argv[14]),
+    None,
+    proxy_tag=proxy_tag,
+)["target"]
 obj = {
     "backend": sys.argv[2],
     "profile": sys.argv[3],
@@ -744,6 +785,14 @@ obj = {
         if is_proxy
         else "exact_model"
     ),
+    "result_marker": (
+        "SMOKE_ONLY"
+        if is_proxy and fallback_requested
+        else "FORMAL"
+        if is_proxy
+        else "EXACT_MODEL"
+    ),
+    "formal_claim_allowed": bool(is_proxy and not fallback_requested),
     "weight_source": (
         "deterministic_random_initialization"
         if is_proxy
@@ -758,14 +807,31 @@ obj = {
     "lora_alpha": int(sys.argv[36]) if finetuning_type == "lora" else 0,
     "lora_target": "all" if finetuning_type == "lora" else None,
     "allow_end_to_end_qwen35_tps_claim": not is_proxy,
+    "allow_end_to_end_target_model_tps_claim": not is_proxy,
     "precision": "bf16",
     "modality": "text_only",
     "source_architecture": "Qwen3_5MoeForConditionalGeneration",
     "model_load_architecture": (
-        "Qwen35ComponentIsomorphicAPTMoEProxy"
+        proxy_load_architecture
         if is_proxy
         else "Qwen3_5MoeForCausalLM"
     ),
+    "target_model": model_display_name,
+    "proxy_tag": proxy_tag if is_proxy else None,
+    "proxy_architecture": proxy_architecture if is_proxy else None,
+    "expected_text_parameters": (
+        target["components"]["model_total"]["parameters"]
+    ),
+    "model_shape": {
+        name: target[name]
+        for name in (
+            "num_hidden_layers",
+            "num_experts",
+            "num_experts_per_tok",
+            "hidden_size",
+            "moe_intermediate_size",
+        )
+    },
     "proxy_target_architecture": (
         "Qwen3_5MoeForCausalLM" if is_proxy else None
     ),
@@ -1215,7 +1281,11 @@ run_one_sequence() {
     if [[ "${BACKEND}" == "ktransformers" ]]; then
         log "${BACKEND}/${profile_name}: seq=${seq}, GPUs=${NUM_GPUS}, global_batch=${GLOBAL_BATCH_SIZE}, tokens/step=${tokens_per_step}, ${FINETUNING_TYPE}, text-only BF16, KT owner(rank0) threads=${kt_owner_threads}, non-owner rank threads=${cpu_threads}"
     elif [[ "${BACKEND}" == "aptmoe" ]]; then
-        log "${BACKEND}/${profile_name}: seq=${seq}, GPUs=${NUM_GPUS}, global_batch=${GLOBAL_BATCH_SIZE}, tokens/step=${tokens_per_step}, component-isomorphic BF16 full-update proxy, CPU threads/rank=${cpu_threads}"
+        local proxy_validity="FORMAL"
+        if (( APTMOE_ALLOW_SYNTHETIC_ROUTING == 1 || APTMOE_ALLOW_UNPROFILED_PLACEMENT == 1 || APTMOE_ALLOW_LINEAR_ATTENTION_FALLBACK == 1 )); then
+            proxy_validity="SMOKE_ONLY"
+        fi
+        log "${BACKEND}/${profile_name}: seq=${seq}, GPUs=${NUM_GPUS}, global_batch=${GLOBAL_BATCH_SIZE}, tokens/step=${tokens_per_step}, component-isomorphic BF16 full-update proxy, validity=${proxy_validity}, CPU threads/rank=${cpu_threads}"
     else
         log "${BACKEND}/${profile_name}: seq=${seq}, GPUs=${NUM_GPUS}, global_batch=${GLOBAL_BATCH_SIZE}, tokens/step=${tokens_per_step}, text-only BF16, CPU threads/rank=${cpu_threads}"
     fi
@@ -1812,6 +1882,7 @@ run_profile() {
     return "${profile_status}"
 }
 
+acquire_aptmoe_sweep_lock
 prepare_runtime_directories
 check_files_and_environment
 RUN_TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
@@ -1824,7 +1895,7 @@ mkdir -p "${RUN_ROOT}"
 validate_dataset
 
 if [[ "${BACKEND}" == "aptmoe" ]]; then
-    log "Qwen3.5-35B-A3B component-isomorphic deployment proxy: backend=aptmoe, random BF16 weights, profile=${PROFILE}"
+    log "${MODEL_DISPLAY_NAME} component-isomorphic deployment proxy: backend=aptmoe, random BF16 weights, profile=${PROFILE}, proxy_tag=${APTMOE_PROXY_TAG}"
     log "Proxy artifacts (gitignored): ${APTMOE_SIMULATION_ROOT}"
 else
     log "Qwen3.5-35B-A3B text-only ${FINETUNING_TYPE} sweep: backend=${BACKEND}, precision=BF16, profile=${PROFILE}"

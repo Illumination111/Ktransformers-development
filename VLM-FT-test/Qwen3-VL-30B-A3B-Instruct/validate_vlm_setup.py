@@ -83,24 +83,23 @@ def validate_checkpoint(model_path: Path) -> tuple[Any, dict[str, Any], dict[str
 def validate_llamafactory() -> dict[str, Any]:
     from llamafactory.data.template import TEMPLATES
     from llamafactory.hparams import FinetuningArguments
-    from llamafactory.model.model_utils.kt_vlm import _KT_VLM_CONV3D_MODEL_TYPES
     from llamafactory.model.model_utils.visual import COMPOSITE_MODELS
-    from llamafactory.model.model_utils.vlm_lora import find_vlm_lora_modules
 
     if "qwen3_vl" not in TEMPLATES:
         fail("LLaMA-Factory has no qwen3_vl template")
     if EXPECTED_MODEL_TYPE not in COMPOSITE_MODELS:
         fail("LLaMA-Factory has no qwen3_vl_moe composite-model registration")
-    if EXPECTED_MODEL_TYPE not in _KT_VLM_CONV3D_MODEL_TYPES:
-        fail("LLaMA-Factory KT Conv3D path does not recognize qwen3_vl_moe")
-    if "vlm_lora_scope" not in FinetuningArguments.__dataclass_fields__:
-        fail("LLaMA-Factory lacks scoped VLM LoRA arguments")
+    source = Path(sys.modules["llamafactory"].__file__).resolve()
+    requirement = (source.parents[2] / "requirements" / "ktransformers.txt").read_text().strip()
+    if requirement != "ktransformers[sft]":
+        fail(f"unexpected KT requirement: {requirement!r}")
     return {
-        "source": str(Path(sys.modules["llamafactory"].__file__).resolve()),
+        "source": str(source),
         "template": "qwen3_vl",
         "composite_model": EXPECTED_MODEL_TYPE,
-        "scoped_lora": callable(find_vlm_lora_modules),
-        "kt_conv3d": True,
+        "freeze_vision_tower": FinetuningArguments.__dataclass_fields__["freeze_vision_tower"].default,
+        "kt_requirement": requirement,
+        "kt_conv3d_marker": "_kt_conv3d_compatible",
     }
 
 
@@ -181,7 +180,7 @@ def main() -> int:
 
     import torch
     import transformers
-    from load_conv3d_compat import load_conv3d_compat
+    from load_conv3d_compat import self_test_conv3d_compat
     from load_kt_arch_compat import audit_kt_architecture
 
     model_path = args.model_path.resolve()
@@ -195,7 +194,7 @@ def main() -> int:
     llamafactory = validate_llamafactory()
     data_path, rows, images = validate_dataset(dataset_dir, args.dataset_name)
     processor = validate_processor(model_path, images[0], raw)
-    conv3d = load_conv3d_compat().self_test_swift_conv3d_patch()
+    conv3d = self_test_conv3d_compat()
     if args.require_cuda and not torch.cuda.is_available():
         fail("CUDA is not visible; a real smoke run requires eight visible GPUs")
 

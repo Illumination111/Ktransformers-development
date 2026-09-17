@@ -126,8 +126,8 @@ def build_proxy_pipeline(
     placement_solver: ProxyPlacementSolver,
     seed: int,
 ) -> tuple[list[Qwen35ModelShard | None], CommScheduler]:
-    if config.num_hidden_layers != 40:
-        raise ValueError("Qwen3.5 proxy requires exactly 40 decoder layers")
+    if config.num_hidden_layers <= 0:
+        raise ValueError("Qwen3.5 proxy requires at least one decoder layer")
     num_stages = config.num_hidden_layers
     layers_per_stage = 1
     comm_scheduler = CommScheduler(device_id=local_rank)

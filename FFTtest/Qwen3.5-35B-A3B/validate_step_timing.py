@@ -40,7 +40,7 @@ def main() -> None:
     parser.add_argument("--warmup-steps", type=int, required=True)
     parser.add_argument(
         "--backend",
-        choices=("ktransformers", "deepspeed", "aptmoe", "megatrain"),
+        choices=("ktransformers", "deepspeed", "aptmoe", "megatrain", "pytorch_torch"),
         required=True,
     )
     args = parser.parse_args()

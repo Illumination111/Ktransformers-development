@@ -9,7 +9,7 @@ from typing import Any
 
 from transformers import TrainerCallback
 
-from load_conv3d_compat import load_conv3d_compat
+from load_conv3d_compat import install_wrapper_hook, load_conv3d_compat
 from load_kt_arch_compat import activate_kt_architecture_shim
 
 
@@ -107,10 +107,9 @@ def assert_vlm_contract(model: Any) -> Any:
 
     compat = load_conv3d_compat()
     torch_29 = tuple(int(part) for part in torch.__version__.split("+", 1)[0].split(".")[:2]) == (2, 9)
-    active = compat.is_swift_conv3d_patch_active()
-    compat.validate_swift_conv3d_modules(visual)
+    active = compat.is_vlm_conv3d_compatible(visual)
     if torch_29 and not active:
-        raise RuntimeError("LLaMA-Factory did not activate KT/ms-swift Conv3D compatibility")
+        raise RuntimeError("KTransformers did not mark every VLM Conv3D instance compatible")
 
     visual_base_trainable = [name for name, param in visual.named_parameters() if param.requires_grad and "lora_" not in name]
     if visual_base_trainable:
@@ -233,7 +232,7 @@ def install_contract() -> None:
 
 def main() -> None:
     arch_source = activate_kt_architecture_shim()
-    load_conv3d_compat(register_as_kt_module=True)
+    install_wrapper_hook()
     print(f"[qwen3vl_kt_arch_shim] source={arch_source}", flush=True)
     install_contract()
     from llamafactory.train.tuner import run_exp

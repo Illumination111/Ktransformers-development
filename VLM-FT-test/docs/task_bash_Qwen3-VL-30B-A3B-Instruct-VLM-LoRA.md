@@ -2,7 +2,11 @@
 
 本测试使用完整的 `Qwen3VLMoeForConditionalGeneration`，保留视觉塔、
 `model.visual.patch_embed.proj` Conv3D 和语言模型，并用 KTransformers 包装 48 层
-Qwen3-VL-MoE decoder。`--lora-scope` 可以选择文本侧、视觉侧或联合 LoRA。
+Qwen3-VL-MoE decoder。当前 PR 只验证 LlamaFactory 原生的文本侧 LoRA，视觉塔和
+多模态 projector 保持冻结。
+
+> 本文后续若仍出现 `vlm_lora_scope` 或 `vision`/`all`，属于早期范围实验记录，不是
+> 当前 PR 的可执行接口；当前 runner 只接受 `--lora-scope text`。
 
 测试目录：
 
@@ -19,9 +23,9 @@ Qwen3-VL-MoE decoder。`--lora-scope` 可以选择文本侧、视觉侧或联合
 默认数据集使用 LLaMA-Factory 开发工作树中的 `mllm_demo`：
 
 ```text
-注册表：/mnt/data2/wbw/LlamaFactory-vlm-pr/data/dataset_info.json
-标注：  /mnt/data2/wbw/LlamaFactory-vlm-pr/data/mllm_demo.json
-图片：  /mnt/data2/wbw/LlamaFactory-vlm-pr/data/mllm_demo_data/
+注册表：/mnt/data2/wbw/LLaMA-Factory/data/dataset_info.json
+标注：  /mnt/data2/wbw/LLaMA-Factory/data/mllm_demo.json
+图片：  /mnt/data2/wbw/LLaMA-Factory/data/mllm_demo_data/
 规模：  6 条中英双语多轮图文样本、8 个图片引用
 ```
 
@@ -36,7 +40,7 @@ Qwen3-VL-MoE decoder。`--lora-scope` 可以选择文本侧、视觉侧或联合
 - LLaMA-Factory 开发工作树已包含 `qwen3_vl` 模板、`qwen3_vl_moe` 复合模型注册、
   `vlm_lora_scope` 和 KT Conv3D 处理；
 - 当前安装的 `kt-kernel` 会拒绝 `Qwen3VLMoeForConditionalGeneration`；
-- `/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel/python/sft/arch.py` 已包含对应架构解析，
+- `/mnt/data2/wbw/ktransformers/kt-kernel/python/sft/arch.py` 已包含对应架构解析，
   但该修改尚未安装；
 - Kllama 环境中的 Transformers 5.6.0 被当前 LLaMA-Factory 开发分支显式排除，测试
   runner 会为诊断设置 `DISABLE_VERSION_CHECK=1`；
@@ -85,15 +89,15 @@ use_kt: true
 
 ```text
 Python：       /mnt/data2/wbw/conda/envs/Kllama/bin/python
-LLaMA-Factory：/mnt/data2/wbw/LlamaFactory-vlm-pr
-KT source：    /mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel
+LLaMA-Factory：/mnt/data2/wbw/LLaMA-Factory
+KT source：    /mnt/data2/wbw/ktransformers/kt-kernel
 ```
 
 可以先在当前 shell 设置：
 
 ```bash
-export VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr
-export VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel
+export VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LLaMA-Factory
+export VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers/kt-kernel
 export VLM_PYTHON=/mnt/data2/wbw/conda/envs/Kllama/bin/python
 ```
 
@@ -102,9 +106,9 @@ export VLM_PYTHON=/mnt/data2/wbw/conda/envs/Kllama/bin/python
 确认关键开发源码存在：
 
 ```bash
-test -f /mnt/data2/wbw/LlamaFactory-vlm-pr/src/llamafactory/model/model_utils/vlm_lora.py
-test -f /mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel/python/sft/arch.py
-test -f /mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel/python/sft/conv3d_compat.py
+test -f /mnt/data2/wbw/LLaMA-Factory/src/llamafactory/model/model_utils/vlm_lora.py
+test -f /mnt/data2/wbw/ktransformers/kt-kernel/python/sft/arch.py
+test -f /mnt/data2/wbw/ktransformers/kt-kernel/python/sft/conv3d_compat.py
 ```
 
 确认 Python 依赖：
@@ -112,26 +116,22 @@ test -f /mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel/python/sft/conv3d_compat.p
 ```bash
 /mnt/data2/wbw/conda/envs/Kllama/bin/python -m pip check
 /mnt/data2/wbw/conda/envs/Kllama/bin/python -c \
-  'import importlib.metadata as m, torch, transformers; print(torch.__version__); print(transformers.__version__); print(m.version("ms-swift")); print(m.version("kt-kernel"))'
+  'import importlib.metadata as m, torch, transformers; print(torch.__version__); print(transformers.__version__); print(m.version("kt-kernel"))'
 ```
 
-当前预检使用 torch 2.9.1、Transformers 5.6.0 和 ms-swift 4.4.2。若缺少 Swift：
-
-```bash
-/mnt/data2/wbw/conda/envs/Kllama/bin/python -m pip install "ms-swift==4.4.2"
-```
+torch 2.9.x 的 VLM Conv3D fallback 由 KT 自身提供，不依赖 ms-swift。
 
 ## 4. 不加载 30B 权重的适配预检
 
 以下命令读取 config、权重索引和 Processor，但不会实例化或加载 30B 模型权重：
 
 ```bash
-VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
-VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LLaMA-Factory \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3-VL-30B-A3B-Instruct/run_vlm_lora_smoke.sh \
   --preflight-only \
   --model-path /mnt/data3/models/Qwen3-VL-30B-A3B-Instruct \
-  --dataset-dir /mnt/data2/wbw/LlamaFactory-vlm-pr/data \
+  --dataset-dir /mnt/data2/wbw/LLaMA-Factory/data \
   --dataset-name mllm_demo \
   --lora-scope text \
   --devices 0,1,2,3,4,5,6,7
@@ -161,12 +161,12 @@ bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3-VL-30B-A3B-Instr
 ## 5. 渲染配置并检查启动命令
 
 ```bash
-VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
-VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LLaMA-Factory \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3-VL-30B-A3B-Instruct/run_vlm_lora_smoke.sh \
   --dry-run \
   --model-path /mnt/data3/models/Qwen3-VL-30B-A3B-Instruct \
-  --dataset-dir /mnt/data2/wbw/LlamaFactory-vlm-pr/data \
+  --dataset-dir /mnt/data2/wbw/LLaMA-Factory/data \
   --dataset-name mllm_demo \
   --lora-scope all \
   --devices 0,1,2,3,4,5,6,7 \
@@ -196,11 +196,11 @@ use_kt: true
 建议先从文本侧 LoRA 开始：
 
 ```bash
-VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
-VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LLaMA-Factory \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3-VL-30B-A3B-Instruct/run_vlm_lora_smoke.sh \
   --model-path /mnt/data3/models/Qwen3-VL-30B-A3B-Instruct \
-  --dataset-dir /mnt/data2/wbw/LlamaFactory-vlm-pr/data \
+  --dataset-dir /mnt/data2/wbw/LLaMA-Factory/data \
   --dataset-name mllm_demo \
   --lora-scope text \
   --devices 0,1,2,3,4,5,6,7 \
@@ -212,11 +212,11 @@ bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3-VL-30B-A3B-Instr
 联合文本与视觉 LoRA：
 
 ```bash
-VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
-VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LLaMA-Factory \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3-VL-30B-A3B-Instruct/run_vlm_lora_smoke.sh \
   --model-path /mnt/data3/models/Qwen3-VL-30B-A3B-Instruct \
-  --dataset-dir /mnt/data2/wbw/LlamaFactory-vlm-pr/data \
+  --dataset-dir /mnt/data2/wbw/LLaMA-Factory/data \
   --dataset-name mllm_demo \
   --lora-scope all \
   --devices 0,1,2,3,4,5,6,7 \
@@ -231,11 +231,11 @@ bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3-VL-30B-A3B-Instr
 ## 7. 运行 20 步功能/短时稳定性测试
 
 ```bash
-VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
-VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LLaMA-Factory \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3-VL-30B-A3B-Instruct/run_vlm_lora_formal.sh \
   --model-path /mnt/data3/models/Qwen3-VL-30B-A3B-Instruct \
-  --dataset-dir /mnt/data2/wbw/LlamaFactory-vlm-pr/data \
+  --dataset-dir /mnt/data2/wbw/LLaMA-Factory/data \
   --dataset-name mllm_demo \
   --lora-scope all \
   --devices 0,1,2,3,4,5,6,7 \
@@ -247,8 +247,8 @@ bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3-VL-30B-A3B-Instr
 只检查 formal 配置与命令：
 
 ```bash
-VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LlamaFactory-vlm-pr \
-VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel \
+VLM_LLAMA_FACTORY_DIR=/mnt/data2/wbw/LLaMA-Factory \
+VLM_KT_SOURCE_DIR=/mnt/data2/wbw/ktransformers/kt-kernel \
 bash /mnt/data2/wbw/Ktransformers-development/VLM-FT-test/Qwen3-VL-30B-A3B-Instruct/run_vlm_lora_formal.sh \
   --dry-run \
   --lora-scope all \
@@ -288,7 +288,7 @@ test_log/<UTC时间>/model_output/adapter_model.safetensors
 训练日志必须出现：
 
 ```text
-[qwen3vl_kt_arch_shim] source=/mnt/data2/wbw/ktransformers-vlm-pr/kt-kernel/python/sft/arch.py
+[qwen3vl_kt_arch_shim] source=/mnt/data2/wbw/ktransformers/kt-kernel/python/sft/arch.py
 [qwen3vl_contract] OK class=Qwen3VLMoeForConditionalGeneration scope=<text|vision|all> ... kt_wrappers=48
 [qwen3vl_functional] GRADIENT_OK scope=<text|vision|all> ...
 [qwen3vl_functional] OPTIMIZER_OK updates=...

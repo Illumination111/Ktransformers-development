@@ -59,6 +59,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--expected-ranks", type=int, required=True)
     parser.add_argument("--expected-patterns", type=int, required=True)
+    parser.add_argument("--expected-layers", type=int, default=40)
+    parser.add_argument("--proxy-tag", default="qwen35")
     parser.add_argument("--sequence-length", type=int, required=True)
     parser.add_argument("--global-batch-size", type=int, required=True)
     parser.add_argument(
@@ -127,18 +129,18 @@ def main() -> None:
         if (
             array.ndim != 4
             or array.shape[0] != args.expected_patterns
-            or array.shape[1] != 40
+            or array.shape[1] != args.expected_layers
             or array.shape[3] != 8
         ):
             raise SystemExit(f"invalid route shape in {path}: {array.shape}")
         metadata = json.loads(str(raw_metadata))
         expected_metadata = {
-            "source": "exact_qwen35_router_forward_hook",
+            "source": f"exact_{args.proxy_tag}_router_forward_hook",
             "rank": expected_rank,
             "world_size": args.expected_ranks,
             "sequence_length": args.sequence_length,
             "patterns": args.expected_patterns,
-            "layers": 40,
+            "layers": args.expected_layers,
             "tokens_on_rank": expected_tokens_per_rank,
             "top_k": 8,
         }
@@ -172,7 +174,7 @@ def main() -> None:
     )
     expected_microbatch_shape = (
         args.expected_patterns,
-        40,
+        args.expected_layers,
         expected_microbatch_tokens,
         8,
     )
@@ -189,19 +191,19 @@ def main() -> None:
         args.expected_patterns // args.source_accumulation_steps
     )
     expected_tokens = args.sequence_length * args.global_batch_size
-    if merged.shape != (output_patterns, 40, expected_tokens, 8):
+    if merged.shape != (output_patterns, args.expected_layers, expected_tokens, 8):
         raise SystemExit(
             f"merged route shape={merged.shape}, "
-            f"expected={(output_patterns, 40, expected_tokens, 8)}"
+            f"expected={(output_patterns, args.expected_layers, expected_tokens, 8)}"
         )
     metadata = {
         "schema_version": 1,
-        "source": "merged_exact_qwen35_router_trace",
+        "source": f"merged_exact_{args.proxy_tag}_router_trace",
         "source_backend": source_backend,
         "sequence_length": args.sequence_length,
         "global_batch_size": args.global_batch_size,
         "patterns": output_patterns,
-        "layers": 40,
+        "layers": args.expected_layers,
         "tokens": expected_tokens,
         "top_k": 8,
         "source_world_size": args.expected_ranks,

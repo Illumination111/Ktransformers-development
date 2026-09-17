@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import importlib.metadata
 import json
@@ -20,7 +21,48 @@ import torch.distributed as dist
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-EXPECTED_PARAMETERS = 34_660_610_688
+DEFAULT_PROXY_TAG = "qwen35"
+DEFAULT_TARGET_MODEL_NAME = "Qwen3.5-35B-A3B-text"
+DEFAULT_PROXY_ARCHITECTURE = "qwen35_component_isomorphic"
+
+
+# ProcessGroup creation is collective.  Keep one deterministic set of ring
+# neighbor groups per process so persistent sweeps do not recreate them for
+# every sequence length.
+_P2P_GROUP_CACHE: dict[int, dict[frozenset[int], Any]] = {}
+
+
+def _neighbor_p2p_groups(
+    world_size: int,
+    global_rank: int,
+) -> dict[frozenset[int], Any]:
+    cached = _P2P_GROUP_CACHE.get(world_size)
+    if cached is not None:
+        return cached
+
+    pairs: list[tuple[int, int]] = []
+    seen: set[frozenset[int]] = set()
+    # APTMoE's action list addresses the next/previous stage by
+    # ``stage_id % world_size``.  With stages laid out round-robin, the last
+    # rank therefore communicates back to rank 0 as well as with rank 6.
+    # Build the complete ring, not only the non-wrapping linear pairs.
+    for left in range(world_size):
+        right = (left + 1) % world_size
+        pair = tuple(sorted((left, right)))
+        key = frozenset(pair)
+        if key not in seen:
+            seen.add(key)
+            pairs.append(pair)
+
+    groups: dict[frozenset[int], Any] = {}
+    for pair in pairs:
+        # Every rank must call new_group in this exact order, including ranks
+        # that are not members of the current pair.
+        group = dist.new_group(ranks=list(pair), backend="nccl")
+        if global_rank in pair:
+            groups[frozenset(pair)] = group
+    _P2P_GROUP_CACHE[world_size] = groups
+    return groups
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,6 +121,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save-random-weights", action="store_true")
     parser.add_argument("--audit-only", action="store_true")
+    parser.add_argument("--proxy-tag", default=DEFAULT_PROXY_TAG)
+    parser.add_argument(
+        "--target-model-name",
+        default=DEFAULT_TARGET_MODEL_NAME,
+    )
+    parser.add_argument(
+        "--proxy-architecture",
+        default=DEFAULT_PROXY_ARCHITECTURE,
+    )
     return parser.parse_args()
 
 
@@ -108,6 +159,11 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("max_grad_norm must be non-negative")
     if not args.text_only:
         raise ValueError("--text-only is required")
+    for name in ("proxy_tag", "target_model_name", "proxy_architecture"):
+        if not str(getattr(args, name, "")).strip():
+            raise ValueError(f"{name} must not be empty")
+    if not args.proxy_tag.replace("_", "").isalnum():
+        raise ValueError(f"invalid proxy_tag: {args.proxy_tag!r}")
     if args.global_batch_size != (
         args.num_gpus * args.per_device_batch_size
     ):
@@ -162,6 +218,7 @@ def _runtime_versions() -> dict[str, Any]:
     gpu_name = None
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
+    fastpath_available = bool(modeling_qwen3_5_moe.is_fast_path_available)
     return {
         "python": sys.version.split()[0],
         "torch": torch.__version__,
@@ -173,9 +230,9 @@ def _runtime_versions() -> dict[str, Any]:
         "cuda_runtime": torch.version.cuda,
         "nvidia_driver": _nvidia_driver_version(),
         "gpu": gpu_name,
-        "qwen35_linear_attention_fastpath": bool(
-            modeling_qwen3_5_moe.is_fast_path_available
-        ),
+        "linear_attention_fastpath": fastpath_available,
+        # Kept for existing 35B result readers.
+        "qwen35_linear_attention_fastpath": fastpath_available,
         "full_attention_implementation": "sdpa",
     }
 
@@ -208,11 +265,12 @@ def _git_identity(repository: Path) -> dict[str, Any]:
 
 def _expected_category_counts(
     model_path: Path,
+    proxy_tag: str = DEFAULT_PROXY_TAG,
 ) -> tuple[dict[str, int], dict[str, Any]]:
     sys.path.insert(0, str(SCRIPT_DIR))
     from qwen35_proxy_spec import build_manifest
 
-    manifest = build_manifest(model_path, None)
+    manifest = build_manifest(model_path, None, proxy_tag=proxy_tag)
     components = manifest["target"]["components"]
     expected = {
         "embedding": components["embedding"]["parameters"],
@@ -238,14 +296,31 @@ def _write_json(path: Path, value: Any) -> None:
 
 
 def _audit_only(args: argparse.Namespace) -> None:
-    expected, manifest = _expected_category_counts(args.model_path)
+    expected, manifest = _expected_category_counts(
+        args.model_path,
+        args.proxy_tag,
+    )
+    target = manifest["target"]
     print(
         json.dumps(
             {
                 "benchmark_class": "deployment_proxy",
+                "proxy_tag": args.proxy_tag,
+                "target_model": args.target_model_name,
+                "proxy_architecture": args.proxy_architecture,
                 "expected_parameters": sum(expected.values()),
                 "expected_categories": expected,
-                "training_state_projection": manifest["target"][
+                "model_shape": {
+                    name: target[name]
+                    for name in (
+                        "num_hidden_layers",
+                        "num_experts",
+                        "num_experts_per_tok",
+                        "hidden_size",
+                        "moe_intermediate_size",
+                    )
+                },
+                "training_state_projection": target[
                     "training_state_projection"
                 ],
                 "random_weight_checkpoint_required": False,
@@ -260,12 +335,22 @@ def _configure_distributed(
 ) -> tuple[int, int, int, bool]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for an APTMoE proxy training run")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    # Bind the CUDA device before NCCL creates its communicators.  Initializing
+    # NCCL first can make all ranks touch device 0 during communicator setup.
+    torch.cuda.set_device(local_rank)
     initialized_here = not dist.is_initialized()
     if initialized_here:
-        dist.init_process_group(backend="nccl")
+        os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+        os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+        dist.init_process_group(
+            backend="nccl",
+            timeout=datetime.timedelta(
+                minutes=int(os.environ.get("FFT_NCCL_TIMEOUT_MINUTES", "30"))
+            ),
+        )
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    local_rank = int(os.environ["LOCAL_RANK"])
     if world_size != args.num_gpus:
         raise RuntimeError(
             f"torchrun world_size={world_size}, --num-gpus={args.num_gpus}"
@@ -358,7 +443,15 @@ def run(args: argparse.Namespace) -> None:
     if not args.allow_linear_attention_fallback:
         require_linear_attention_fastpath()
     expected_categories, target_manifest = _expected_category_counts(
-        args.model_path
+        args.model_path,
+        args.proxy_tag,
+    )
+    expected_parameters = sum(expected_categories.values())
+    expert_bf16_bytes = (
+        3
+        * text_config.hidden_size
+        * text_config.moe_intermediate_size
+        * 2
     )
     tokens_per_microbatch = (
         args.global_batch_size * args.sequence_length
@@ -375,6 +468,12 @@ def run(args: argparse.Namespace) -> None:
         ),
         trace_path=args.route_trace,
         allow_synthetic=args.allow_synthetic_routing,
+        formal_trace_source=(
+            f"merged_exact_{args.proxy_tag}_router_trace"
+        ),
+        formal_replay_mode=(
+            f"replayed_{args.proxy_tag}_topk_indices"
+        ),
     )
     placement = ProxyPlacementSolver(
         text_config.num_experts,
@@ -384,6 +483,10 @@ def run(args: argparse.Namespace) -> None:
         allow_unprofiled=args.allow_unprofiled_placement,
         expected_profile=args.deployment_profile,
         required_max_tokens=tokens_per_microbatch,
+        expected_expert_bf16_bytes=expert_bf16_bytes,
+        expected_benchmark_class=(
+            f"aptmoe_{args.proxy_tag}_proxy_lookup"
+        ),
     )
     offload_runtime.prefetch_portion = args.prefetch_portion
 
@@ -426,9 +529,9 @@ def run(args: argparse.Namespace) -> None:
         local_parameter_counts(module_list)
     )
     actual_total = sum(actual_categories.values())
-    if actual_total != EXPECTED_PARAMETERS:
+    if actual_total != expected_parameters:
         raise RuntimeError(
-            f"proxy parameters={actual_total:,}, expected={EXPECTED_PARAMETERS:,}"
+            f"proxy parameters={actual_total:,}, expected={expected_parameters:,}"
         )
     if actual_categories != expected_categories:
         raise RuntimeError(
@@ -466,11 +569,12 @@ def run(args: argparse.Namespace) -> None:
         data_loader=data_loader,
         config=runtime_config,
         sft_mode=True,
+        p2p_groups=_neighbor_p2p_groups(world_size, rank),
     )
-    if runtime.total_params != EXPECTED_PARAMETERS:
+    if runtime.total_params != expected_parameters:
         raise RuntimeError(
             f"optimizer scope={runtime.total_params:,}, "
-            f"expected={EXPECTED_PARAMETERS:,}"
+            f"expected={expected_parameters:,}"
         )
 
     run_dir = args.step_timing_output_dir.resolve().parent
@@ -482,16 +586,22 @@ def run(args: argparse.Namespace) -> None:
                 args.allow_linear_attention_fallback,
             )
         )
+        result_validity = (
+            "smoke_only"
+            if fallback_requested
+            else "formal_deployment_proxy"
+        )
         proxy_manifest = {
             "schema_version": 1,
             "benchmark_class": "deployment_proxy",
-            "result_validity": (
-                "smoke_only"
-                if fallback_requested
-                else "formal_deployment_proxy"
+            "result_validity": result_validity,
+            "result_marker": (
+                "SMOKE_ONLY" if fallback_requested else "FORMAL"
             ),
-            "target_model": "Qwen3.5-35B-A3B-text",
-            "proxy_architecture": "qwen35_component_isomorphic",
+            "formal_claim_allowed": not fallback_requested,
+            "proxy_tag": args.proxy_tag,
+            "target_model": args.target_model_name,
+            "proxy_architecture": args.proxy_architecture,
             "weight_source": "deterministic_random_initialization",
             "random_seed": args.seed,
             "checkpoint_compatible": False,
@@ -500,6 +610,16 @@ def run(args: argparse.Namespace) -> None:
             "real_forward_backward_optimizer_update": True,
             "precision": "bf16",
             "parameter_count": actual_total,
+            "model_shape": {
+                "num_hidden_layers": text_config.num_hidden_layers,
+                "num_experts": text_config.num_experts,
+                "num_experts_per_tok": text_config.num_experts_per_tok,
+                "hidden_size": text_config.hidden_size,
+                "moe_intermediate_size": (
+                    text_config.moe_intermediate_size
+                ),
+                "expert_bf16_bytes": expert_bf16_bytes,
+            },
             "parameter_categories": actual_categories,
             "route": routes.manifest(),
             "placement": placement.manifest(),
@@ -570,7 +690,7 @@ def run(args: argparse.Namespace) -> None:
     dist.barrier()
     if rank == 0:
         print(
-            "[aptmoe_qwen35_proxy] completed "
+            f"[aptmoe_{args.proxy_tag}_proxy] completed "
             f"steps={args.steps} stable={args.steps - args.warmup_steps} "
             f"timing={args.step_timing_output_dir}",
             flush=True,
